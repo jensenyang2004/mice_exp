@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--free_latent", action="store_true")
     parser.add_argument("--free_context", action="store_true")
     parser.add_argument("--free_LC", action="store_true")
+    parser.add_argument("--free_LL", action="store_true")
 
     args = parser.parse_args()
 
@@ -186,6 +187,7 @@ def main():
                 free_latent=args.free_latent,
                 free_context=args.free_context,
                 free_LC=args.free_LC,
+                free_LL=args.free_LL,
                 **kwargs,
             )
 

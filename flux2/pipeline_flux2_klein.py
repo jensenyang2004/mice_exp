@@ -699,6 +699,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         free_latent: bool = False,
         free_context: bool = False,
         free_LC: bool = False,
+        free_LL: bool = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -951,6 +952,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                     self._attention_kwargs["free_latent"] = free_latent
                     self._attention_kwargs["free_context"] = free_context
                     self._attention_kwargs["free_LC"] = free_LC
+                    self._attention_kwargs["free_LL"] = free_LL
                     # self._attention_kwargs['num_hard_control_steps'] = num_hard_control_steps
                     # self._attention_kwargs['now_steps'] = i
                     if self.do_classifier_free_guidance:
