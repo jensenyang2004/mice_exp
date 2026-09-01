@@ -2,6 +2,7 @@
 Script for running MICE inference on the MICE-Bench dataset.
 """
 import sys
+import gc
 import argparse
 import torch
 import numpy as np
@@ -199,6 +200,11 @@ def main():
 
             generated_image.save(save_path)
             logger.info(f"Saved result to {save_path}")
+
+            del result, generated_image
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GiB, reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GiB")
 
 if __name__ == "__main__":
     main()
