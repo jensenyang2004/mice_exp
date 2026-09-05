@@ -39,9 +39,12 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None,
                         help="Device to run on, e.g. 'cuda:0'. Defaults to 'cuda' (respects CUDA_VISIBLE_DEVICES) or 'cpu'.")
     parser.add_argument("--num_shards", type=int, default=1,
-                        help="Total number of parallel shards (e.g. one per GPU) for splitting the dataset")
+                        help="Total number of parallel shards (data parallel: one process per GPU, each running a full copy of the model on independent samples)")
     parser.add_argument("--shard_id", type=int, default=0,
-                        help="Index of this shard in [0, num_shards), used with --num_shards to run multi-GPU inference")
+                        help="Index of this shard in [0, num_shards), used with --num_shards")
+    parser.add_argument("--multi_gpu", action="store_true",
+                        help="Model parallel: split the single transformer's weights across all visible GPUs via accelerate "
+                             "(use this if the model OOMs on one GPU; incompatible with --num_shards > 1)")
     parser.add_argument("--num_inference_steps", type=int, default=4)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--prompt_settings", type=str, default='outer_local_prompts',
@@ -87,16 +90,29 @@ def parse_args():
     if not (0 <= args.shard_id < args.num_shards):
         parser.error(f"--shard_id must be in [0, {args.num_shards})")
 
+    if args.multi_gpu and args.num_shards > 1:
+        parser.error("--multi_gpu (model parallel) cannot be combined with --num_shards > 1 (data parallel)")
+
     return args
 
 def load_pipeline(args, device):
     logger.info(f"Loading Flux2KleinPipeline from {args.pretrained_model_name_or_path}")
 
-    transformer = Flux2Transformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path,
+    transformer_kwargs = dict(
         subfolder="transformer",
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=False
+    )
+    if args.multi_gpu:
+        num_gpus = torch.cuda.device_count()
+        logger.info(f"--multi_gpu set: splitting transformer weights across {num_gpus} visible GPU(s) via accelerate")
+        transformer_kwargs["device_map"] = "balanced"
+        transformer_kwargs["low_cpu_mem_usage"] = True
+    else:
+        transformer_kwargs["low_cpu_mem_usage"] = False
+
+    transformer = Flux2Transformer2DModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        **transformer_kwargs
     )
 
     pipe = Flux2KleinPipeline.from_pretrained(
@@ -104,7 +120,16 @@ def load_pipeline(args, device):
         transformer=transformer,
         torch_dtype=torch.bfloat16
     )
-    pipe.to(device)
+
+    if args.multi_gpu:
+        # transformer weights are already dispatched across GPUs by accelerate (its forward
+        # hooks move activations between devices automatically); only place the much smaller
+        # vae/text_encoder, and don't call pipe.to() since that would try to move the
+        # already-sharded transformer back onto a single device.
+        pipe.vae.to(device)
+        pipe.text_encoder.to(device)
+    else:
+        pipe.to(device)
 
     return pipe
 
@@ -112,6 +137,8 @@ def main():
     args = parse_args()
     if args.device:
         device = args.device
+    elif args.multi_gpu:
+        device = "cuda:0"
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -186,42 +213,46 @@ def main():
             else:
                 kwargs['instance_bboxes_xyxy_normalized'] = bboxes
 
-            result = pipe(
-                image=image,
-                prompt=prompt_with_breakflag,
-                height=h,
-                width=w,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                prompt_settings=args.prompt_settings,
-                attention_setting=args.attention_setting,
-                hard_image_attribute_binding_list_double=args.hard_image_attribute_binding_list_double,
-                hard_image_attribute_binding_list_single=args.hard_image_attribute_binding_list_single,
-                bring_area_to_1024_squared=args.bring_area_to_1024_squared,
-                generator=torch.Generator(device=device).manual_seed(SEED),
-                hard_masking_steps=args.masking_steps,
-                relaxed_timesteps=args.relaxed_timesteps,
-                attention_kwargs={"smooth_P_L": args.smooth_P_L},
-                free_latent=args.free_latent,
-                free_context=args.free_context,
-                free_LC=args.free_LC,
-                free_LL=args.free_LL,
-                **kwargs,
-            )
+            try:
+                result = pipe(
+                    image=image,
+                    prompt=prompt_with_breakflag,
+                    height=h,
+                    width=w,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    prompt_settings=args.prompt_settings,
+                    attention_setting=args.attention_setting,
+                    hard_image_attribute_binding_list_double=args.hard_image_attribute_binding_list_double,
+                    hard_image_attribute_binding_list_single=args.hard_image_attribute_binding_list_single,
+                    bring_area_to_1024_squared=args.bring_area_to_1024_squared,
+                    generator=torch.Generator(device=device).manual_seed(SEED),
+                    hard_masking_steps=args.masking_steps,
+                    relaxed_timesteps=args.relaxed_timesteps,
+                    attention_kwargs={"smooth_P_L": args.smooth_P_L},
+                    free_latent=args.free_latent,
+                    free_context=args.free_context,
+                    free_LC=args.free_LC,
+                    free_LL=args.free_LL,
+                    **kwargs,
+                )
 
-            generated_image = result.images[0]
+                generated_image = result.images[0]
 
-            orig_w, orig_h = original_size
-            if generated_image.size != (orig_w, orig_h):
-                generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
+                orig_w, orig_h = original_size
+                if generated_image.size != (orig_w, orig_h):
+                    generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
 
-            generated_image.save(save_path)
-            logger.info(f"Saved result to {save_path}")
+                generated_image.save(save_path)
+                logger.info(f"Saved result to {save_path}")
 
-            del result, generated_image
-            gc.collect()
-            torch.cuda.empty_cache()
-            logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GiB, reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GiB")
+                del result, generated_image
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error(f"CUDA OOM on sample {sample_id} ({w}x{h}), skipping: {e}")
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
+                logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GiB, reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GiB")
 
 if __name__ == "__main__":
     main()
