@@ -36,6 +36,12 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="results_micebench")
     parser.add_argument("--exp_name", type=str, required=True, help="Experiment name for results subfolder")
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples (for debugging)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device to run on, e.g. 'cuda:0'. Defaults to 'cuda' (respects CUDA_VISIBLE_DEVICES) or 'cpu'.")
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="Total number of parallel shards (e.g. one per GPU) for splitting the dataset")
+    parser.add_argument("--shard_id", type=int, default=0,
+                        help="Index of this shard in [0, num_shards), used with --num_shards to run multi-GPU inference")
     parser.add_argument("--num_inference_steps", type=int, default=4)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--prompt_settings", type=str, default='outer_local_prompts',
@@ -78,6 +84,9 @@ def parse_args():
     args.hard_image_attribute_binding_list_double = parse_layer_range(args.hard_image_attribute_binding_list_double)
     args.hard_image_attribute_binding_list_single = parse_layer_range(args.hard_image_attribute_binding_list_single)
 
+    if not (0 <= args.shard_id < args.num_shards):
+        parser.error(f"--shard_id must be in [0, {args.num_shards})")
+
     return args
 
 def load_pipeline(args, device):
@@ -101,7 +110,13 @@ def load_pipeline(args, device):
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device:
+        device = args.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.num_shards > 1:
+        logger.info(f"Running shard {args.shard_id}/{args.num_shards} on device {device}")
 
     save_dir = Path(args.output_dir) / f"mice_flux2_klein_{args.exp_name}"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -129,7 +144,9 @@ def main():
         root_dir=args.dataset_root,
         batch_size=1,
         shuffle=False,
-        target_size=1024
+        target_size=1024,
+        num_shards=args.num_shards,
+        shard_id=args.shard_id
     )
 
     if args.num_samples:

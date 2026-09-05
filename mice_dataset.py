@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 def parse_quoted_strings(line: str) -> list[str]:
     return re.findall(r'"([^"]*)"', line)
@@ -103,8 +103,16 @@ class MiceBenchDataset(Dataset):
 def collate_fn(batch):
     return batch
 
-def get_mice_dataloader(root_dir='../mice_bench', batch_size=1, shuffle=False, num_workers=0, **kwargs):
+def get_mice_dataloader(root_dir='../mice_bench', batch_size=1, shuffle=False, num_workers=0,
+                         num_shards=1, shard_id=0, **kwargs):
     dataset = MiceBenchDataset(root_dir=root_dir, **kwargs)
+
+    if num_shards > 1:
+        if not (0 <= shard_id < num_shards):
+            raise ValueError(f"shard_id {shard_id} must be in [0, {num_shards})")
+        indices = list(range(shard_id, len(dataset), num_shards))
+        dataset = Subset(dataset, indices)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
