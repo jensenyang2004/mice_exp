@@ -249,6 +249,8 @@ def main():
                 del result, generated_image
             except torch.cuda.OutOfMemoryError as e:
                 logger.error(f"CUDA OOM on sample {sample_id} ({w}x{h}), skipping: {e}")
+            except Exception as e:
+                logger.exception(f"Error on sample {sample_id} ({w}x{h}), skipping: {e}")
             finally:
                 gc.collect()
                 torch.cuda.empty_cache()
