@@ -101,7 +101,18 @@ def parse_args():
     parser.add_argument("--log_steps", type=str, default="all", help="\"all\" or comma list of diffusion step indices")
     parser.add_argument("--no_background", action="store_true", help="Skip the per-instance background-source channel")
     parser.add_argument("--min_region_tokens", type=int, default=4, help="Drop instances with fewer than this many target-latent tokens")
-    parser.add_argument("--cond_only", action="store_true", default=True, help="Only log the conditional (positive-prompt) branch")
+    parser.add_argument("--min_text_tokens", type=int, default=1, help="Drop instances with fewer than this many local-prompt tokens (only relevant to key_region=text)")
+    parser.add_argument("--include_uncond", action="store_true", help="Also log the unconditional (negative-prompt) CFG branch, not just the conditional one")
+    parser.add_argument("--key_regions", type=str, default="target,context,text",
+                         help="Comma list from {target,context,text}: which region of the OTHER instance to use as "
+                              "the attention key side. 'target' = k' 's own evolving latent; 'context' = k' 's "
+                              "untouched source-image copy (tests whether leakage pulls from the reference image "
+                              "rather than from k' 's new content); 'text' = k' 's local-prompt token span (tests "
+                              "whether leakage is text/semantic-mediated). Tagged in the output as the key_region "
+                              "column. The expensive part per (step, block) cell -- computing the full softmax "
+                              "row -- happens once regardless of how many key_regions you ask for; adding more "
+                              "just adds cheap slicing/reduction on top, so there's no reason to run this "
+                              "separately per region.")
 
     args = parser.parse_args()
 
@@ -113,6 +124,10 @@ def parse_args():
     args.log_blocks_single = parse_block_spec(args.log_blocks_single)
     args.log_steps = parse_step_spec(args.log_steps)
     args.sample_ids = set(args.sample_ids.split(',')) if args.sample_ids else None
+    args.key_regions = tuple(s.strip() for s in args.key_regions.split(','))
+    for kr in args.key_regions:
+        if kr not in ("target", "context", "text"):
+            parser.error(f"--key_regions entries must be one of 'target', 'context', 'text', got {kr!r}")
 
     if not (0 <= args.shard_id < args.num_shards):
         parser.error(f"--shard_id must be in [0, {args.num_shards})")
@@ -171,9 +186,11 @@ def main():
         log_blocks_double=args.log_blocks_double,
         log_blocks_single=args.log_blocks_single,
         log_steps=args.log_steps,
-        cond_only=args.cond_only,
+        cond_only=not args.include_uncond,
         log_background=not args.no_background,
         min_region_tokens=args.min_region_tokens,
+        min_text_tokens=args.min_text_tokens,
+        key_regions=args.key_regions,
     )
 
     dataloader = get_mice_dataloader(

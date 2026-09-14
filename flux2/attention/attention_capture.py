@@ -12,12 +12,37 @@ per-instance-pair (mu, L, H) statistics and discarded (the full [H, Lq, Lk] matr
 never held longer than one block's forward pass).
 
 Region convention: target-image tokens are the first HW image tokens after the text
-block (`seq_len : seq_len + HW`, i.e. the actively-edited latent) for BOTH stream
-types, since the transformer concatenates [text | target_latent | context_latent]
-before both the double- and single-stream blocks (see pipeline_flux2_klein.py, where
-`latent_model_input = torch.cat([latents, image_latents], dim=1)`). Only target-token
-regions are analyzed (per-instance masks + background = complement of the union of
-instance masks); the context/reference copy is not touched here.
+block (`seq_len : seq_len + HW`, i.e. the actively-edited latent), and context/
+reference-image tokens are the next HW tokens (`seq_len + HW : seq_len + 2*HW`, the
+unedited source image copy) -- for BOTH stream types, since the transformer
+concatenates [text | target_latent | context_latent] before both the double- and
+single-stream blocks (see pipeline_flux2_klein.py, where
+`latent_model_input = torch.cat([latents, image_latents], dim=1)`).
+
+The QUERY side is always an instance's TARGET-latent tokens (the thing actually being
+generated -- "who is asking"). The KEY side ("what it's pulling from") is controlled by
+`CAPTURE.key_regions` (default `("target", "context", "text")`, tagged in the output as
+the `key_region` column):
+  - "target":  does instance k's generation attend into instance k''s own evolving
+               TARGET latent (semantic/content leakage from k' 's in-progress edit)?
+  - "context": does instance k's generation attend into instance k''s untouched
+               CONTEXT/reference copy (i.e. k' 's ORIGINAL, pre-edit appearance)? Tests
+               whether leakage pulls from the *source* image rather than from the
+               other instance's own new target content.
+  - "text":    does instance k's generation attend into instance k''s LOCAL PROMPT
+               tokens (the text span describing k')? Tests whether leakage is
+               semantic/text-mediated rather than purely visual/positional.
+"target"/"context" use per-instance spatial masks + background = complement of the
+union of instance masks (same mask, only the HW-block offset differs). "text" uses
+each instance's local-prompt token span (`instance_text_index_lst`, assumes
+`prompt_settings="outer_local_prompts"` where these are already absolute token
+indices) + the global-prompt span as its background/catch-all channel.
+
+The query side is intentionally NOT generalized the same way (e.g. "does k's own TEXT
+attend into k' 's CONTEXT") -- that's a within/across-instance question orthogonal to
+"does k's generation leak from elsewhere," and would multiply the row count by another
+~3x for comparisons that mostly aren't about cross-instance leakage. If a future
+question needs it, add it the same way "context" and "text" were added here.
 """
 import math
 from typing import Dict, List, Optional, Set
@@ -47,11 +72,14 @@ class AttentionCaptureState:
         self.cond_only = True
         self.log_background = True
         self.min_region_tokens = 4
+        self.min_text_tokens = 1
         self.eps = 1e-9
+        self.key_regions = ("target", "context", "text")
         self.records: List[dict] = []
 
     def configure(self, log_blocks_double=None, log_blocks_single=None, log_steps=None,
-                  cond_only=True, log_background=True, min_region_tokens=4, eps=1e-9):
+                  cond_only=True, log_background=True, min_region_tokens=4, min_text_tokens=1, eps=1e-9,
+                  key_regions=("target", "context", "text")):
         self.log_blocks = {
             "double": set(log_blocks_double) if log_blocks_double is not None else None,
             "single": set(log_blocks_single) if log_blocks_single is not None else None,
@@ -60,7 +88,9 @@ class AttentionCaptureState:
         self.cond_only = cond_only
         self.log_background = log_background
         self.min_region_tokens = min_region_tokens
+        self.min_text_tokens = min_text_tokens
         self.eps = eps
+        self.key_regions = tuple(key_regions)
         self.active = True
 
     def reset_records(self):
@@ -103,47 +133,76 @@ def _region_indices(instance_position_mask_list, HW, device, min_tokens):
     return regions, background
 
 
-def _pair_stats(A: torch.Tensor, Rk: torch.Tensor, Rkp: torch.Tensor,
-                 q_base: int, k_base: int, eps: float):
-    """A: [H, Lq, Lk] full-row softmax (fp32). Returns (mu_bar, L, H_bar), each [H]."""
-    Aq = A[:, q_base + Rk, :]                       # [H, n, Lk]
-    P = Aq[:, :, k_base + Rkp]                       # [H, n, m]
-    mu = P.sum(-1)                                   # [H, n]
-    p = P / (mu.unsqueeze(-1) + eps)                 # [H, n, m]
-    pbar = p.mean(dim=1, keepdim=True)               # [H, 1, m]
-    mu_bar = mu.mean(dim=-1)                         # [H]
-    logm = math.log(max(Rkp.numel(), 2))
+def _pair_stats(A: torch.Tensor, Q_abs: torch.Tensor, K_abs: torch.Tensor, eps: float):
+    """A: [H, Lq, Lk] full-row softmax (fp32). Q_abs/K_abs: ABSOLUTE column indices
+    into the joint sequence for the query/key sides. Returns (mu_bar, L, H_bar), each [H]."""
+    Aq = A[:, Q_abs, :]                              # [H, n, Lk]
+    P = Aq[:, :, K_abs]                               # [H, n, m]
+    mu = P.sum(-1)                                    # [H, n]
+    p = P / (mu.unsqueeze(-1) + eps)                  # [H, n, m]
+    pbar = p.mean(dim=1, keepdim=True)                # [H, 1, m]
+    mu_bar = mu.mean(dim=-1)                          # [H]
+    logm = math.log(max(K_abs.numel(), 2))
     L = (p * (torch.log(p + eps) - torch.log(pbar + eps))).sum(-1).mean(-1) / logm
     Hb = (-(pbar * torch.log(pbar + eps)).sum(-1).squeeze(-1)) / logm
     return mu_bar, L, Hb
 
 
-def _log_pairs(A, regions, background, seq_len, step_idx, stream, layer_idx):
-    """A: [H, Lq, Lk] full-row softmax (fp32) for ONE sample (batch dim already dropped)."""
-    q_base = k_base = seq_len
-    K = len(regions)
+def _key_region_indices(key_region, regions, background, seq_len, HW, instance_text_index_lst, device):
+    """Returns (per_instance_abs_idx: list[Tensor|None], background_abs_idx: Tensor)
+    for one key_region ("target"/"context"/"text"). `regions`/`background` are LOCAL
+    (0..HW-1) image-token indices from `_region_indices`; `instance_text_index_lst[0]`
+    is the global prompt, `instance_text_index_lst[kp+1]` instance kp's local prompt
+    (already absolute token indices, per `prompt_settings="outer_local_prompts"`)."""
+    if key_region == "target":
+        offset = seq_len
+        return [offset + r if r is not None else None for r in regions], offset + background
+    if key_region == "context":
+        offset = seq_len + HW
+        return [offset + r if r is not None else None for r in regions], offset + background
+    if key_region == "text":
+        per_instance = []
+        for kp in range(len(regions)):
+            idx = instance_text_index_lst[kp + 1].to(device)
+            per_instance.append(idx if idx.numel() >= CAPTURE.min_text_tokens else None)
+        return per_instance, instance_text_index_lst[0].to(device)
+    raise ValueError(f"Unknown key_region {key_region!r}")
+
+
+def _log_pairs(A, regions, background, seq_len, HW, instance_text_index_lst, step_idx, stream, layer_idx):
+    """A: [H, Lq, Lk] full-row softmax (fp32) for ONE sample (batch dim already dropped).
+    Query is always the target-latent block (the thing being generated); key is each
+    region in CAPTURE.key_regions, tagged in the output rows via `key_region`."""
+    device = A.device
+    Q = [seq_len + r if r is not None else None for r in regions]
+    K_inst = len(regions)
     rows = []
-    for k in range(K):
-        Rk = regions[k]
-        if Rk is None:
-            continue
-        for kp in range(K):
-            if kp == k:
+    for key_region in CAPTURE.key_regions:
+        key_idx, bg_idx = _key_region_indices(key_region, regions, background, seq_len, HW, instance_text_index_lst, device)
+        min_tokens = CAPTURE.min_text_tokens if key_region == "text" else CAPTURE.min_region_tokens
+        for k in range(K_inst):
+            Qk = Q[k]
+            if Qk is None:
                 continue
-            Rkp = regions[kp]
-            if Rkp is None:
-                continue
-            mu, L, Hb = _pair_stats(A, Rk, Rkp, q_base, k_base, CAPTURE.eps)
-            for head in range(mu.shape[0]):
-                rows.append(dict(step=step_idx, stream=stream, layer=layer_idx, head=head,
-                                  src=kp, dst=k, mu=mu[head].item(), L=L[head].item(),
-                                  H=Hb[head].item(), n=int(Rk.numel()), m=int(Rkp.numel())))
-        if CAPTURE.log_background and background.numel() >= CAPTURE.min_region_tokens:
-            mu_bg, _, _ = _pair_stats(A, Rk, background, q_base, k_base, CAPTURE.eps)
-            for head in range(mu_bg.shape[0]):
-                rows.append(dict(step=step_idx, stream=stream, layer=layer_idx, head=head,
-                                  src=-1, dst=k, mu=mu_bg[head].item(), L=None, H=None,
-                                  n=int(Rk.numel()), m=int(background.numel())))
+            for kp in range(K_inst):
+                if kp == k:
+                    continue
+                Kkp = key_idx[kp]
+                if Kkp is None:
+                    continue
+                mu, L, Hb = _pair_stats(A, Qk, Kkp, CAPTURE.eps)
+                for head in range(mu.shape[0]):
+                    rows.append(dict(step=step_idx, stream=stream, layer=layer_idx, head=head,
+                                      src=kp, dst=k, key_region=key_region,
+                                      mu=mu[head].item(), L=L[head].item(),
+                                      H=Hb[head].item(), n=int(Qk.numel()), m=int(Kkp.numel())))
+            if CAPTURE.log_background and bg_idx.numel() >= min_tokens:
+                mu_bg, _, _ = _pair_stats(A, Qk, bg_idx, CAPTURE.eps)
+                for head in range(mu_bg.shape[0]):
+                    rows.append(dict(step=step_idx, stream=stream, layer=layer_idx, head=head,
+                                      src=-1, dst=k, key_region=key_region,
+                                      mu=mu_bg[head].item(), L=None, H=None,
+                                      n=int(Qk.numel()), m=int(bg_idx.numel())))
     CAPTURE.add(rows)
 
 
@@ -308,7 +367,7 @@ class Flux2APITASMCaptureAttnProcessor:
             hidden_states, A = _manual_attention_with_capture(query, key, value, atten_mask, scale)
             assert A.shape[0] == 1, "attention capture currently assumes batch_size == 1"
             regions, background = _region_indices(instance_position_mask_list, HW, query.device, CAPTURE.min_region_tokens)
-            _log_pairs(A[0], regions, background, seq_len, step_idx, "double", layer_idx)
+            _log_pairs(A[0], regions, background, seq_len, HW, instance_text_index_lst, step_idx, "double", layer_idx)
             del A
         else:
             hidden_states = dispatch_attention_fn(
@@ -474,7 +533,7 @@ class Flux2ParallelSelfAttnProcessorAPITASMCapture:
             hidden_states, A = _manual_attention_with_capture(query, key, value, atten_mask, scale)
             assert A.shape[0] == 1, "attention capture currently assumes batch_size == 1"
             regions, background = _region_indices(instance_position_mask_list, HW, query.device, CAPTURE.min_region_tokens)
-            _log_pairs(A[0], regions, background, seq_len, step_idx, "single", layer_idx)
+            _log_pairs(A[0], regions, background, seq_len, HW, instance_text_index_lst, step_idx, "single", layer_idx)
             del A
         else:
             hidden_states = dispatch_attention_fn(
