@@ -12,9 +12,9 @@ holding mu fixed, and produces both the generated images (under the intervention
 and the stats needed to check whether it landed and whether leakage moved with it.
 
 For each sample this produces:
-  - <output_dir>/<sample_id>.png (or similar, via the pipeline's normal save path
-    if you wire that in) -- NOTE: this script only captures stats by default; add
-    image saving the same way infer_flux2_mice.py does if you also want outputs.
+  - <output_dir>/<sample_id>_query_blur_sigma<sigma>.png -- the generated image under
+    the intervention, resized back to the source image's original size (matching
+    infer_flux2_mice.py's save convention).
   - <output_dir>/<sample_id>_query_blur_stats.parquet, one row per (step, stream,
     layer, head, src instance, dst instance, key_region, phase), phase in
     {"before", "after"}. key_region in {"target", "context"} for per-pair rows,
@@ -35,6 +35,7 @@ from pathlib import Path
 from tqdm import tqdm
 from loguru import logger
 import random
+from PIL import Image
 from mice_dataset import get_mice_dataloader
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -241,13 +242,15 @@ def main():
                 break
 
             image = sample['image']
+            original_size = sample['original_size']
             bboxes = sample['bboxes']
             masks = sample['masks']
             prompt_with_breakflag = sample['prompt']
             w, h = image.size
 
-            out_path = save_dir / f"{sample_id}_query_blur_stats.parquet"
-            if out_path.exists():
+            stats_path = save_dir / f"{sample_id}_query_blur_stats.parquet"
+            image_path = save_dir / f"{sample_id}_query_blur_sigma{sigma_tag}.png"
+            if stats_path.exists() and image_path.exists():
                 processed += 1
                 continue
 
@@ -264,7 +267,7 @@ def main():
                 kwargs['instance_bboxes_xyxy_normalized'] = bboxes
 
             try:
-                pipe(
+                result = pipe(
                     image=image,
                     prompt=prompt_with_breakflag,
                     height=h,
@@ -287,11 +290,19 @@ def main():
                     **kwargs,
                 )
 
+                generated_image = result.images[0]
+                orig_w, orig_h = original_size
+                if generated_image.size != (orig_w, orig_h):
+                    generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
+                generated_image.save(image_path)
+                logger.info(f"Saved image to {image_path}")
+                del result, generated_image
+
                 if len(QUERY_BLUR.records) == 0:
                     logger.warning(f"No query-blur rows captured for sample {sample_id} (check --log_blocks_*/--log_steps).")
                 else:
-                    QUERY_BLUR.save(out_path)
-                    logger.info(f"Saved {len(QUERY_BLUR.records)} rows to {out_path}")
+                    QUERY_BLUR.save(stats_path)
+                    logger.info(f"Saved {len(QUERY_BLUR.records)} rows to {stats_path}")
 
             except torch.cuda.OutOfMemoryError as e:
                 logger.error(f"CUDA OOM on sample {sample_id} ({w}x{h}), skipping: {e}")
