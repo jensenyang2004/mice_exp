@@ -76,6 +76,12 @@ class QueryBlurState:
         self.eps = 1e-9
         self.log_stats = False
         self.records: List[dict] = []
+        # Instance layout (bbox grids, query/key index sets) only depends on the
+        # per-sample instance masks + grid dims, all constant for a whole pipe() call --
+        # keyed on is_conditional since cond/uncond have different seq_len. Rebuilding it
+        # from scratch on every (step, block) call (as before) re-does several .item()
+        # GPU->CPU syncs per instance for no reason; cache it here instead.
+        self._layout_cache: Dict[bool, tuple] = {}
 
     def configure(self, sigma, log_blocks_double=None, log_blocks_single=None, log_steps=None,
                   cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9,
@@ -101,6 +107,16 @@ class QueryBlurState:
 
     def reset_records(self):
         self.records = []
+        self._layout_cache = {}
+
+    def get_layout(self, is_conditional, instance_position_mask_list, seq_len, HW,
+                    image_token_H, image_token_W, device):
+        if is_conditional not in self._layout_cache:
+            self._layout_cache[is_conditional] = _build_instance_layout(
+                instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
+                device, self.min_region_tokens,
+            )
+        return self._layout_cache[is_conditional]
 
     def should_apply(self, stream: str, layer_idx: int, step_idx: int, is_conditional: bool) -> bool:
         if not self.active:
@@ -330,7 +346,8 @@ def _log_query_blur_stats(rows, A, V, layouts, qi, cross_keys, seq_len, HW, step
 
 
 def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_position_mask_list,
-                                 seq_len, HW, image_token_H, image_token_W, step_idx, stream, layer_idx):
+                                 seq_len, HW, image_token_H, image_token_W, step_idx, stream, layer_idx,
+                                 is_conditional):
     """query/key/value: [B, L, H, D] (as produced by `unflatten(-1, (heads, -1))`),
     B == 1 assumed. Applies QUERY_BLUR.sigma to cross-instance logits and, only when
     QUERY_BLUR.log_stats is on, logs before/after pair stats (that path holds a second
@@ -348,9 +365,9 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
     z = z[0]                                               # [H, Lq, Lk]
     V = v_[0]                                               # [H, Lk, D]
 
-    layouts, qi, cross_keys = _build_instance_layout(
-        instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
-        query.device, QUERY_BLUR.min_region_tokens,
+    layouts, qi, cross_keys = QUERY_BLUR.get_layout(
+        is_conditional, instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
+        query.device,
     )
 
     # z_before/A_before are a second full [H, Lq, Lk] fp32 tensor pair, alive
@@ -522,6 +539,7 @@ class Flux2APITASMQueryBlurAttnProcessor:
             hidden_states = _manual_attention_with_blur(
                 query, key, value, atten_mask, scale, instance_position_mask_list,
                 seq_len, HW, image_token_H, image_token_W, step_idx, "double", layer_idx,
+                is_conditional,
             )
         else:
             hidden_states = dispatch_attention_fn(
@@ -687,6 +705,7 @@ class Flux2ParallelSelfAttnProcessorAPITASMQueryBlur:
             hidden_states = _manual_attention_with_blur(
                 query, key, value, atten_mask, scale, instance_position_mask_list,
                 seq_len, HW, image_token_H, image_token_W, step_idx, "single", layer_idx,
+                is_conditional,
             )
         else:
             hidden_states = dispatch_attention_fn(
