@@ -199,17 +199,23 @@ def _conv1d_along(x: torch.Tensor, kernel: torch.Tensor, dim: int) -> torch.Tens
     shape = x_moved.shape
     flat = x_moved.reshape(-1, 1, shape[-1])
     mode = "reflect" if shape[-1] > pad else "replicate"
-    flat = F.pad(flat, (pad, pad), mode=mode)
+
+    def _pad_and_conv(chunk: torch.Tensor) -> torch.Tensor:
+        chunk = F.pad(chunk, (pad, pad), mode=mode)
+        return F.conv1d(chunk, kernel.view(1, 1, -1))
+
     # The collapsed batch here is heads * (other spatial dim) * num_cross_keys, which
     # at high resolution / large instance bboxes can reach into the millions. Past some
-    # device-dependent grid-dimension ceiling, cuDNN's conv1d kernel launch fails with
-    # "CUDA error: invalid configuration argument" (this is what broke finite-sigma runs
-    # at 832x1248 while sigma=inf, which never builds this tensor, sailed through).
-    # Chunking the launch is numerically identical and sidesteps the ceiling.
+    # device-dependent grid-dimension ceiling, both F.pad(mode="reflect") and F.conv1d
+    # fail their CUDA kernel launch with "invalid configuration argument" (this is what
+    # broke finite-sigma runs -- sigma=inf never builds this tensor, so it sailed
+    # through). Chunking before EITHER op runs is numerically identical and sidesteps
+    # the ceiling; chunking only the conv1d call (as an earlier fix did) still leaves
+    # the unchunked pad on the way in.
     if flat.shape[0] > _CONV1D_MAX_BATCH:
-        out = torch.cat([F.conv1d(chunk, kernel.view(1, 1, -1)) for chunk in flat.split(_CONV1D_MAX_BATCH, dim=0)], dim=0)
+        out = torch.cat([_pad_and_conv(chunk) for chunk in flat.split(_CONV1D_MAX_BATCH, dim=0)], dim=0)
     else:
-        out = F.conv1d(flat, kernel.view(1, 1, -1))
+        out = _pad_and_conv(flat)
     out = out.reshape(shape)
     return out.movedim(-1, dim)
 
