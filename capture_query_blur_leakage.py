@@ -132,6 +132,12 @@ def parse_args():
     parser.add_argument("--log_steps", type=str, default="all", help="\"all\" or comma list of diffusion step indices to apply/log the blur on")
     parser.add_argument("--min_region_tokens", type=int, default=4, help="Drop instances with fewer than this many target-latent tokens")
     parser.add_argument("--include_uncond", action="store_true", help="Also apply/log the unconditional (negative-prompt) CFG branch, not just the conditional one")
+    parser.add_argument("--log_stats", action="store_true",
+                         help="Compute and save before/after mu/L/H pair stats. Off by default: it requires a "
+                              "second full attention matrix (pre-blur) alive alongside the post-blur one on every "
+                              "selected block, roughly doubling peak VRAM there -- generation (the images) doesn't "
+                              "need it. Turn on for a dedicated stats pass, ideally restricted to a few blocks/"
+                              "steps via --log_blocks_double/--log_blocks_single/--log_steps to keep it cheap.")
     parser.add_argument("--no_verify_mass", action="store_true", help="Skip the per-block mu-preservation sanity check (cheap; only disable for a speed run once it's been verified clean)")
     parser.add_argument("--mass_tol", type=float, default=1e-3, help="Warn if LSE mass restoration is off by more than this (log-probability units)")
 
@@ -216,6 +222,7 @@ def main():
         min_region_tokens=args.min_region_tokens,
         verify_mass=not args.no_verify_mass,
         mass_tol=args.mass_tol,
+        log_stats=args.log_stats,
     )
 
     dataloader = get_mice_dataloader(
@@ -250,7 +257,8 @@ def main():
 
             stats_path = save_dir / f"{sample_id}_query_blur_stats.parquet"
             image_path = save_dir / f"{sample_id}_query_blur_sigma{sigma_tag}.png"
-            if stats_path.exists() and image_path.exists():
+            already_done = image_path.exists() and (stats_path.exists() or not args.log_stats)
+            if already_done:
                 processed += 1
                 continue
 
@@ -298,11 +306,12 @@ def main():
                 logger.info(f"Saved image to {image_path}")
                 del result, generated_image
 
-                if len(QUERY_BLUR.records) == 0:
-                    logger.warning(f"No query-blur rows captured for sample {sample_id} (check --log_blocks_*/--log_steps).")
-                else:
-                    QUERY_BLUR.save(stats_path)
-                    logger.info(f"Saved {len(QUERY_BLUR.records)} rows to {stats_path}")
+                if args.log_stats:
+                    if len(QUERY_BLUR.records) == 0:
+                        logger.warning(f"No query-blur rows captured for sample {sample_id} (check --log_blocks_*/--log_steps).")
+                    else:
+                        QUERY_BLUR.save(stats_path)
+                        logger.info(f"Saved {len(QUERY_BLUR.records)} rows to {stats_path}")
 
             except torch.cuda.OutOfMemoryError as e:
                 logger.error(f"CUDA OOM on sample {sample_id} ({w}x{h}), skipping: {e}")

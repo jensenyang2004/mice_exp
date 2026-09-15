@@ -74,10 +74,12 @@ class QueryBlurState:
         self.verify_mass = True
         self.mass_tol = 1e-3
         self.eps = 1e-9
+        self.log_stats = False
         self.records: List[dict] = []
 
     def configure(self, sigma, log_blocks_double=None, log_blocks_single=None, log_steps=None,
-                  cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9):
+                  cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9,
+                  log_stats=False):
         self.sigma = float('inf') if isinstance(sigma, str) and sigma.strip().lower() == 'inf' else float(sigma)
         self.log_blocks = {
             "double": set(log_blocks_double) if log_blocks_double is not None else None,
@@ -89,6 +91,12 @@ class QueryBlurState:
         self.verify_mass = verify_mass
         self.mass_tol = mass_tol
         self.eps = eps
+        # Before/after mu/L/H logging needs a second full [H, Lq, Lk] fp32 copy of the
+        # attention matrix (pre-blur) alive alongside the post-blur one -- roughly 2x
+        # the peak VRAM of just applying the blur and generating. Off by default so a
+        # generation run doesn't pay for stats it isn't asking for; turn on for a
+        # dedicated (and/or block/step-restricted, via log_blocks_*/log_steps) stats pass.
+        self.log_stats = log_stats
         self.active = True
 
     def reset_records(self):
@@ -306,8 +314,9 @@ def _log_query_blur_stats(rows, A, V, layouts, qi, cross_keys, seq_len, HW, step
 def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_position_mask_list,
                                  seq_len, HW, image_token_H, image_token_W, step_idx, stream, layer_idx):
     """query/key/value: [B, L, H, D] (as produced by `unflatten(-1, (heads, -1))`),
-    B == 1 assumed. Applies QUERY_BLUR.sigma to cross-instance logits and, if this
-    (step, block) cell is selected, logs before/after pair stats.
+    B == 1 assumed. Applies QUERY_BLUR.sigma to cross-instance logits and, only when
+    QUERY_BLUR.log_stats is on, logs before/after pair stats (that path holds a second
+    full attention matrix in memory, so it's opt-in).
 
     Returns hidden_states [B, Lq, H, D] matching dispatch_attention_fn's layout.
     """
@@ -326,19 +335,24 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
         query.device, QUERY_BLUR.min_region_tokens,
     )
 
-    z_before = z.clone()
+    # z_before/A_before are a second full [H, Lq, Lk] fp32 tensor pair, alive
+    # alongside z/A_after -- only pay for that when stats were actually requested.
+    log_stats = QUERY_BLUR.log_stats
+    z_before = z.clone() if log_stats else None
+
     _apply_query_logit_blur_(z, layouts, qi, cross_keys, QUERY_BLUR.sigma,
                               verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol)
     A_after = torch.softmax(z, dim=-1)
 
-    rows = []
-    A_before = torch.softmax(z_before, dim=-1)
-    _log_query_blur_stats(rows, A_before, V, layouts, qi, cross_keys, seq_len, HW, step_idx, stream, layer_idx,
-                           "before", QUERY_BLUR.min_region_tokens, QUERY_BLUR.eps)
-    _log_query_blur_stats(rows, A_after, V, layouts, qi, cross_keys, seq_len, HW, step_idx, stream, layer_idx,
-                           "after", QUERY_BLUR.min_region_tokens, QUERY_BLUR.eps)
-    QUERY_BLUR.add(rows)
-    del z_before, A_before
+    if log_stats:
+        rows = []
+        A_before = torch.softmax(z_before, dim=-1)
+        _log_query_blur_stats(rows, A_before, V, layouts, qi, cross_keys, seq_len, HW, step_idx, stream, layer_idx,
+                               "before", QUERY_BLUR.min_region_tokens, QUERY_BLUR.eps)
+        _log_query_blur_stats(rows, A_after, V, layouts, qi, cross_keys, seq_len, HW, step_idx, stream, layer_idx,
+                               "after", QUERY_BLUR.min_region_tokens, QUERY_BLUR.eps)
+        QUERY_BLUR.add(rows)
+        del z_before, A_before
 
     out = torch.matmul(A_after.to(v_.dtype), V)              # [H, Lq, D]
     hidden_states = out.unsqueeze(0).permute(0, 2, 1, 3).contiguous()  # [1, Lq, H, D]
