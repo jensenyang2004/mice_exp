@@ -140,6 +140,13 @@ def parse_args():
                               "steps via --log_blocks_double/--log_blocks_single/--log_steps to keep it cheap.")
     parser.add_argument("--no_verify_mass", action="store_true", help="Skip the per-block mu-preservation sanity check (cheap; only disable for a speed run once it's been verified clean)")
     parser.add_argument("--mass_tol", type=float, default=1e-3, help="Warn if LSE mass restoration is off by more than this (log-probability units)")
+    parser.add_argument("--mask_erode_tokens", type=int, default=0,
+                         help="Erode each instance mask by this many tokens (each token ~16px) before use, "
+                              "applied after --strict carving. Strips the boundary ring of tokens whose VAE patch "
+                              "can straddle two instances (or an instance and background) from being exposed as "
+                              "cross-instance keys or treated as clean instance queries -- carving alone still "
+                              "leaves that ring's content physically blended, which is a real leak no attention-"
+                              "side correction can undo. 0 = off (default).")
 
     args = parser.parse_args()
 
@@ -223,6 +230,7 @@ def main():
         verify_mass=not args.no_verify_mass,
         mass_tol=args.mass_tol,
         log_stats=args.log_stats,
+        mask_erode_tokens=args.mask_erode_tokens,
     )
 
     dataloader = get_mice_dataloader(
