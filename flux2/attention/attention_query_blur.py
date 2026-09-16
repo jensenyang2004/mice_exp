@@ -218,11 +218,17 @@ def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token
                     own bbox, `mask_k` = [Hk, Wk] float mask of which bbox cells are k's.
       qi[k]       : None, or seq_len + flat -- absolute query indices for instance k.
       cross_keys[k]: absolute key indices = concat(R_k'^tgt for k'!=k, R_k'^ctx for k'!=k),
-                     skipping any k' below min_region_tokens.
+                     skipping any k' below min_region_tokens, and skipping any individual
+                     token that k' claims but k ALSO claims (mask overlap at that exact
+                     position) -- such a token is ambiguous, not foreign, to k: exposing
+                     it as a "k' key" would let k attend to (and get mass-normalized
+                     against) what is, from k's own perspective, actually its own region.
     """
     layouts = []
+    own_masks_flat = []  # [HW] bool per instance, full-grid flat footprint (independent of min_region_tokens)
     for m in instance_position_mask_list:
         m2d = m.to(device).reshape(image_token_H, image_token_W).bool()
+        own_masks_flat.append(m2d.reshape(-1))
         ys, xs = m2d.nonzero(as_tuple=True)
         n = ys.numel()
         if n < min_region_tokens:
@@ -244,11 +250,16 @@ def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token
     cross_keys = []
     for k in range(K):
         parts = []
+        own_k = own_masks_flat[k]  # a k'-claimed token at a position k also claims is ambiguous, not foreign
         for kp in range(K):
             if kp == k or layouts[kp] is None:
                 continue
-            parts.append(seq_len + layouts[kp]['flat'])
-            parts.append(seq_len + HW + layouts[kp]['flat'])
+            flat_kp = layouts[kp]['flat']
+            flat_kp = flat_kp[~own_k[flat_kp]]
+            if flat_kp.numel() == 0:
+                continue
+            parts.append(seq_len + flat_kp)
+            parts.append(seq_len + HW + flat_kp)
         cross_keys.append(torch.cat(parts) if parts else torch.empty(0, dtype=torch.long, device=device))
     return layouts, qi, cross_keys
 
