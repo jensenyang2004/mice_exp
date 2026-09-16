@@ -158,6 +158,15 @@ def parse_args():
                               "cross-instance keys or treated as clean instance queries -- carving alone still "
                               "leaves that ring's content physically blended, which is a real leak no attention-"
                               "side correction can undo. 0 = off (default).")
+    parser.add_argument("--background_as_query", action="store_true",
+                         help="Add a synthetic 'background' pseudo-instance (complement of the union of all "
+                              "instance masks) as an extra blur DESTINATION: background's own queries get the "
+                              "same cross-instance blur/mass-preservation treatment as any real instance's "
+                              "queries, since background pixels idiosyncratically attending to specific instance "
+                              "content is exactly what the bench's background-preservation (pixel-wise) metric "
+                              "would penalize. Background is never exposed as a SOURCE, though -- a real "
+                              "instance's own reads of background are left completely untouched, unblurred, "
+                              "exactly as without this flag. Off by default.")
 
     args = parser.parse_args()
 
@@ -214,7 +223,8 @@ def main():
     # Keep the default (--blur_axis query) path identical to before -- only tag the dir
     # when running the key-axis variant, so existing query-axis sweeps/resumes are untouched.
     axis_tag = "" if args.blur_axis == "query" else f"_{args.blur_axis}axis"
-    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}"
+    bg_tag = "_bgquery" if args.background_as_query else ""
+    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}{bg_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Query-blur stats will be saved to {save_dir}")
     if not args.free_latent:
@@ -246,6 +256,7 @@ def main():
         log_stats=args.log_stats,
         mask_erode_tokens=args.mask_erode_tokens,
         blur_axis=args.blur_axis,
+        background_as_query=args.background_as_query,
     )
 
     dataloader = get_mice_dataloader(

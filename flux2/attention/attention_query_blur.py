@@ -77,6 +77,7 @@ class QueryBlurState:
         self.log_stats = False
         self.mask_erode_tokens = 0
         self.blur_axis = "query"
+        self.background_as_query = False
         self.records: List[dict] = []
         # Instance layout (bbox grids, query/key index sets) only depends on the
         # per-sample instance masks + grid dims, all constant for a whole pipe() call --
@@ -92,7 +93,7 @@ class QueryBlurState:
 
     def configure(self, sigma, log_blocks_double=None, log_blocks_single=None, log_steps=None,
                   cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9,
-                  log_stats=False, mask_erode_tokens=0, blur_axis="query"):
+                  log_stats=False, mask_erode_tokens=0, blur_axis="query", background_as_query=False):
         self.sigma = float('inf') if isinstance(sigma, str) and sigma.strip().lower() == 'inf' else float(sigma)
         self.log_blocks = {
             "double": set(log_blocks_double) if log_blocks_double is not None else None,
@@ -113,6 +114,14 @@ class QueryBlurState:
         self.mask_erode_tokens = mask_erode_tokens
         assert blur_axis in ("query", "key"), f"blur_axis must be 'query' or 'key', got {blur_axis!r}"
         self.blur_axis = blur_axis
+        # Adds a synthetic "background" pseudo-instance that's a valid blur DESTINATION
+        # (its own queries get the same cross-instance blur treatment as any real
+        # instance's queries, per the bench's background-preservation metric: background
+        # pixels idiosyncratically attending to specific instance content is exactly what
+        # would make them drift) but is NEVER a valid SOURCE for real instances (a real
+        # instance reading background stays completely untouched -- see background_index
+        # in _build_instance_layout / _apply_key_logit_blur_).
+        self.background_as_query = background_as_query
         self.active = True
 
     def reset_records(self):
@@ -122,11 +131,23 @@ class QueryBlurState:
 
     def get_layout(self, is_conditional, instance_position_mask_list, seq_len, HW,
                     image_token_H, image_token_W, device):
+        """Returns (layouts, qi, cross_keys, own_masks_flat, background_index) -- see
+        _build_instance_layout. When self.background_as_query, a synthetic background
+        pseudo-instance (see _background_mask) is appended before building the layout
+        and its index returned as background_index (None otherwise), so this is the
+        only place that mask gets computed -- once per sample, on cache miss."""
         if is_conditional not in self._layout_cache:
-            self._layout_cache[is_conditional] = _build_instance_layout(
-                instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
-                device, self.min_region_tokens,
+            masks = instance_position_mask_list
+            background_index = None
+            if self.background_as_query:
+                bg = _background_mask(instance_position_mask_list, image_token_H, image_token_W, device)
+                background_index = len(instance_position_mask_list)
+                masks = list(instance_position_mask_list) + [bg.reshape(-1)]
+            layouts, qi, cross_keys, own_masks_flat = _build_instance_layout(
+                masks, seq_len, HW, image_token_H, image_token_W,
+                device, self.min_region_tokens, background_index=background_index,
             )
+            self._layout_cache[is_conditional] = (layouts, qi, cross_keys, own_masks_flat, background_index)
         return self._layout_cache[is_conditional]
 
     def get_processed_masks(self, instance_position_mask_list, device, image_token_H, image_token_W,
@@ -212,8 +233,22 @@ def _erode_mask_2d(mask: torch.Tensor, H: int, W: int, radius: int) -> torch.Ten
 # Per-instance target-token layout: bbox grid, mask, and cross-instance key indices.
 # --------------------------------------------------------------------------------------
 
+def _background_mask(instance_position_mask_list, image_token_H, image_token_W, device):
+    """[H, W] bool: the complement of the union of all (already processed -- carved/
+    eroded, if those are active) instance masks. Approximates the bench's background
+    region as "whatever this intervention doesn't consider part of an instance"; it
+    won't bit-exactly match the bench's own background ground truth if that comes from
+    tighter/looser annotations (e.g. bboxes) than what's driving the intervention."""
+    if len(instance_position_mask_list) == 0:
+        return torch.ones(image_token_H, image_token_W, dtype=torch.bool, device=device)
+    union = torch.zeros(image_token_H, image_token_W, dtype=torch.bool, device=device)
+    for m in instance_position_mask_list:
+        union |= m.to(device).reshape(image_token_H, image_token_W).bool()
+    return ~union
+
+
 def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
-                            device, min_region_tokens):
+                            device, min_region_tokens, background_index=None):
     """Returns (layouts, qi, cross_keys):
       layouts[k]  : None, or dict(flat, gy, gx, Hk, Wk, mask_k, n) for instance k's
                     own R_k^tgt tokens -- `flat` = full-grid flat indices (row-major,
@@ -226,6 +261,12 @@ def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token
                      position) -- such a token is ambiguous, not foreign, to k: exposing
                      it as a "k' key" would let k attend to (and get mass-normalized
                      against) what is, from k's own perspective, actually its own region.
+                     If `background_index` names a "background" pseudo-instance in the
+                     input list, it's additionally excluded as a source (kp) for every
+                     OTHER k -- background is a valid blur destination (queries at
+                     background_index get treated like any other instance) but never a
+                     valid source: a real instance reading background must stay
+                     completely untouched, only background reading real instances blurs.
       own_masks_flat[k]: [HW] bool, instance k's full-grid footprint (independent of
                      min_region_tokens) -- exposed so callers (e.g. the key-axis blur,
                      which needs per-(k, k') exclusion rather than the pre-flattened
@@ -261,6 +302,8 @@ def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token
         for kp in range(K):
             if kp == k or layouts[kp] is None:
                 continue
+            if background_index is not None and kp == background_index and k != background_index:
+                continue  # background is never a source for a real instance's cross_keys
             flat_kp = layouts[kp]['flat']
             flat_kp = flat_kp[~own_k[flat_kp]]
             if flat_kp.numel() == 0:
@@ -378,7 +421,8 @@ def _apply_query_logit_blur_(z: torch.Tensor, layouts, qi, cross_keys, sigma: fl
 
 
 def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len, HW, sigma: float,
-                            verify_mass: bool = True, mass_tol: float = 1e-3) -> torch.Tensor:
+                            verify_mass: bool = True, mass_tol: float = 1e-3,
+                            background_index: Optional[int] = None) -> torch.Tensor:
     """In-place key-axis blur of cross-instance logits in `z` [H, Lq, Lk] (fp32).
 
     The dual of `_apply_query_logit_blur_`: that function blurs, for a fixed key,
@@ -400,6 +444,9 @@ def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len
     overall is exactly unchanged, only how that mass is distributed within k' moves.
     Tokens k' claims that k also claims are excluded (reusing the same ambiguous-
     overlap check `_build_instance_layout` applies to cross_keys). sigma=0 is a no-op.
+    `background_index`, if given, names a "background" pseudo-instance in `layouts`/
+    `qi` that's excluded as a source (kp) for every other k, mirroring
+    `_build_instance_layout`'s cross_keys.
     """
     if sigma == 0:
         return z
@@ -414,6 +461,8 @@ def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len
         for kp in range(K):
             if kp == k or layouts[kp] is None:
                 continue
+            if background_index is not None and kp == background_index and k != background_index:
+                continue  # background is never a source for a real instance's keys
             lay = layouts[kp]
             keep = ~own_k[lay['flat']]
             if not bool(keep.any()):
@@ -523,7 +572,7 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
     z = z[0]                                               # [H, Lq, Lk]
     V = v_[0]                                               # [H, Lk, D]
 
-    layouts, qi, cross_keys, own_masks_flat = QUERY_BLUR.get_layout(
+    layouts, qi, cross_keys, own_masks_flat, background_index = QUERY_BLUR.get_layout(
         is_conditional, instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
         query.device,
     )
@@ -535,7 +584,8 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
 
     if QUERY_BLUR.blur_axis == "key":
         _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, seq_len, HW, QUERY_BLUR.sigma,
-                                verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol)
+                                verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol,
+                                background_index=background_index)
     else:
         _apply_query_logit_blur_(z, layouts, qi, cross_keys, QUERY_BLUR.sigma,
                                   verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol)
