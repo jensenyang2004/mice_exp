@@ -75,6 +75,7 @@ class QueryBlurState:
         self.mass_tol = 1e-3
         self.eps = 1e-9
         self.log_stats = False
+        self.mask_erode_tokens = 0
         self.records: List[dict] = []
         # Instance layout (bbox grids, query/key index sets) only depends on the
         # per-sample instance masks + grid dims, all constant for a whole pipe() call --
@@ -82,10 +83,15 @@ class QueryBlurState:
         # from scratch on every (step, block) call (as before) re-does several .item()
         # GPU->CPU syncs per instance for no reason; cache it here instead.
         self._layout_cache: Dict[bool, tuple] = {}
+        # Same story as _layout_cache: neither the --strict non-overlapping mask carve
+        # nor the mask_erode_tokens erosion (see get_processed_masks) depend on
+        # step/block/cond-uncond -- both only touch the sample's raw instance masks, so
+        # cache the (carved, then eroded) result instead of recomputing it every call.
+        self._processed_mask_cache: Optional[list] = None
 
     def configure(self, sigma, log_blocks_double=None, log_blocks_single=None, log_steps=None,
                   cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9,
-                  log_stats=False):
+                  log_stats=False, mask_erode_tokens=0):
         self.sigma = float('inf') if isinstance(sigma, str) and sigma.strip().lower() == 'inf' else float(sigma)
         self.log_blocks = {
             "double": set(log_blocks_double) if log_blocks_double is not None else None,
@@ -103,11 +109,13 @@ class QueryBlurState:
         # generation run doesn't pay for stats it isn't asking for; turn on for a
         # dedicated (and/or block/step-restricted, via log_blocks_*/log_steps) stats pass.
         self.log_stats = log_stats
+        self.mask_erode_tokens = mask_erode_tokens
         self.active = True
 
     def reset_records(self):
         self.records = []
         self._layout_cache = {}
+        self._processed_mask_cache = None
 
     def get_layout(self, is_conditional, instance_position_mask_list, seq_len, HW,
                     image_token_H, image_token_W, device):
@@ -117,6 +125,39 @@ class QueryBlurState:
                 device, self.min_region_tokens,
             )
         return self._layout_cache[is_conditional]
+
+    def get_processed_masks(self, instance_position_mask_list, device, image_token_H, image_token_W,
+                             strict: bool):
+        """Carve (if `strict`) then erode (if `mask_erode_tokens > 0`) the raw instance
+        masks, cached per sample. Carving resolves overlap between instances (e.g. a
+        plate mask losing pixels a nested, smaller broccoli instance also claims);
+        erosion then strips a `mask_erode_tokens`-wide boundary ring from each
+        resulting mask. That ring matters even after carving is clean, because carving
+        is a hard per-token reassignment while each 16px-VAE token's own embedding can
+        still physically straddle two instances (or an instance and background) right
+        at the boundary it just drew -- no attention-side correction can undo content
+        that's already blended inside one token, so those tokens are better left
+        unclaimed by either instance than exposed as a "clean" cross-instance key.
+        """
+        if self._processed_mask_cache is None:
+            masks = instance_position_mask_list
+            if strict and len(masks) > 1:
+                areas = [mask.sum().item() for mask in masks]
+                carved = []
+                for i, mask in enumerate(masks):
+                    new_mask = mask.to(device).clone()
+                    for j, other_mask in enumerate(masks):
+                        if i != j and areas[j] < areas[i]:
+                            new_mask = new_mask * (1 - other_mask.to(device))
+                    carved.append(new_mask)
+                masks = carved
+            if self.mask_erode_tokens > 0:
+                masks = [
+                    _erode_mask_2d(m.to(device), image_token_H, image_token_W, self.mask_erode_tokens)
+                    for m in masks
+                ]
+            self._processed_mask_cache = masks
+        return self._processed_mask_cache
 
     def should_apply(self, stream: str, layer_idx: int, step_idx: int, is_conditional: bool) -> bool:
         if not self.active:
@@ -140,6 +181,28 @@ class QueryBlurState:
 
 
 QUERY_BLUR = QueryBlurState()
+
+
+# --------------------------------------------------------------------------------------
+# Mask erosion: strip a boundary ring from each instance mask before it's used for
+# anything, so tokens whose 16px VAE patch straddles two instances (or an instance and
+# background) aren't claimed by either.
+# --------------------------------------------------------------------------------------
+
+def _erode_mask_2d(mask: torch.Tensor, H: int, W: int, radius: int) -> torch.Tensor:
+    """Binary erosion by `radius` tokens over a (H, W) token grid: a token survives
+    only if every IN-GRID token in its (2*radius+1)-square neighborhood also belongs
+    to the mask. `F.max_pool2d`'s implicit padding behaves as -inf, not 0 (verified:
+    it never lets a padded cell win the max), so out-of-grid neighbors impose no
+    constraint -- an instance touching the photo's own edge isn't eroded there, only
+    where it actually borders a 0 (background or another instance) inside the grid,
+    which is the only place a straddling-token leak can actually occur. `mask` may be
+    any shape that reshapes to (H, W); the eroded result is returned in that shape."""
+    orig_shape = mask.shape
+    m = mask.to(torch.float32).reshape(1, 1, H, W)
+    k = 2 * radius + 1
+    eroded = -F.max_pool2d(-m, kernel_size=k, stride=1, padding=radius)  # erosion = NOT(dilate(complement))
+    return (eroded > 0.5).reshape(orig_shape).to(mask.dtype)
 
 
 # --------------------------------------------------------------------------------------
@@ -486,16 +549,10 @@ class Flux2APITASMQueryBlurAttnProcessor:
         instance_num = len(instance_position_mask_list)
         Flux2APITASMQueryBlurAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
 
-        if self.strict and instance_num > 1:
-            areas = [mask.sum().item() for mask in instance_position_mask_list]
-            new_mask_list = []
-            for i, mask in enumerate(instance_position_mask_list):
-                new_mask = mask.to(query.device).clone()
-                for j, other_mask in enumerate(instance_position_mask_list):
-                    if i != j and areas[j] < areas[i]:
-                        new_mask = new_mask * (1 - other_mask.to(query.device))
-                new_mask_list.append(new_mask)
-            instance_position_mask_list = new_mask_list
+        if self.strict or QUERY_BLUR.mask_erode_tokens > 0:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
 
         if (Flux2APITASMQueryBlurAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (Flux2APITASMQueryBlurAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
             atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
@@ -652,16 +709,10 @@ class Flux2ParallelSelfAttnProcessorAPITASMQueryBlur:
         instance_num = len(instance_position_mask_list)
         Flux2ParallelSelfAttnProcessorAPITASMQueryBlur.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
 
-        if self.strict and instance_num > 1:
-            areas = [mask.sum().item() for mask in instance_position_mask_list]
-            new_mask_list = []
-            for i, mask in enumerate(instance_position_mask_list):
-                new_mask = mask.to(query.device).clone()
-                for j, other_mask in enumerate(instance_position_mask_list):
-                    if i != j and areas[j] < areas[i]:
-                        new_mask = new_mask * (1 - other_mask.to(query.device))
-                new_mask_list.append(new_mask)
-            instance_position_mask_list = new_mask_list
+        if self.strict or QUERY_BLUR.mask_erode_tokens > 0:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
 
         if (Flux2ParallelSelfAttnProcessorAPITASMQueryBlur.cond_hard_bind_mask is None and is_conditional) or (Flux2ParallelSelfAttnProcessorAPITASMQueryBlur.uncond_hard_bind_mask is None and not is_conditional):
             atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
