@@ -123,10 +123,21 @@ def parse_args():
     parser.add_argument("--strict", action="store_true", help="Use the non-overlapping (strict) instance mask variant")
 
     # Query-blur-specific.
+    parser.add_argument("--blur_axis", type=str, default="query", choices=["query", "key"],
+                         help="'query' (default) blurs, for a fixed foreign key, across the querying instance's "
+                              "own neighboring query tokens that share it -- drives L (per-query idiosyncrasy) "
+                              "toward 0, mass held fixed over the combined cross-instance set. 'key' instead "
+                              "blurs, for a fixed query, across a single source instance's neighboring key tokens "
+                              "-- the query still attends as much as it wants to each source instance (mass held "
+                              "fixed per (query, source instance) pair), but which specific token it resolves to "
+                              "is smeared, raising per-query entropy H directly instead of picking it up as a "
+                              "side effect of lowering L.")
     parser.add_argument("--sigma", type=str, required=True,
-                         help="Gaussian blur sigma over the query grid, or 'inf' for the global masked-mean "
-                              "limit (L -> 0 exactly) or '0' for the identity no-op (bitwise, run this first). "
-                              "Per the intervention's config sweep: inf first, then {4, 2, 1}.")
+                         help="Gaussian blur sigma over the query grid (--blur_axis query) or over each source "
+                              "instance's key grid (--blur_axis key), or 'inf' for the global masked-mean limit "
+                              "(L -> 0, or H -> max, depending on --blur_axis) or '0' for the identity no-op "
+                              "(bitwise, run this first). Per the intervention's config sweep: inf first, then "
+                              "{4, 2, 1}.")
     parser.add_argument("--log_blocks_double", type=str, default="all", help="\"all\" or comma list of double-stream layer indices to apply/log the blur on")
     parser.add_argument("--log_blocks_single", type=str, default="all", help="\"all\" or comma list of single-stream layer indices to apply/log the blur on")
     parser.add_argument("--log_steps", type=str, default="all", help="\"all\" or comma list of diffusion step indices to apply/log the blur on")
@@ -200,7 +211,10 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     sigma_tag = "inf" if args.sigma == float('inf') else str(args.sigma).replace('.', 'p')
-    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}"
+    # Keep the default (--blur_axis query) path identical to before -- only tag the dir
+    # when running the key-axis variant, so existing query-axis sweeps/resumes are untouched.
+    axis_tag = "" if args.blur_axis == "query" else f"_{args.blur_axis}axis"
+    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Query-blur stats will be saved to {save_dir}")
     if not args.free_latent:
@@ -231,6 +245,7 @@ def main():
         mass_tol=args.mass_tol,
         log_stats=args.log_stats,
         mask_erode_tokens=args.mask_erode_tokens,
+        blur_axis=args.blur_axis,
     )
 
     dataloader = get_mice_dataloader(
@@ -242,7 +257,7 @@ def main():
         shard_id=args.shard_id,
     )
 
-    logger.info(f"Starting query-blur rerun (sigma={args.sigma})...")
+    logger.info(f"Starting {args.blur_axis}-axis blur rerun (sigma={args.sigma})...")
 
     processed = 0
     for batch in tqdm(dataloader):
