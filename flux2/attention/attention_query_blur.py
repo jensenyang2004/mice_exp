@@ -78,6 +78,8 @@ class QueryBlurState:
         self.mask_erode_tokens = 0
         self.blur_axis = "query"
         self.background_as_query = False
+        self.protect_ring_radius = 0
+        self.restore_mass = True
         self.records: List[dict] = []
         # Instance layout (bbox grids, query/key index sets) only depends on the
         # per-sample instance masks + grid dims, all constant for a whole pipe() call --
@@ -93,7 +95,8 @@ class QueryBlurState:
 
     def configure(self, sigma, log_blocks_double=None, log_blocks_single=None, log_steps=None,
                   cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9,
-                  log_stats=False, mask_erode_tokens=0, blur_axis="query", background_as_query=False):
+                  log_stats=False, mask_erode_tokens=0, blur_axis="query", background_as_query=False,
+                  protect_ring_radius=0, restore_mass=True):
         self.sigma = float('inf') if isinstance(sigma, str) and sigma.strip().lower() == 'inf' else float(sigma)
         self.log_blocks = {
             "double": set(log_blocks_double) if log_blocks_double is not None else None,
@@ -122,6 +125,15 @@ class QueryBlurState:
         # instance reading background stays completely untouched -- see background_index
         # in _build_instance_layout / _apply_key_logit_blur_).
         self.background_as_query = background_as_query
+        # Diagnostic/design toggles: restore_mass=False skips the LSE mass-correction
+        # entirely (raw blurred logits, no mu preservation) -- we already confirmed
+        # good disentanglement doesn't require holding mu fixed, so this checks whether
+        # the correction itself (rather than the blur) is implicated in artifacts.
+        # protect_ring_radius>0 additionally excludes, for each querying instance k, any
+        # key token within that many tokens of k's own boundary but not part of k --
+        # see own_ring_flat in _build_instance_layout.
+        self.restore_mass = restore_mass
+        self.protect_ring_radius = protect_ring_radius
         self.active = True
 
     def reset_records(self):
@@ -131,11 +143,12 @@ class QueryBlurState:
 
     def get_layout(self, is_conditional, instance_position_mask_list, seq_len, HW,
                     image_token_H, image_token_W, device):
-        """Returns (layouts, qi, cross_keys, own_masks_flat, background_index) -- see
-        _build_instance_layout. When self.background_as_query, a synthetic background
-        pseudo-instance (see _background_mask) is appended before building the layout
-        and its index returned as background_index (None otherwise), so this is the
-        only place that mask gets computed -- once per sample, on cache miss."""
+        """Returns (layouts, qi, cross_keys, own_masks_flat, own_ring_flat,
+        background_index) -- see _build_instance_layout. When self.background_as_query,
+        a synthetic background pseudo-instance (see _background_mask) is appended
+        before building the layout and its index returned as background_index (None
+        otherwise), so this is the only place that mask gets computed -- once per
+        sample, on cache miss."""
         if is_conditional not in self._layout_cache:
             masks = instance_position_mask_list
             background_index = None
@@ -143,11 +156,14 @@ class QueryBlurState:
                 bg = _background_mask(instance_position_mask_list, image_token_H, image_token_W, device)
                 background_index = len(instance_position_mask_list)
                 masks = list(instance_position_mask_list) + [bg.reshape(-1)]
-            layouts, qi, cross_keys, own_masks_flat = _build_instance_layout(
+            layouts, qi, cross_keys, own_masks_flat, own_ring_flat = _build_instance_layout(
                 masks, seq_len, HW, image_token_H, image_token_W,
                 device, self.min_region_tokens, background_index=background_index,
+                ring_radius=self.protect_ring_radius,
             )
-            self._layout_cache[is_conditional] = (layouts, qi, cross_keys, own_masks_flat, background_index)
+            self._layout_cache[is_conditional] = (
+                layouts, qi, cross_keys, own_masks_flat, own_ring_flat, background_index,
+            )
         return self._layout_cache[is_conditional]
 
     def get_processed_masks(self, instance_position_mask_list, device, image_token_H, image_token_W,
@@ -229,6 +245,17 @@ def _erode_mask_2d(mask: torch.Tensor, H: int, W: int, radius: int) -> torch.Ten
     return (eroded > 0.5).reshape(orig_shape).to(mask.dtype)
 
 
+def _dilate_mask_2d(mask: torch.Tensor, H: int, W: int, radius: int) -> torch.Tensor:
+    """Binary dilation by `radius` tokens over a (H, W) token grid: a token is included
+    if any IN-GRID token in its (2*radius+1)-square neighborhood belongs to the mask.
+    `mask` may be any shape that reshapes to (H, W); returned in that same shape."""
+    orig_shape = mask.shape
+    m = mask.to(torch.float32).reshape(1, 1, H, W)
+    k = 2 * radius + 1
+    dilated = F.max_pool2d(m, kernel_size=k, stride=1, padding=radius)
+    return (dilated > 0.5).reshape(orig_shape).to(mask.dtype)
+
+
 # --------------------------------------------------------------------------------------
 # Per-instance target-token layout: bbox grid, mask, and cross-instance key indices.
 # --------------------------------------------------------------------------------------
@@ -248,7 +275,7 @@ def _background_mask(instance_position_mask_list, image_token_H, image_token_W, 
 
 
 def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
-                            device, min_region_tokens, background_index=None):
+                            device, min_region_tokens, background_index=None, ring_radius: int = 0):
     """Returns (layouts, qi, cross_keys):
       layouts[k]  : None, or dict(flat, gy, gx, Hk, Wk, mask_k, n) for instance k's
                     own R_k^tgt tokens -- `flat` = full-grid flat indices (row-major,
@@ -271,12 +298,27 @@ def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token
                      min_region_tokens) -- exposed so callers (e.g. the key-axis blur,
                      which needs per-(k, k') exclusion rather than the pre-flattened
                      union above) can reuse the same overlap check.
+      own_ring_flat[k]: [HW] bool (all False if ring_radius == 0), tokens within
+                     `ring_radius` of instance k's own boundary but NOT part of k --
+                     a protective buffer: regardless of which OTHER instance (or
+                     background) these tokens nominally belong to, their 16px VAE
+                     patch is close enough to k's own boundary that its content could
+                     be blended with k's, so k's own queries never read them as a
+                     cross-instance key. Cheaper than outlining every source instance
+                     separately -- one dilation of k itself covers every source k
+                     might read.
     """
     layouts = []
     own_masks_flat = []  # [HW] bool per instance, full-grid flat footprint (independent of min_region_tokens)
+    own_ring_flat = []   # [HW] bool per instance, protective ring just outside its own boundary
     for m in instance_position_mask_list:
         m2d = m.to(device).reshape(image_token_H, image_token_W).bool()
         own_masks_flat.append(m2d.reshape(-1))
+        if ring_radius > 0:
+            dilated = _dilate_mask_2d(m2d, image_token_H, image_token_W, ring_radius)
+            own_ring_flat.append((dilated & ~m2d).reshape(-1))
+        else:
+            own_ring_flat.append(torch.zeros(image_token_H * image_token_W, dtype=torch.bool, device=device))
         ys, xs = m2d.nonzero(as_tuple=True)
         n = ys.numel()
         if n < min_region_tokens:
@@ -299,19 +341,20 @@ def _build_instance_layout(instance_position_mask_list, seq_len, HW, image_token
     for k in range(K):
         parts = []
         own_k = own_masks_flat[k]  # a k'-claimed token at a position k also claims is ambiguous, not foreign
+        ring_k = own_ring_flat[k]  # k's own protective ring: never a key, regardless of whose it is
         for kp in range(K):
             if kp == k or layouts[kp] is None:
                 continue
             if background_index is not None and kp == background_index and k != background_index:
                 continue  # background is never a source for a real instance's cross_keys
             flat_kp = layouts[kp]['flat']
-            flat_kp = flat_kp[~own_k[flat_kp]]
+            flat_kp = flat_kp[~own_k[flat_kp] & ~ring_k[flat_kp]]
             if flat_kp.numel() == 0:
                 continue
             parts.append(seq_len + flat_kp)
             parts.append(seq_len + HW + flat_kp)
         cross_keys.append(torch.cat(parts) if parts else torch.empty(0, dtype=torch.long, device=device))
-    return layouts, qi, cross_keys, own_masks_flat
+    return layouts, qi, cross_keys, own_masks_flat, own_ring_flat
 
 
 # --------------------------------------------------------------------------------------
@@ -380,9 +423,13 @@ def _blur_block(Z: torch.Tensor, M: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def _apply_query_logit_blur_(z: torch.Tensor, layouts, qi, cross_keys, sigma: float,
-                              verify_mass: bool = True, mass_tol: float = 1e-3) -> torch.Tensor:
+                              verify_mass: bool = True, mass_tol: float = 1e-3,
+                              restore_mass: bool = True) -> torch.Tensor:
     """In-place query-axis blur of cross-instance logits in `z` [H, Lq, Lk] (fp32).
-    sigma=0 is a no-op (identity, bitwise)."""
+    sigma=0 is a no-op (identity, bitwise). restore_mass=False skips the LSE
+    mass-correction entirely (a diagnostic/ablation: does holding mu fixed matter, or
+    does the correction itself contribute to artifacts?) -- mu is then whatever the raw
+    blur produces, unconstrained."""
     if sigma == 0:
         return z
     H = z.shape[0]
@@ -395,7 +442,7 @@ def _apply_query_logit_blur_(z: torch.Tensor, layouts, qi, cross_keys, sigma: fl
         qk = qi[k]
 
         blk = z[:, qk][:, :, kj]                          # [H, n, m]
-        lse0 = torch.logsumexp(blk, dim=-1)                # [H, n]
+        lse0 = torch.logsumexp(blk, dim=-1) if restore_mass else None  # [H, n]
 
         lay = layouts[k]
         Hk, Wk, gy, gx, mask_k = lay['Hk'], lay['Wk'], lay['gy'], lay['gx'], lay['mask_k']
@@ -407,22 +454,23 @@ def _apply_query_logit_blur_(z: torch.Tensor, layouts, qi, cross_keys, sigma: fl
         Zb = _blur_block(Z, M, sigma)
         blk_b = Zb[:, gy, gx, :]                            # [H, n, m]
 
-        lse1 = torch.logsumexp(blk_b, dim=-1)               # [H, n]
-        blk_b = blk_b + (lse0 - lse1).unsqueeze(-1)
+        if restore_mass:
+            lse1 = torch.logsumexp(blk_b, dim=-1)               # [H, n]
+            blk_b = blk_b + (lse0 - lse1).unsqueeze(-1)
 
-        if verify_mass:
-            lse_check = torch.logsumexp(blk_b, dim=-1)
-            max_err = (lse_check - lse0).abs().max().item()
-            if max_err > mass_tol:
-                logger.warning(f"query-blur mass restoration off by {max_err:.2e} for instance {k} (tol={mass_tol})")
+            if verify_mass:
+                lse_check = torch.logsumexp(blk_b, dim=-1)
+                max_err = (lse_check - lse0).abs().max().item()
+                if max_err > mass_tol:
+                    logger.warning(f"query-blur mass restoration off by {max_err:.2e} for instance {k} (tol={mass_tol})")
 
         z[:, qk.unsqueeze(-1), kj] = blk_b
     return z
 
 
-def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len, HW, sigma: float,
+def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, sigma: float,
                             verify_mass: bool = True, mass_tol: float = 1e-3,
-                            background_index: Optional[int] = None) -> torch.Tensor:
+                            background_index: Optional[int] = None, restore_mass: bool = True) -> torch.Tensor:
     """In-place key-axis blur of cross-instance logits in `z` [H, Lq, Lk] (fp32).
 
     The dual of `_apply_query_logit_blur_`: that function blurs, for a fixed key,
@@ -443,10 +491,13 @@ def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len
     preserved on the COMBINED (target+context) block of k' -- how much i attends to k'
     overall is exactly unchanged, only how that mass is distributed within k' moves.
     Tokens k' claims that k also claims are excluded (reusing the same ambiguous-
-    overlap check `_build_instance_layout` applies to cross_keys). sigma=0 is a no-op.
-    `background_index`, if given, names a "background" pseudo-instance in `layouts`/
-    `qi` that's excluded as a source (kp) for every other k, mirroring
-    `_build_instance_layout`'s cross_keys.
+    overlap check `_build_instance_layout` applies to cross_keys), as are tokens in k's
+    own protective ring (own_ring_flat -- see _build_instance_layout), regardless of
+    which k' nominally claims them. sigma=0 is a no-op. `background_index`, if given,
+    names a "background" pseudo-instance in `layouts`/`qi` that's excluded as a source
+    (kp) for every other k, mirroring `_build_instance_layout`'s cross_keys.
+    restore_mass=False skips the LSE mass-correction entirely (see
+    _apply_query_logit_blur_ for why this is worth testing).
     """
     if sigma == 0:
         return z
@@ -458,13 +509,14 @@ def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len
         qk = qi[k]
         n = qk.numel()
         own_k = own_masks_flat[k]
+        ring_k = own_ring_flat[k]
         for kp in range(K):
             if kp == k or layouts[kp] is None:
                 continue
             if background_index is not None and kp == background_index and k != background_index:
                 continue  # background is never a source for a real instance's keys
             lay = layouts[kp]
-            keep = ~own_k[lay['flat']]
+            keep = ~own_k[lay['flat']] & ~ring_k[lay['flat']]
             if not bool(keep.any()):
                 continue
             flat_kp = lay['flat'][keep]
@@ -477,7 +529,7 @@ def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len
 
             blk_t = z[:, qk][:, :, kt]      # [H, n, m']
             blk_c = z[:, qk][:, :, kc]      # [H, n, m']
-            lse0 = torch.logsumexp(torch.cat([blk_t, blk_c], dim=-1), dim=-1)  # [H, n]
+            lse0 = torch.logsumexp(torch.cat([blk_t, blk_c], dim=-1), dim=-1) if restore_mass else None  # [H, n]
 
             Zt = blk_t.new_zeros(H, Hk, Wk, n)
             Zt[:, gy, gx, :] = blk_t.permute(0, 2, 1)         # scatter key axis onto kp's grid
@@ -487,16 +539,17 @@ def _apply_key_logit_blur_(z: torch.Tensor, layouts, qi, own_masks_flat, seq_len
             Zc[:, gy, gx, :] = blk_c.permute(0, 2, 1)
             blk_c_b = _blur_block(Zc, M.to(blk_c.dtype), sigma)[:, gy, gx, :].permute(0, 2, 1)
 
-            lse1 = torch.logsumexp(torch.cat([blk_t_b, blk_c_b], dim=-1), dim=-1)  # [H, n]
-            correction = (lse0 - lse1).unsqueeze(-1)
-            blk_t_b = blk_t_b + correction
-            blk_c_b = blk_c_b + correction
+            if restore_mass:
+                lse1 = torch.logsumexp(torch.cat([blk_t_b, blk_c_b], dim=-1), dim=-1)  # [H, n]
+                correction = (lse0 - lse1).unsqueeze(-1)
+                blk_t_b = blk_t_b + correction
+                blk_c_b = blk_c_b + correction
 
-            if verify_mass:
-                lse_check = torch.logsumexp(torch.cat([blk_t_b, blk_c_b], dim=-1), dim=-1)
-                max_err = (lse_check - lse0).abs().max().item()
-                if max_err > mass_tol:
-                    logger.warning(f"key-blur mass restoration off by {max_err:.2e} for pair (k={k}, k'={kp}) (tol={mass_tol})")
+                if verify_mass:
+                    lse_check = torch.logsumexp(torch.cat([blk_t_b, blk_c_b], dim=-1), dim=-1)
+                    max_err = (lse_check - lse0).abs().max().item()
+                    if max_err > mass_tol:
+                        logger.warning(f"key-blur mass restoration off by {max_err:.2e} for pair (k={k}, k'={kp}) (tol={mass_tol})")
 
             z[:, qk.unsqueeze(-1), kt] = blk_t_b
             z[:, qk.unsqueeze(-1), kc] = blk_c_b
@@ -572,7 +625,7 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
     z = z[0]                                               # [H, Lq, Lk]
     V = v_[0]                                               # [H, Lk, D]
 
-    layouts, qi, cross_keys, own_masks_flat, background_index = QUERY_BLUR.get_layout(
+    layouts, qi, cross_keys, own_masks_flat, own_ring_flat, background_index = QUERY_BLUR.get_layout(
         is_conditional, instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
         query.device,
     )
@@ -583,12 +636,13 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
     z_before = z.clone() if log_stats else None
 
     if QUERY_BLUR.blur_axis == "key":
-        _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, seq_len, HW, QUERY_BLUR.sigma,
+        _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, QUERY_BLUR.sigma,
                                 verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol,
-                                background_index=background_index)
+                                background_index=background_index, restore_mass=QUERY_BLUR.restore_mass)
     else:
         _apply_query_logit_blur_(z, layouts, qi, cross_keys, QUERY_BLUR.sigma,
-                                  verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol)
+                                  verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol,
+                                  restore_mass=QUERY_BLUR.restore_mass)
     A_after = torch.softmax(z, dim=-1)
 
     if log_stats:

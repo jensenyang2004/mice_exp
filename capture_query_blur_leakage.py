@@ -167,6 +167,19 @@ def parse_args():
                               "would penalize. Background is never exposed as a SOURCE, though -- a real "
                               "instance's own reads of background are left completely untouched, unblurred, "
                               "exactly as without this flag. Off by default.")
+    parser.add_argument("--no_restore_mass", action="store_true",
+                         help="Skip the LSE mass-correction entirely -- a diagnostic/ablation to check whether "
+                              "holding mu fixed is itself implicated in artifacts, versus the blur alone. mu is "
+                              "then whatever the raw blur produces, unconstrained. Off by default (mass restored, "
+                              "matching the intervention's original design).")
+    parser.add_argument("--protect_ring_radius", type=int, default=0,
+                         help="For each querying instance k, additionally exclude any key token within this many "
+                              "tokens of k's own boundary but not part of k -- regardless of which OTHER instance "
+                              "(or background) that token nominally belongs to. One dilation of k itself, cheaper "
+                              "than outlining every source instance separately, and directly protects k: those "
+                              "tokens' 16px VAE patch is close enough to k's boundary that content could be "
+                              "blended with k's own, so k never reads them as a cross-instance key. Applies to "
+                              "both --blur_axis modes. 0 = off (default).")
 
     args = parser.parse_args()
 
@@ -224,7 +237,9 @@ def main():
     # when running the key-axis variant, so existing query-axis sweeps/resumes are untouched.
     axis_tag = "" if args.blur_axis == "query" else f"_{args.blur_axis}axis"
     bg_tag = "_bgquery" if args.background_as_query else ""
-    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}{bg_tag}"
+    nomass_tag = "_nomass" if args.no_restore_mass else ""
+    ring_tag = f"_ring{args.protect_ring_radius}" if args.protect_ring_radius > 0 else ""
+    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}{bg_tag}{nomass_tag}{ring_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Query-blur stats will be saved to {save_dir}")
     if not args.free_latent:
@@ -257,6 +272,8 @@ def main():
         mask_erode_tokens=args.mask_erode_tokens,
         blur_axis=args.blur_axis,
         background_as_query=args.background_as_query,
+        protect_ring_radius=args.protect_ring_radius,
+        restore_mass=not args.no_restore_mass,
     )
 
     dataloader = get_mice_dataloader(
