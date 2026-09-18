@@ -80,6 +80,7 @@ class QueryBlurState:
         self.background_as_query = False
         self.protect_ring_radius = 0
         self.restore_mass = True
+        self.text_grounding_alpha = 0.0
         self.records: List[dict] = []
         # Instance layout (bbox grids, query/key index sets) only depends on the
         # per-sample instance masks + grid dims, all constant for a whole pipe() call --
@@ -96,7 +97,7 @@ class QueryBlurState:
     def configure(self, sigma, log_blocks_double=None, log_blocks_single=None, log_steps=None,
                   cond_only=True, min_region_tokens=4, verify_mass=True, mass_tol=1e-3, eps=1e-9,
                   log_stats=False, mask_erode_tokens=0, blur_axis="query", background_as_query=False,
-                  protect_ring_radius=0, restore_mass=True):
+                  protect_ring_radius=0, restore_mass=True, text_grounding_alpha=0.0):
         self.sigma = float('inf') if isinstance(sigma, str) and sigma.strip().lower() == 'inf' else float(sigma)
         self.log_blocks = {
             "double": set(log_blocks_double) if log_blocks_double is not None else None,
@@ -134,6 +135,12 @@ class QueryBlurState:
         # see own_ring_flat in _build_instance_layout.
         self.restore_mass = restore_mass
         self.protect_ring_radius = protect_ring_radius
+        # Floors instance k's own local-prompt text mass at text_grounding_alpha times
+        # k's own-context mass (see _apply_text_grounding_boost_) -- independent of the
+        # cross-instance blur above, counters the model's own preference for copying
+        # its unconditionally-open own-context over following the edit instruction,
+        # which can leave an edit's target content out of the image entirely. 0 = off.
+        self.text_grounding_alpha = text_grounding_alpha
         self.active = True
 
     def reset_records(self):
@@ -605,9 +612,55 @@ def _log_query_blur_stats(rows, A, V, layouts, qi, cross_keys, seq_len, HW, step
                               n=int(Qk.numel()), m=int(Ck.numel()), delivered_norm=dn[head].item()))
 
 
+# --------------------------------------------------------------------------------------
+# Text-grounding boost: independent of the cross-instance blur above, operates entirely
+# on a disjoint part of the row (k's own context vs. k's own local-prompt text) --
+# counters the model's natural preference for the unconditionally-open, high-fidelity
+# "copy my own context" shortcut over its local edit instruction, which can leave an
+# edit's target content out of the image entirely (reverting to source) even though
+# nothing about cross-instance leakage is at fault.
+# --------------------------------------------------------------------------------------
+
+def _apply_text_grounding_boost_(z: torch.Tensor, layouts, qi, own_masks_flat, instance_text_index_lst,
+                                  seq_len, HW, alpha: float, background_index: Optional[int] = None) -> torch.Tensor:
+    """In-place floor on instance k's own local-prompt text mass, relative to k's own
+    context mass, for k's own target-latent queries. Per query, computes
+    `delta = max(0, log(alpha) + LSE(own_context) - LSE(own_text))` and adds it
+    uniformly to that query's own-text logits -- a floor, not a reset: queries where
+    text already meets or exceeds `alpha` times own-context's mass are left untouched.
+    `alpha=1.0` means "text's mass should be at least as large as own-context's",
+    `alpha=0.5` half that, `alpha=2.0` double. alpha<=0 is a no-op (undefined floor).
+    `instance_text_index_lst[k+1]` gives instance k's own local-prompt token indices
+    (index 0 is the global prompt, per fill_hard_text_bind_mask's convention);
+    `background_index`, if given, is skipped -- background has no local prompt.
+    """
+    if alpha <= 0:
+        return z
+    log_alpha = math.log(alpha)
+    for k in range(len(layouts)):
+        if layouts[k] is None or k == background_index:
+            continue
+        qk = qi[k]
+        own_flat = layouts[k]['flat']
+        kc_own = seq_len + HW + own_flat
+        text_idx = instance_text_index_lst[k + 1]
+        if text_idx.numel() == 0:
+            continue
+
+        own_logits = z[:, qk][:, :, kc_own]      # [H, n, m_own]
+        text_logits = z[:, qk][:, :, text_idx]   # [H, n, m_text]
+
+        lse_own = torch.logsumexp(own_logits, dim=-1)    # [H, n]
+        lse_text = torch.logsumexp(text_logits, dim=-1)  # [H, n]
+        delta = (log_alpha + lse_own - lse_text).clamp(min=0.0)  # [H, n]
+
+        z[:, qk.unsqueeze(-1), text_idx] = text_logits + delta.unsqueeze(-1)
+    return z
+
+
 def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_position_mask_list,
                                  seq_len, HW, image_token_H, image_token_W, step_idx, stream, layer_idx,
-                                 is_conditional):
+                                 is_conditional, instance_text_index_lst):
     """query/key/value: [B, L, H, D] (as produced by `unflatten(-1, (heads, -1))`),
     B == 1 assumed. Applies QUERY_BLUR.sigma to cross-instance logits and, only when
     QUERY_BLUR.log_stats is on, logs before/after pair stats (that path holds a second
@@ -643,6 +696,12 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
         _apply_query_logit_blur_(z, layouts, qi, cross_keys, QUERY_BLUR.sigma,
                                   verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol,
                                   restore_mass=QUERY_BLUR.restore_mass)
+
+    if QUERY_BLUR.text_grounding_alpha > 0:
+        _apply_text_grounding_boost_(z, layouts, qi, own_masks_flat, instance_text_index_lst,
+                                      seq_len, HW, QUERY_BLUR.text_grounding_alpha,
+                                      background_index=background_index)
+
     A_after = torch.softmax(z, dim=-1)
 
     if log_stats:
@@ -799,7 +858,7 @@ class Flux2APITASMQueryBlurAttnProcessor:
             hidden_states = _manual_attention_with_blur(
                 query, key, value, atten_mask, scale, instance_position_mask_list,
                 seq_len, HW, image_token_H, image_token_W, step_idx, "double", layer_idx,
-                is_conditional,
+                is_conditional, instance_text_index_lst,
             )
         else:
             hidden_states = dispatch_attention_fn(
@@ -959,7 +1018,7 @@ class Flux2ParallelSelfAttnProcessorAPITASMQueryBlur:
             hidden_states = _manual_attention_with_blur(
                 query, key, value, atten_mask, scale, instance_position_mask_list,
                 seq_len, HW, image_token_H, image_token_W, step_idx, "single", layer_idx,
-                is_conditional,
+                is_conditional, instance_text_index_lst,
             )
         else:
             hidden_states = dispatch_attention_fn(

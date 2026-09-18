@@ -180,6 +180,16 @@ def parse_args():
                               "tokens' 16px VAE patch is close enough to k's boundary that content could be "
                               "blended with k's own, so k never reads them as a cross-instance key. Applies to "
                               "both --blur_axis modes. 0 = off (default).")
+    parser.add_argument("--text_grounding_alpha", type=float, default=0.0,
+                         help="Floors instance k's own local-prompt text mass at this many times k's own-context "
+                              "mass, for k's own target-latent queries -- independent of the cross-instance blur "
+                              "above (disjoint cells: own-context vs. own-text, never cross-instance keys). "
+                              "Counters the model's own preference for copying its unconditionally-open "
+                              "own-context over following the edit instruction, which can leave an edit's target "
+                              "content out of the image entirely (reverts to source) even with no cross-instance "
+                              "leakage at fault. 1.0 = text mass floored to match own-context's; 0.5 = half; "
+                              "2.0 = double. A floor, not a reset: queries where text already meets or exceeds "
+                              "the target are left untouched. 0 = off (default).")
 
     args = parser.parse_args()
 
@@ -239,7 +249,8 @@ def main():
     bg_tag = "_bgquery" if args.background_as_query else ""
     nomass_tag = "_nomass" if args.no_restore_mass else ""
     ring_tag = f"_ring{args.protect_ring_radius}" if args.protect_ring_radius > 0 else ""
-    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}{bg_tag}{nomass_tag}{ring_tag}"
+    text_tag = f"_text{str(args.text_grounding_alpha).replace('.', 'p')}" if args.text_grounding_alpha > 0 else ""
+    save_dir = Path(args.output_dir) / f"mice_query_blur_{args.exp_name}_sigma{sigma_tag}{axis_tag}{bg_tag}{nomass_tag}{ring_tag}{text_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Query-blur stats will be saved to {save_dir}")
     if not args.free_latent:
@@ -274,6 +285,7 @@ def main():
         background_as_query=args.background_as_query,
         protect_ring_radius=args.protect_ring_radius,
         restore_mass=not args.no_restore_mass,
+        text_grounding_alpha=args.text_grounding_alpha,
     )
 
     dataloader = get_mice_dataloader(
