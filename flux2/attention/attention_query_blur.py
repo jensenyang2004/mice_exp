@@ -61,6 +61,11 @@ from .attention_capture import _pair_stats
 BlockSpec = Optional[Set[int]]  # None means "all layers of that stream"
 
 
+class _CaptureAbort(Exception):
+    """Raised by _manual_attention_with_blur to unwind a pipe() call the instant
+    QUERY_BLUR.capture_only has stashed what it needs -- see visualize_attention_variants.py."""
+
+
 class QueryBlurState:
     """Process-global toggle + accumulator for the query-axis logit blur intervention."""
 
@@ -78,6 +83,23 @@ class QueryBlurState:
         self.mask_erode_tokens = 0
         self.blur_axis = "query"
         self.background_as_query = False
+        # Debug/visualization hook: when True, _manual_attention_with_blur stashes the
+        # raw (mask-applied, pre-blur/pre-boost) logits + everything needed to
+        # reconstruct any variant offline into `captured`, then raises _CaptureAbort to
+        # unwind the pipe() call immediately -- no need to finish generation just to
+        # inspect one attention snapshot. See visualize_attention_variants.py.
+        self.capture_only = False
+        self.captured: Optional[dict] = None
+        # Optional (step_idx, stream, layer_idx) filter on top of capture_only: when
+        # set, capture fires only at that exact point, regardless of should_apply's own
+        # log_steps/log_blocks_* schedule -- lets the intervention stay active at every
+        # step/layer (so an earlier-step capture reflects the SAME cumulative
+        # trajectory a full, uninterrupted run would have produced there) while still
+        # only intercepting once. None (default) preserves the original behavior: fire
+        # on whichever call should_apply's own schedule lets through, which is how
+        # visualize_attention_variants.py's narrow log_steps/log_blocks_* already
+        # isolates a single point without needing this.
+        self.capture_target: Optional[tuple] = None
         self.protect_ring_radius = 0
         self.restore_mass = True
         self.text_grounding_alpha = 0.0
@@ -682,6 +704,25 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
         is_conditional, instance_position_mask_list, seq_len, HW, image_token_H, image_token_W,
         query.device,
     )
+
+    if QUERY_BLUR.capture_only and (
+        QUERY_BLUR.capture_target is None or QUERY_BLUR.capture_target == (step_idx, stream, layer_idx)
+    ):
+        # Stash the raw (mask-applied, pre-blur/pre-boost) logits plus everything
+        # needed to reconstruct any variant offline, then abort -- see
+        # visualize_attention_variants.py. Cloning is required: z/V are views into
+        # this call's local tensors, which don't survive past this function returning
+        # (and we're about to raise instead of returning at all).
+        QUERY_BLUR.captured = dict(
+            z=z.detach().clone(),
+            V=V.detach().clone(),
+            instance_position_mask_list=[m.detach().clone() for m in instance_position_mask_list],
+            instance_text_index_lst=instance_text_index_lst,
+            seq_len=seq_len, HW=HW,
+            image_token_H=image_token_H, image_token_W=image_token_W,
+            step_idx=step_idx, stream=stream, layer_idx=layer_idx,
+        )
+        raise _CaptureAbort()
 
     # z_before/A_before are a second full [H, Lq, Lk] fp32 tensor pair, alive
     # alongside z/A_after -- only pay for that when stats were actually requested.
