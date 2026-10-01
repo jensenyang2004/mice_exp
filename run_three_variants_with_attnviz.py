@@ -59,6 +59,7 @@ from flux2.attention.attention_query_blur import (
     _build_instance_layout,
     _apply_query_logit_blur_,
     _apply_key_logit_blur_,
+    _apply_ring_hard_mask_,
 )
 from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range
 from visualize_attention_variants import (
@@ -271,6 +272,12 @@ def _compute_attention_maps(args, variant, ring_radius, sigma, captured):
     )
 
     z = z0.clone()
+    # Ring is a hard -inf block on k's own queries reading its protective boundary
+    # band, applied BEFORE blur -- matches _manual_attention_with_blur's real-pipeline
+    # order, so this offline reconstruction actually matches what the real generation
+    # (phase (a) in run_variant) did, not a weaker "don't blur the ring" approximation.
+    # No-op for variants 0-2 (ring_radius=0 -> own_ring_flat is all-False everywhere).
+    _apply_ring_hard_mask_(z, layouts, qi, own_ring_flat, seq_len, HW, background_index=None)
     if args.blur_axis == "key":
         _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, sigma,
                                 verify_mass=False, restore_mass=variant["restore_mass"])

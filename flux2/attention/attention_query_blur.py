@@ -680,6 +680,42 @@ def _apply_text_grounding_boost_(z: torch.Tensor, layouts, qi, own_masks_flat, i
     return z
 
 
+# --------------------------------------------------------------------------------------
+# Ring hard-block: a genuine -inf, not merely "don't blur this." Independent of
+# blur_axis -- it's a property of k's own row (what k is ALLOWED to see at all), not of
+# the blur math -- so it runs once, before either blur function, and both blur
+# functions' own ring exclusion (own_ring_flat) stays in place alongside it so neither
+# ever tries to read/write an already -inf'd cell.
+# --------------------------------------------------------------------------------------
+
+def _apply_ring_hard_mask_(z: torch.Tensor, layouts, qi, own_ring_flat, seq_len, HW,
+                            background_index: Optional[int] = None) -> torch.Tensor:
+    """In-place: for each real instance k, sets z[k's own queries, ring tokens] = -inf
+    on BOTH the target and context planes, where "ring tokens" (own_ring_flat[k]) are
+    tokens within protect_ring_radius of k's own boundary but NOT part of k -- regardless
+    of which other instance (or background) nominally claims them. This is the original
+    design intent ("it got a -inf"): k's queries are hard-blocked from that boundary
+    band entirely, not merely spared from being averaged into it by the blur. No-op
+    when ring_radius == 0 (own_ring_flat[k] is then all-False for every k).
+    Background (background_index) is skipped: its own_ring_flat would be the boundary
+    just inside neighboring real instances, which isn't a meaningful "own boundary" for
+    a residual region and was never the intent.
+    """
+    for k in range(len(layouts)):
+        if layouts[k] is None or k == background_index:
+            continue
+        ring_k = own_ring_flat[k]
+        if not bool(ring_k.any()):
+            continue
+        qk = qi[k]
+        ring_flat = ring_k.nonzero(as_tuple=True)[0]
+        kt = seq_len + ring_flat
+        kc = seq_len + HW + ring_flat
+        z[:, qk.unsqueeze(-1), kt] = -float('inf')
+        z[:, qk.unsqueeze(-1), kc] = -float('inf')
+    return z
+
+
 def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_position_mask_list,
                                  seq_len, HW, image_token_H, image_token_W, step_idx, stream, layer_idx,
                                  is_conditional, instance_text_index_lst):
@@ -728,6 +764,9 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
     # alongside z/A_after -- only pay for that when stats were actually requested.
     log_stats = QUERY_BLUR.log_stats
     z_before = z.clone() if log_stats else None
+
+    if QUERY_BLUR.protect_ring_radius > 0:
+        _apply_ring_hard_mask_(z, layouts, qi, own_ring_flat, seq_len, HW, background_index=background_index)
 
     if QUERY_BLUR.blur_axis == "key":
         _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, QUERY_BLUR.sigma,
