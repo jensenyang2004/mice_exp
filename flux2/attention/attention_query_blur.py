@@ -681,11 +681,14 @@ def _apply_text_grounding_boost_(z: torch.Tensor, layouts, qi, own_masks_flat, i
 
 
 # --------------------------------------------------------------------------------------
-# Ring hard-block: a genuine -inf, not merely "don't blur this." Independent of
-# blur_axis -- it's a property of k's own row (what k is ALLOWED to see at all), not of
-# the blur math -- so it runs once, before either blur function, and both blur
-# functions' own ring exclusion (own_ring_flat) stays in place alongside it so neither
-# ever tries to read/write an already -inf'd cell.
+# Ring hard-block (REJECTED ABLATION -- not called anywhere by default; kept only for
+# documentation/reproducibility). A genuine -inf, as opposed to the soft exclusion
+# actually in use (own_ring_flat just keeps the blur from WRITING to a ring token --
+# the token's raw, un-blurred attention value survives). Tried wiring this into
+# _manual_attention_with_blur; empirically it regressed benchmark scores back toward
+# vanilla MICE's behavior (same class of degradation the soft ring was built to avoid),
+# so it was reverted. Do not call this from the real generation path without
+# re-validating against the benchmark first.
 # --------------------------------------------------------------------------------------
 
 def _apply_ring_hard_mask_(z: torch.Tensor, layouts, qi, own_ring_flat, seq_len, HW,
@@ -693,10 +696,9 @@ def _apply_ring_hard_mask_(z: torch.Tensor, layouts, qi, own_ring_flat, seq_len,
     """In-place: for each real instance k, sets z[k's own queries, ring tokens] = -inf
     on BOTH the target and context planes, where "ring tokens" (own_ring_flat[k]) are
     tokens within protect_ring_radius of k's own boundary but NOT part of k -- regardless
-    of which other instance (or background) nominally claims them. This is the original
-    design intent ("it got a -inf"): k's queries are hard-blocked from that boundary
-    band entirely, not merely spared from being averaged into it by the blur. No-op
-    when ring_radius == 0 (own_ring_flat[k] is then all-False for every k).
+    of which other instance (or background) nominally claims them. Hard-blocks k's
+    queries from that boundary band entirely, rather than merely sparing it from the
+    blur. No-op when ring_radius == 0 (own_ring_flat[k] is then all-False for every k).
     Background (background_index) is skipped: its own_ring_flat would be the boundary
     just inside neighboring real instances, which isn't a meaningful "own boundary" for
     a residual region and was never the intent.
@@ -765,9 +767,16 @@ def _manual_attention_with_blur(query, key, value, atten_mask, scale, instance_p
     log_stats = QUERY_BLUR.log_stats
     z_before = z.clone() if log_stats else None
 
-    if QUERY_BLUR.protect_ring_radius > 0:
-        _apply_ring_hard_mask_(z, layouts, qi, own_ring_flat, seq_len, HW, background_index=background_index)
-
+    # NOTE: a hard -inf ring (_apply_ring_hard_mask_, defined below) was tried here and
+    # empirically regressed benchmark scores back toward vanilla MICE's behavior --
+    # reverted. The real ring effect comes entirely from the SOFT exclusion already
+    # built into own_ring_flat (cross_keys / _apply_key_logit_blur_'s own `keep` filter,
+    # see _build_instance_layout): a ring token is simply never written by the blur, so
+    # it keeps its natural, un-blurred attention value instead of being smoothed into
+    # the rest of its source instance -- not a hard block on attending there at all.
+    # Do not reintroduce a call to _apply_ring_hard_mask_ here without re-validating
+    # against the benchmark; capture_query_blur_leakage.py's numbers depend on this
+    # staying soft-exclusion-only.
     if QUERY_BLUR.blur_axis == "key":
         _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, QUERY_BLUR.sigma,
                                 verify_mass=QUERY_BLUR.verify_mass, mass_tol=QUERY_BLUR.mass_tol,

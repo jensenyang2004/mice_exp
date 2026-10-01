@@ -54,7 +54,6 @@ from flux2.attention.attention_query_blur import (
     _apply_query_logit_blur_,
     _apply_key_logit_blur_,
     _apply_text_grounding_boost_,
-    _apply_ring_hard_mask_,
 )
 from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range
 
@@ -166,19 +165,18 @@ def _make_variants(captured, args, device):
     blur(z3, layouts0, qi0, cross_keys0, own_masks_flat0, own_ring_flat0, restore_mass=True)
     variants["3_blur_mass"] = (torch.softmax(z3, dim=-1), layouts0, qi0)
 
-    # Ring is a hard -inf block on instance k's own queries reading its protective
-    # boundary band (own_ring_flatR) -- applied BEFORE blur, matching
-    # _manual_attention_with_blur's real-pipeline order, so these two variants'
-    # offline reconstruction actually matches what a real run with
-    # --protect_ring_radius produces (not merely "don't blur the ring", which was an
-    # earlier, weaker implementation).
+    # Ring here is the SOFT exclusion already built into own_ring_flatR (a ring token is
+    # simply never written by the blur -- see _build_instance_layout / blur()'s `keep`
+    # filter -- so it keeps its natural, un-blurred value rather than being smoothed in).
+    # A hard -inf block was tried and reverted (regressed benchmark scores toward
+    # vanilla MICE's behavior); see _apply_ring_hard_mask_'s docstring in
+    # attention_query_blur.py. This offline reconstruction intentionally matches that
+    # reverted, soft-only real-pipeline behavior.
     z4 = z0.clone()
-    _apply_ring_hard_mask_(z4, layoutsR, qiR, own_ring_flatR, seq_len, HW, background_index=None)
     blur(z4, layoutsR, qiR, cross_keysR, own_masks_flatR, own_ring_flatR, restore_mass=True)
     variants["4_blur_mass_ring"] = (torch.softmax(z4, dim=-1), layoutsR, qiR)
 
     z5 = z0.clone()
-    _apply_ring_hard_mask_(z5, layoutsR, qiR, own_ring_flatR, seq_len, HW, background_index=None)
     blur(z5, layoutsR, qiR, cross_keysR, own_masks_flatR, own_ring_flatR, restore_mass=True)
     _apply_text_grounding_boost_(z5, layoutsR, qiR, own_masks_flatR, instance_text_index_lst,
                                   seq_len, HW, args.text_alpha, background_index=None)

@@ -59,7 +59,6 @@ from flux2.attention.attention_query_blur import (
     _build_instance_layout,
     _apply_query_logit_blur_,
     _apply_key_logit_blur_,
-    _apply_ring_hard_mask_,
 )
 from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range
 from visualize_attention_variants import (
@@ -272,12 +271,15 @@ def _compute_attention_maps(args, variant, ring_radius, sigma, captured):
     )
 
     z = z0.clone()
-    # Ring is a hard -inf block on k's own queries reading its protective boundary
-    # band, applied BEFORE blur -- matches _manual_attention_with_blur's real-pipeline
-    # order, so this offline reconstruction actually matches what the real generation
-    # (phase (a) in run_variant) did, not a weaker "don't blur the ring" approximation.
-    # No-op for variants 0-2 (ring_radius=0 -> own_ring_flat is all-False everywhere).
-    _apply_ring_hard_mask_(z, layouts, qi, own_ring_flat, seq_len, HW, background_index=None)
+    # Ring here is the SOFT exclusion already built into own_ring_flat (a ring token is
+    # simply never written by the blur -- see _build_instance_layout's cross_keys /
+    # _apply_key_logit_blur_'s `keep` filter -- so it keeps its natural, un-blurred
+    # value rather than being smoothed in). A hard -inf block was tried and reverted
+    # (regressed benchmark scores toward vanilla MICE's behavior); see
+    # _apply_ring_hard_mask_'s docstring in attention_query_blur.py. This offline
+    # reconstruction intentionally matches that reverted, soft-only real-pipeline
+    # behavior (variant 3's image, from run_variant's phase (a), was generated the
+    # same way).
     if args.blur_axis == "key":
         _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, sigma,
                                 verify_mass=False, restore_mass=variant["restore_mass"])
