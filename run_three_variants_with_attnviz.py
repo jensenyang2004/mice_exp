@@ -12,7 +12,10 @@ Variant 0: baseline, --free_latent only (sigma=0, no intervention at all -- what
            mask alone produces, the reference point the other three are measured against)
 Variant 1: blurring + mass adjustment   (sigma=inf, restore_mass=True,  ring=0)
 Variant 2: blurring only                (sigma=inf, restore_mass=False, ring=0)
-Variant 3: blurring + outline carve N   (sigma=inf, restore_mass=True,  ring=--ring_radius)
+Variant 3: blurring + outline carve N   (sigma=inf, restore_mass=False, ring=--ring_radius)
+           -- same as variant 2 (no mass adjustment) but with the ring exclusion added,
+           NOT variant 1 with a ring added. If you want mass adjustment WITH the ring
+           instead, flip this variant's restore_mass back to True in the VARIANTS list.
 
 For each variant this runs pipe() TWICE with the identical seed and generation config
 (only QUERY_BLUR's intervention settings differ from one call to the next within a
@@ -39,7 +42,7 @@ import argparse
 from pathlib import Path
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -58,7 +61,13 @@ from flux2.attention.attention_query_blur import (
     _apply_key_logit_blur_,
 )
 from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range
-from visualize_attention_variants import _heatmap_panel, _row_stats
+from visualize_attention_variants import (
+    _heatmap_panel,
+    _attention_map_panel,
+    _draw_mask_contour,
+    _colorbar_strip,
+    _row_stats,
+)
 
 SEED = 0
 
@@ -106,6 +115,19 @@ def parse_args():
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of instance indices to visualize")
 
+    # Attention-map rendering.
+    parser.add_argument("--map_style", type=str, default="pure", choices=["pure", "overlay"],
+                         help="'pure' (default): the attention map on its own, as a colormapped token grid -- much "
+                              "easier to read than the photo-overlay. 'overlay': the old red-tint-over-photo style.")
+    parser.add_argument("--map_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"],
+                         help="Display transfer curve. Attention is extremely peaky, so 'linear' buries everything "
+                              "but the hottest few tokens; 'sqrt' (default) and 'log' lift the low/mid range into "
+                              "view. Use 'linear' only when you want true proportions.")
+    parser.add_argument("--map_px", type=int, default=384, help="Rendered size (px) of each attention-map panel")
+    parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True,
+                         help="Draw instance k's own footprint as a contour on pure maps -- without the photo "
+                              "underneath there's otherwise no spatial anchor telling you where k actually is.")
+
     args = parser.parse_args()
 
     args.masking_steps = list(range(0, args.num_inference_steps)) if args.masking_steps == "all" else str2list(args.masking_steps)
@@ -125,7 +147,7 @@ VARIANTS = [
     dict(name="0_baseline_free_latent", sigma=0.0, restore_mass=True, ring_radius=0),
     dict(name="1_blur_mass", sigma=None, restore_mass=True, ring_radius=0),
     dict(name="2_blur_only", sigma=None, restore_mass=False, ring_radius=0),
-    dict(name="3_blur_mass_ring", sigma=None, restore_mass=True, ring_radius=None),  # ring_radius filled from args
+    dict(name="3_blur_ring", sigma=None, restore_mass=False, ring_radius=None),  # ring_radius filled from args
 ]
 
 
@@ -222,12 +244,21 @@ def run_variant(args, pipe, attn_proc, parallel_attn_proc, sample, device, varia
     captured = QUERY_BLUR.captured
     if captured is None:
         logger.error(f"[{name}] no snapshot captured.")
-        return
+        return None
 
-    _save_attention_viz(args, variant, ring_radius, sigma, captured, sample, out_dir)
+    # Return the maps instead of rendering here: panels can only share a color scale
+    # once every variant's values are known, so rendering waits until main() has them all.
+    return _compute_attention_maps(args, variant, ring_radius, sigma, captured)
 
 
-def _save_attention_viz(args, variant, ring_radius, sigma, captured, sample, out_dir):
+def _compute_attention_maps(args, variant, ring_radius, sigma, captured):
+    """Reapplies this variant's own intervention to the captured pre-intervention
+    logits, then extracts per-instance target/context attention maps (post-softmax,
+    averaged over heads and over all of instance k's own queries).
+
+    Returns {k: dict(target=[Ht,Wt], context=[Ht,Wt], own_mask=[Ht,Wt] bool, stats=...)}.
+    Rendering is deliberately NOT done here -- see run_variant's note on shared scales.
+    """
     z0 = captured['z']
     device = z0.device
     seq_len, HW = captured['seq_len'], captured['HW']
@@ -250,33 +281,74 @@ def _save_attention_viz(args, variant, ring_radius, sigma, captured, sample, out
 
     K = len(layouts)
     target_ks = range(K) if args.instance_idx is None else sorted(args.instance_idx & set(range(K)))
-    image = sample['image']
-    panel_size = 256
-    label_h = 60
 
+    maps = {}
     for k in target_ks:
         if layouts[k] is None:
             continue
         qk = qi[k]
         attn_row = A[:, qk, :].mean(dim=(0, 1))
-        target_map = attn_row[seq_len:seq_len + HW].reshape(image_token_H, image_token_W).float().cpu().numpy()
-        context_map = attn_row[seq_len + HW:seq_len + 2 * HW].reshape(image_token_H, image_token_W).float().cpu().numpy()
-        own_mass, cross_mass, text_mass, other_mass = _row_stats(attn_row, layouts, k, seq_len, HW)
+        maps[k] = dict(
+            target=attn_row[seq_len:seq_len + HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
+            context=attn_row[seq_len + HW:seq_len + 2 * HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
+            own_mask=own_masks_flat[k].reshape(image_token_H, image_token_W).cpu().numpy().astype(bool),
+            stats=_row_stats(attn_row, layouts, k, seq_len, HW),
+        )
+    return maps
 
-        base_panel = image.resize((panel_size, panel_size), resample=Image.BILINEAR)
-        canvas = Image.new("RGB", (panel_size * 2, label_h + panel_size), (255, 255, 255))
-        from PIL import ImageDraw
+
+def _render_variant_maps(args, variant_name, maps, vmax_by_plane, sample, out_dir):
+    """One PNG per (variant, instance): target | context, as PURE attention heatmaps.
+
+    `vmax_by_plane` is shared across every variant (see main()), so brightness is
+    directly comparable panel-to-panel and file-to-file -- the whole point of the
+    figure. Each panel is captioned with its own max so an all-dim panel is still
+    readable as "genuinely low", not "rendering artifact".
+    """
+    image = sample['image']
+    label_h, caption_h, gap = 42, 46, 10
+    pure = args.map_style == "pure"
+
+    for k, m in maps.items():
+        own_mass, cross_mass, text_mass, other_mass = m['stats']
+        # Panel size follows the TOKEN GRID's aspect ratio, not a forced square --
+        # the grid is only square for square source images, and stretching it would
+        # move every token off its true relative position.
+        Ht, Wt = m['target'].shape
+        pw = args.map_px
+        ph = max(1, int(round(pw * Ht / Wt)))
+        panel_size = (pw, ph)
+
+        canvas_w = pw * 2 + gap
+        canvas = Image.new("RGB", (canvas_w, label_h + ph + caption_h), (255, 255, 255))
         draw = ImageDraw.Draw(canvas)
-        draw.text((5, 5), f"{variant['name']}  k={k}  own={own_mass:.2f} x-inst={cross_mass:.2f} text={text_mass:.2f} other={other_mass:.2f}", fill=(0, 0, 0))
+        draw.text((4, 4), f"{variant_name}   k={k}   scale={args.map_scale}", fill=(0, 0, 0))
+        draw.text((4, 20), f"own={own_mass:.3f}  x-inst={cross_mass:.3f}  text={text_mass:.3f}  other={other_mass:.3f}",
+                  fill=(60, 60, 60))
 
-        target_panel = _heatmap_panel(target_map, base_panel, target_map.max())
-        canvas.paste(target_panel, (0, label_h))
-        context_panel = _heatmap_panel(context_map, base_panel, context_map.max())
-        canvas.paste(context_panel, (panel_size, label_h))
+        for col, plane in enumerate(("target", "context")):
+            x0 = col * (pw + gap)
+            if pure:
+                panel = _attention_map_panel(m[plane], vmax_by_plane[plane], panel_size, args.map_scale)
+            else:
+                panel = _heatmap_panel(m[plane], image.resize(panel_size, resample=Image.BILINEAR),
+                                        vmax_by_plane[plane])
+            canvas.paste(panel, (x0, label_h))
+            if pure and args.outline_instance:
+                _draw_mask_contour(draw, m['own_mask'], panel_size, (x0, label_h))
+            draw.text((x0 + 4, label_h + ph + 4),
+                      f"{plane}  (panel max={m[plane].max():.4f}, shared vmax={vmax_by_plane[plane]:.4f})",
+                      fill=(0, 0, 0))
 
-        out_path = out_dir / f"{sample['sample_id']}_{variant['name']}_k{k}_attnviz.png"
+        if pure:
+            bar_y = label_h + ph + caption_h - 16
+            canvas.paste(_colorbar_strip(canvas_w - 8), (4, bar_y))
+            draw.text((4, bar_y - 12), "0", fill=(0, 0, 0))
+            draw.text((canvas_w - 34, bar_y - 12), "vmax", fill=(0, 0, 0))
+
+        out_path = out_dir / f"{sample['sample_id']}_{variant_name}_k{k}_attnmap.png"
         canvas.save(out_path)
-        logger.info(f"[{variant['name']}] saved attention viz to {out_path}")
+        logger.info(f"[{variant_name}] saved attention map to {out_path}")
 
 
 def main():
@@ -308,8 +380,28 @@ def main():
         logger.error(f"sample_id {args.sample_id!r} not found in {args.dataset_root}")
         return
 
+    # Phase 1: generate + capture every variant, keeping the maps in memory.
+    maps_by_variant = {}
     for variant in VARIANTS:
-        run_variant(args, pipe, attn_proc, parallel_attn_proc, sample, device, variant, out_dir)
+        maps = run_variant(args, pipe, attn_proc, parallel_attn_proc, sample, device, variant, out_dir)
+        if maps:
+            maps_by_variant[variant["name"]] = maps
+
+    if not maps_by_variant:
+        logger.error("No attention maps captured for any variant -- nothing to render.")
+        return
+
+    # Phase 2: one color scale per plane across ALL variants, then render. Normalizing
+    # each panel to its own max (as this script first did) makes a brighter panel mean
+    # nothing -- the comparison only reads correctly on a shared scale.
+    vmax_by_plane = {
+        plane: max(float(m[plane].max()) for maps in maps_by_variant.values() for m in maps.values())
+        for plane in ("target", "context")
+    }
+    logger.info(f"Shared color scale across variants: {vmax_by_plane}")
+
+    for variant_name, maps in maps_by_variant.items():
+        _render_variant_maps(args, variant_name, maps, vmax_by_plane, sample, out_dir)
 
 
 if __name__ == "__main__":

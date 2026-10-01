@@ -104,6 +104,17 @@ def parse_args():
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of instance indices to visualize")
 
+    # Attention-map rendering.
+    parser.add_argument("--map_style", type=str, default="pure", choices=["pure", "overlay"],
+                         help="'pure' (default): the attention map on its own, as a colormapped token grid -- much "
+                              "easier to read than the photo-overlay. 'overlay': the old red-tint-over-photo style.")
+    parser.add_argument("--map_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"],
+                         help="Display transfer curve. Attention is extremely peaky, so 'linear' buries everything "
+                              "but the hottest few tokens; 'sqrt' (default) and 'log' lift the low/mid range into view.")
+    parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True,
+                         help="Draw instance k's own footprint as a contour on pure maps -- without the photo "
+                              "underneath there's otherwise no spatial anchor telling you where k actually is.")
+
     args = parser.parse_args()
 
     args.masking_steps = list(range(0, args.num_inference_steps)) if args.masking_steps == "all" else str2list(args.masking_steps)
@@ -192,12 +203,90 @@ def _heatmap_panel(values_2d: np.ndarray, base_image: Image.Image, vmax: float) 
     """values_2d: [Hk, Wk] non-negative floats. Upsamples (nearest, matching each cell
     to its 16px token patch) to base_image's size and overlays as a red-tinted alpha
     blend -- same convention as the existing debug_vis code in
-    attention_processor_APITASM_kernel_nonlap.py."""
+    attention_processor_APITASM_kernel_nonlap.py. See _attention_map_panel for the
+    pure-heatmap (no photo underneath) alternative, which is much easier to read when
+    comparing variants."""
     scaled = np.sqrt(np.clip(values_2d, 0, None) / max(vmax, 1e-12))  # sqrt: attention is peaky, linear washes out
     heat_uint8 = (np.clip(scaled, 0, 1) * 255).astype(np.uint8)
     heat_img = Image.fromarray(heat_uint8, mode='L').resize(base_image.size, resample=Image.NEAREST)
     red = Image.new("RGB", base_image.size, (255, 0, 0))
     return Image.composite(red, base_image.convert("RGB"), heat_img)
+
+
+# Inferno-ish anchors (dark -> purple -> red -> orange -> pale yellow), sampled coarsely
+# and linearly interpolated. Hand-rolled rather than pulled from matplotlib: nothing in
+# this repo depends on matplotlib and a visualization helper isn't worth adding it for.
+_CMAP_ANCHORS = np.array([
+    [0.001, 0.000, 0.014], [0.078, 0.044, 0.214], [0.231, 0.060, 0.437],
+    [0.391, 0.100, 0.502], [0.550, 0.161, 0.506], [0.716, 0.215, 0.475],
+    [0.867, 0.318, 0.376], [0.955, 0.491, 0.216], [0.988, 0.681, 0.111],
+    [0.945, 0.876, 0.265], [0.988, 0.998, 0.645],
+])
+
+
+def _apply_colormap(norm01: np.ndarray) -> np.ndarray:
+    """norm01: [H, W] floats already in [0, 1]. Returns uint8 [H, W, 3]."""
+    xs = np.linspace(0.0, 1.0, len(_CMAP_ANCHORS))
+    flat = np.clip(norm01, 0.0, 1.0).ravel()
+    rgb = np.stack([np.interp(flat, xs, _CMAP_ANCHORS[:, c]) for c in range(3)], axis=-1)
+    return (rgb.reshape(norm01.shape + (3,)) * 255).astype(np.uint8)
+
+
+def _rescale_for_display(values_2d: np.ndarray, vmax: float, scale: str) -> np.ndarray:
+    """Attention is extremely peaky, so a linear ramp buries everything except the few
+    hottest tokens. 'sqrt' (default) and 'log' lift the mid/low range into view; use
+    'linear' when you specifically want true proportions."""
+    v = np.clip(values_2d, 0.0, None) / max(vmax, 1e-12)
+    if scale == "sqrt":
+        v = np.sqrt(v)
+    elif scale == "log":
+        v = np.log1p(v * 99.0) / np.log(100.0)
+    elif scale != "linear":
+        raise ValueError(f"unknown map scale {scale!r}")
+    return np.clip(v, 0.0, 1.0)
+
+
+def _draw_mask_contour(draw: ImageDraw.ImageDraw, mask2d: np.ndarray, out_size, offset,
+                        color=(0, 255, 255), width=2):
+    """Outlines `mask2d` (bool, at token resolution) on an already-upscaled panel by
+    drawing only those cell edges whose neighbor is outside the mask -- i.e. a real
+    contour, not a box per cell. Without the photo underneath, a pure heatmap has no
+    spatial anchor; this puts instance k's own footprint back without tinting any
+    attention values."""
+    Ht, Wt = mask2d.shape
+    ox, oy = offset
+    cw = out_size[0] / Wt
+    ch = out_size[1] / Ht
+    for y in range(Ht):
+        for x in range(Wt):
+            if not mask2d[y, x]:
+                continue
+            x0, y0 = ox + x * cw, oy + y * ch
+            x1, y1 = ox + (x + 1) * cw, oy + (y + 1) * ch
+            if y == 0 or not mask2d[y - 1, x]:
+                draw.line([(x0, y0), (x1, y0)], fill=color, width=width)
+            if y == Ht - 1 or not mask2d[y + 1, x]:
+                draw.line([(x0, y1), (x1, y1)], fill=color, width=width)
+            if x == 0 or not mask2d[y, x - 1]:
+                draw.line([(x0, y0), (x0, y1)], fill=color, width=width)
+            if x == Wt - 1 or not mask2d[y, x + 1]:
+                draw.line([(x1, y0), (x1, y1)], fill=color, width=width)
+
+
+def _attention_map_panel(values_2d: np.ndarray, vmax: float, out_size, scale: str = "sqrt") -> Image.Image:
+    """Pure attention heatmap -- no source photo underneath. NEAREST upscaling keeps the
+    token grid honest (one block per 16px token) rather than inventing smooth gradients
+    the attention map doesn't actually have."""
+    norm = _rescale_for_display(values_2d, vmax, scale)
+    rgb = _apply_colormap(norm)
+    return Image.fromarray(rgb, mode="RGB").resize(out_size, resample=Image.NEAREST)
+
+
+def _colorbar_strip(width: int, height: int = 12) -> Image.Image:
+    """Horizontal 0 -> vmax colormap legend. Needed once the photo is gone: with a pure
+    heatmap there's nothing else telling the reader which end is hot."""
+    ramp = np.linspace(0.0, 1.0, max(width, 2))[None, :]
+    return Image.fromarray(_apply_colormap(ramp), mode="RGB").resize((width, height), resample=Image.BILINEAR)
 
 
 def visualize_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device):
@@ -271,7 +360,12 @@ def visualize_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device):
     target_ks = range(K) if args.instance_idx is None else sorted(args.instance_idx & set(range(K)))
 
     variant_names = list(variants.keys())
-    panel_size = 256
+    # Panel follows the TOKEN GRID's aspect ratio rather than a forced square: the grid
+    # is only square for square source images, and stretching it would move every token
+    # off its true relative position.
+    panel_w = 256
+    panel_h = max(1, int(round(panel_w * image_token_H / image_token_W)))
+    panel_size = (panel_w, panel_h)
     label_h = 60
     row_label_w = 90
 
@@ -299,26 +393,41 @@ def visualize_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device):
         target_vmax = max(m.max() for m in target_maps)
         context_vmax = max(m.max() for m in context_maps)
 
-        canvas_w = row_label_w + panel_size * len(variant_names)
-        canvas_h = label_h + panel_size * 2 + label_h  # column titles + 2 rows + footer stats
+        canvas_w = row_label_w + panel_w * len(variant_names)
+        canvas_h = label_h + panel_h * 2 + label_h  # column titles + 2 rows + footer stats
         canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
         draw = ImageDraw.Draw(canvas)
 
-        base_panel = image.resize((panel_size, panel_size), resample=Image.BILINEAR)
-        draw.text((5, label_h + panel_size // 2 - 8), "target", fill=(0, 0, 0))
-        draw.text((5, label_h + panel_size + panel_size // 2 - 8), "context", fill=(0, 0, 0))
+        base_panel = image.resize(panel_size, resample=Image.BILINEAR)
+        draw.text((5, label_h + panel_h // 2 - 8), "target", fill=(0, 0, 0))
+        draw.text((5, label_h + panel_h + panel_h // 2 - 8), "context", fill=(0, 0, 0))
+
+        pure = args.map_style == "pure"
+        # Instance k's own footprint, for the contour -- a pure heatmap has no photo
+        # underneath to tell the reader where k actually sits.
+        own_mask = np.zeros(image_token_H * image_token_W, dtype=bool)
+        own_mask[layouts0[k]['flat'].cpu().numpy()] = True
+        own_mask = own_mask.reshape(image_token_H, image_token_W)
 
         for i, name in enumerate(variant_names):
-            x0 = row_label_w + i * panel_size
+            x0 = row_label_w + i * panel_w
             draw.text((x0 + 5, 5), name, fill=(0, 0, 0))
 
-            target_panel = _heatmap_panel(target_maps[i], base_panel, target_vmax)
-            canvas.paste(target_panel, (x0, label_h))
+            for row, (maps_list, vmax) in enumerate(((target_maps, target_vmax), (context_maps, context_vmax))):
+                y0 = label_h + row * panel_h
+                if pure:
+                    panel = _attention_map_panel(maps_list[i], vmax, panel_size, args.map_scale)
+                else:
+                    panel = _heatmap_panel(maps_list[i], base_panel, vmax)
+                canvas.paste(panel, (x0, y0))
+                if pure and args.outline_instance:
+                    _draw_mask_contour(draw, own_mask, panel_size, (x0, y0), width=1)
 
-            context_panel = _heatmap_panel(context_maps[i], base_panel, context_vmax)
-            canvas.paste(context_panel, (x0, label_h + panel_size))
+            draw.text((x0 + 2, label_h + panel_h * 2 + 4), stat_lines[i], fill=(0, 0, 0))
 
-            draw.text((x0 + 2, label_h + panel_size * 2 + 4), stat_lines[i], fill=(0, 0, 0))
+        if pure:
+            canvas.paste(_colorbar_strip(panel_w), (row_label_w, canvas_h - 14))
+            draw.text((5, canvas_h - 16), f"0 -> vmax ({args.map_scale})", fill=(0, 0, 0))
 
         out_path = Path(args.output_dir) / f"{sample['sample_id']}_k{k}_attnviz.png"
         out_path.parent.mkdir(parents=True, exist_ok=True)
