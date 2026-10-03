@@ -19,18 +19,20 @@ orthogonal axis not touched here). Two axes this script adds:
                  of reusing _apply_key_logit_blur_'s unmodified loop, are never rendered
                  or counted here -- this script only ever reports on REAL instances).
 
-  --groupings {per_source, combined}
-      per_source: today's default -- each eligible source blurred independently (its
-                  own local mean/kernel), matching _apply_key_logit_blur_ exactly.
-      combined:   every eligible source for a given k (other instances, and
-                  background if --sources includes it) pooled into ONE region and
-                  blurred TOGETHER with a single shared kernel -- one flattened value
-                  for ALL foreign content a query reads, not one per source.
+  --scopes {cross_only, full_map}
+      cross_only: today's validated default -- k's own tokens are NEVER blurred, only
+                  foreign (cross-instance) tokens are, each source blurred
+                  independently, matching _apply_key_logit_blur_ exactly. --sources
+                  controls which foreign regions count as eligible sources here.
+      full_map:   the deliberate opposite -- blurs the ENTIRE target-plane/context-
+                  plane canvas for k's queries with one shared kernel, k's own region
+                  and background included, no exclusions at all. --sources is ignored
+                  for this scope (there's no source-eligibility concept when
+                  everything is included), so it only ever produces one variant per
+                  (plane, sigma) regardless of --sources.
 
---sigma_list sweeps kernel size across every (source, grouping) combination (cartesian
-product). Default variant set = {others, others_bg} x {per_source, combined} x {inf}:
-4 variants = your two new ideas, today's validated baseline, and the one natural extra
-point (combine other instances only, no background) that falls out of the same 2x2.
+--sigma_list sweeps kernel size across every (source, scope) combination (cartesian
+product, minus the --sources dedup for full_map noted above).
 
 Renders one PNG per instance: all requested variants as columns, target/context as
 rows, pure colormapped heatmaps on a SHARED scale across every variant (so brightness
@@ -95,7 +97,7 @@ SEED = 0
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Compare key-axis blur strategies (source scope x grouping x kernel size) on one sample's attention.")
+    parser = argparse.ArgumentParser(description="Compare key-axis blur strategies (source scope x blur scope x kernel size) on one sample's attention.")
 
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument("--dataset_root", type=str, default="../mice_bench")
@@ -134,13 +136,15 @@ def parse_args():
     parser.add_argument("--sources", type=str, default="others,others_bg",
                          help="Comma list from {others, others_bg}. 'others' = today's validated default (only "
                               "other real instances are sources). 'others_bg' = background also becomes a source.")
-    parser.add_argument("--groupings", type=str, default="per_source,combined",
-                         help="Comma list from {per_source, combined}. 'per_source' = today's default (each "
-                              "source blurred independently). 'combined' = all eligible sources for a given "
-                              "query pooled into one region, blurred together with a single shared kernel.")
+    parser.add_argument("--scopes", type=str, default="cross_only,full_map",
+                         help="Comma list from {cross_only, full_map}. 'cross_only' = today's validated default "
+                              "(k's own tokens are never blurred, only foreign/cross-instance ones, each source "
+                              "independently). 'full_map' = the opposite -- blurs the ENTIRE target/context "
+                              "canvas for k's queries with one shared kernel, k's own region AND background "
+                              "included, no exclusions. --sources is ignored for full_map.")
     parser.add_argument("--sigma_list", type=str, default="inf",
                          help="Comma list of sigma values (e.g. 'inf,8,4,2'), crossed with every "
-                              "(source, grouping) pair. 'inf' is the global masked-mean limit.")
+                              "(source, scope) pair. 'inf' is the global masked-mean limit.")
     parser.add_argument("--planes", type=str, default="both",
                          help="Comma list from {both, target, context}. 'both' = today's default (a source's "
                               "target-plane and context-plane keys are both blurred, mass restored on their "
@@ -173,95 +177,59 @@ def parse_args():
     args.hard_image_attribute_binding_list_double = parse_layer_range(args.hard_image_attribute_binding_list_double)
     args.hard_image_attribute_binding_list_single = parse_layer_range(args.hard_image_attribute_binding_list_single)
     args.sources = args.sources.split(',')
-    args.groupings = args.groupings.split(',')
+    args.scopes = args.scopes.split(',')
     args.sigma_list = [float('inf') if s.strip().lower() == 'inf' else float(s) for s in args.sigma_list.split(',')]
     args.planes = args.planes.split(',')
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for s in args.sources:
         if s not in ("others", "others_bg"):
             parser.error(f"--sources entries must be 'others' or 'others_bg', got {s!r}")
-    for g in args.groupings:
-        if g not in ("per_source", "combined"):
-            parser.error(f"--groupings entries must be 'per_source' or 'combined', got {g!r}")
+    for sc in args.scopes:
+        if sc not in ("cross_only", "full_map"):
+            parser.error(f"--scopes entries must be 'cross_only' or 'full_map', got {sc!r}")
     for p in args.planes:
         if p not in ("both", "target", "context"):
             parser.error(f"--planes entries must be 'both', 'target', or 'context', got {p!r}")
     return args
 
 
-def _combined_source_key_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
-                                image_token_H, image_token_W, sigma, source_indices,
-                                real_ks, restore_mass=False):
-    """Pools every source in `source_indices` into ONE combined region per querying
-    instance k (restricted to `real_ks` -- background's own row, if present in
-    `layouts`, is never processed here), blurred together with a single shared kernel.
-
-    sigma=inf is a flat mean over the gathered logits directly -- no spatial structure
-    needed at all, since a global mean doesn't care about geometry, so this skips
-    building a canvas entirely (cheaper, and avoids an unnecessarily large [H,
-    image_token_H, image_token_W, n] intermediate). Finite sigma needs real spatial
-    structure (the pooled region is a scattered union of up to several disjoint
-    instances' footprints with no single compact bbox containing it without also
-    containing unrelated tokens), so that path scatters onto the FULL image grid and
-    reuses _blur_block (already generic over grid size -- this is exactly the same
-    masked-conv machinery the validated per-source blur uses, just given a bigger
-    canvas instead of one source's own small bbox).
+def _full_map_key_blur_(z, qi, seq_len, HW, image_token_H, image_token_W, sigma, real_ks, restore_mass=False):
+    """The deliberate opposite of _apply_key_logit_blur_/_apply_key_logit_blur_single_plane_:
+    those explicitly EXCLUDE a querying instance k's own tokens (and its protective
+    ring) from ever being blurred, only touching foreign cross-instance keys. This
+    blurs the ENTIRE target-plane and context-plane canvas for k's queries -- every
+    token, k's own region and background alike, no exclusions, no source-eligibility
+    concept at all -- with one shared kernel. Closest thing testable here to a flat
+    low-pass filter over the whole attention map. `qi[k] is None` (instance dropped
+    below --min_region_tokens) is skipped same as everywhere else.
 
     Target-plane and context-plane are blurred independently (same reasoning as
     _apply_key_logit_blur_: different token planes at the same coordinates, not
     spatial neighbors of each other); mass (if restore_mass) is restored on their
-    COMBINED total across every pooled source at once.
+    COMBINED total. sigma=inf and finite sigma both go through _blur_block directly
+    (mask of all ones -- no per-token exclusion), which already handles both cases.
     """
     if sigma == 0:
         return z
     H = z.shape[0]
+    flat_all = torch.arange(HW, device=z.device)
+    kt = seq_len + flat_all
+    kc = seq_len + HW + flat_all
+    M = torch.ones(1, image_token_H, image_token_W, 1, device=z.device)
     for k in real_ks:
-        if layouts[k] is None:
-            continue
         qk = qi[k]
-        n = qk.numel()
-        own_k = own_masks_flat[k]
-        ring_k = own_ring_flat[k]
-
-        parts = []
-        for kp in source_indices:
-            if kp == k or layouts[kp] is None:
-                continue
-            flat_kp = layouts[kp]['flat']
-            keep = ~own_k[flat_kp] & ~ring_k[flat_kp]
-            if keep.any():
-                parts.append(flat_kp[keep])
-        if not parts:
+        if qk is None:
             continue
-        # Defensive dedup: different sources shouldn't share a raw position after
-        # carving/overlap-exclusion, but a residual tie (e.g. two same-area instances
-        # --strict doesn't fully resolve) would otherwise double-count that position's
-        # contribution to the pooled mean/mass -- the same class of bug the per-source
-        # overlap-exclusion fix in _build_instance_layout was built to avoid.
-        combined_flat = torch.unique(torch.cat(parts))
-
-        kt = seq_len + combined_flat
-        kc = seq_len + HW + combined_flat
-        blk_t = z[:, qk][:, :, kt]      # [H, n, m]
+        n = qk.numel()
+        blk_t = z[:, qk][:, :, kt]      # [H, n, HW]
         blk_c = z[:, qk][:, :, kc]
         lse0 = torch.logsumexp(torch.cat([blk_t, blk_c], dim=-1), dim=-1) if restore_mass else None
 
-        if math.isinf(sigma):
-            blk_t_b = blk_t.mean(dim=-1, keepdim=True).expand_as(blk_t)
-            blk_c_b = blk_c.mean(dim=-1, keepdim=True).expand_as(blk_c)
-        else:
-            gy = combined_flat // image_token_W
-            gx = combined_flat % image_token_W
-            M = torch.zeros(1, image_token_H, image_token_W, 1, device=z.device, dtype=blk_t.dtype)
-            M[0, gy, gx, 0] = 1.0
+        Zt = blk_t.permute(0, 2, 1).reshape(H, image_token_H, image_token_W, n)
+        blk_t_b = _blur_block(Zt, M.to(blk_t.dtype), sigma).reshape(H, HW, n).permute(0, 2, 1)
 
-            Zt = blk_t.new_zeros(H, image_token_H, image_token_W, n)
-            Zt[:, gy, gx, :] = blk_t.permute(0, 2, 1)
-            blk_t_b = _blur_block(Zt, M, sigma)[:, gy, gx, :].permute(0, 2, 1)
-
-            Zc = blk_c.new_zeros(H, image_token_H, image_token_W, n)
-            Zc[:, gy, gx, :] = blk_c.permute(0, 2, 1)
-            blk_c_b = _blur_block(Zc, M, sigma)[:, gy, gx, :].permute(0, 2, 1)
+        Zc = blk_c.permute(0, 2, 1).reshape(H, image_token_H, image_token_W, n)
+        blk_c_b = _blur_block(Zc, M.to(blk_c.dtype), sigma).reshape(H, HW, n).permute(0, 2, 1)
 
         if restore_mass:
             lse1 = torch.logsumexp(torch.cat([blk_t_b, blk_c_b], dim=-1), dim=-1)
@@ -329,54 +297,29 @@ def _apply_key_logit_blur_single_plane_(z, layouts, qi, own_masks_flat, own_ring
     return z
 
 
-def _combined_source_key_blur_single_plane_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
-                                             image_token_H, image_token_W, sigma, source_indices, real_ks,
-                                             plane, restore_mass=False):
-    """Combined-grouping analog of _apply_key_logit_blur_single_plane_: pools every
-    source in `source_indices` into one region per querying instance (same as
-    _combined_source_key_blur_), but blurs/restores only the requested single plane --
-    the other plane is left completely untouched.
-    """
+def _full_map_key_blur_single_plane_(z, qi, seq_len, HW, image_token_H, image_token_W, sigma, plane,
+                                      real_ks, restore_mass=False):
+    """Single-plane analog of _full_map_key_blur_: blurs the ENTIRE canvas of just
+    `plane` ('target' or 'context') for every querying instance's queries -- the other
+    plane is left completely untouched, not blurred, not read into mass restoration."""
     assert plane in ("target", "context")
     if sigma == 0:
         return z
     H = z.shape[0]
     offset = seq_len if plane == "target" else seq_len + HW
+    flat_all = torch.arange(HW, device=z.device)
+    kk = offset + flat_all
+    M = torch.ones(1, image_token_H, image_token_W, 1, device=z.device)
     for k in real_ks:
-        if layouts[k] is None:
-            continue
         qk = qi[k]
-        n = qk.numel()
-        own_k = own_masks_flat[k]
-        ring_k = own_ring_flat[k]
-
-        parts = []
-        for kp in source_indices:
-            if kp == k or layouts[kp] is None:
-                continue
-            flat_kp = layouts[kp]['flat']
-            keep = ~own_k[flat_kp] & ~ring_k[flat_kp]
-            if keep.any():
-                parts.append(flat_kp[keep])
-        if not parts:
+        if qk is None:
             continue
-        combined_flat = torch.unique(torch.cat(parts))
-
-        kk = offset + combined_flat
-        blk = z[:, qk][:, :, kk]      # [H, n, m]
+        n = qk.numel()
+        blk = z[:, qk][:, :, kk]      # [H, n, HW]
         lse0 = torch.logsumexp(blk, dim=-1) if restore_mass else None
 
-        if math.isinf(sigma):
-            blk_b = blk.mean(dim=-1, keepdim=True).expand_as(blk)
-        else:
-            gy = combined_flat // image_token_W
-            gx = combined_flat % image_token_W
-            M = torch.zeros(1, image_token_H, image_token_W, 1, device=z.device, dtype=blk.dtype)
-            M[0, gy, gx, 0] = 1.0
-
-            Z = blk.new_zeros(H, image_token_H, image_token_W, n)
-            Z[:, gy, gx, :] = blk.permute(0, 2, 1)
-            blk_b = _blur_block(Z, M, sigma)[:, gy, gx, :].permute(0, 2, 1)
+        Z = blk.permute(0, 2, 1).reshape(H, image_token_H, image_token_W, n)
+        blk_b = _blur_block(Z, M.to(blk.dtype), sigma).reshape(H, HW, n).permute(0, 2, 1)
 
         if restore_mass:
             lse1 = torch.logsumexp(blk_b, dim=-1)
@@ -390,7 +333,7 @@ def _combined_source_key_blur_single_plane_(z, layouts, qi, own_masks_flat, own_
 # --------------------------------------------------------------------------------------
 # Real-generation support: one attention function + two processor classes, used ONLY by
 # --produce_images. Dispatches to THIS script's variant strategy (source scope x
-# grouping x sigma) instead of the validated per-(k,kp) default, every time the
+# blur scope x sigma) instead of the validated per-(k,kp) default, every time the
 # processor fires -- i.e. blur genuinely active at every step/layer of a real run, not
 # applied once to a frozen snapshot like the comparison above.
 # --------------------------------------------------------------------------------------
@@ -437,25 +380,21 @@ def _manual_attention_with_variant_blur(query, key, value, atten_mask, scale, in
                       else list(range(c['num_real'])))
 
     plane = spec.get("plane", "both")
-    if plane == "both":
-        if spec["grouping"] == "per_source":
-            _apply_key_logit_blur_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'], seq_len, HW,
-                                    spec["sigma"], verify_mass=False, background_index=None,
-                                    restore_mass=spec["restore_mass"])
+    if spec["scope"] == "full_map":
+        if plane == "both":
+            _full_map_key_blur_(z, c['qi'], seq_len, HW, image_token_H, image_token_W, spec["sigma"],
+                                 real_ks, restore_mass=spec["restore_mass"])
         else:
-            _combined_source_key_blur_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'], seq_len, HW,
-                                        image_token_H, image_token_W, spec["sigma"], source_indices, real_ks,
-                                        restore_mass=spec["restore_mass"])
+            _full_map_key_blur_single_plane_(z, c['qi'], seq_len, HW, image_token_H, image_token_W,
+                                              spec["sigma"], plane, real_ks, restore_mass=spec["restore_mass"])
+    elif plane == "both":
+        _apply_key_logit_blur_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'], seq_len, HW,
+                                spec["sigma"], verify_mass=False, background_index=None,
+                                restore_mass=spec["restore_mass"])
     else:
-        if spec["grouping"] == "per_source":
-            _apply_key_logit_blur_single_plane_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'],
-                                                 seq_len, HW, spec["sigma"], plane, background_index=None,
-                                                 restore_mass=spec["restore_mass"])
-        else:
-            _combined_source_key_blur_single_plane_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'],
-                                                     seq_len, HW, image_token_H, image_token_W, spec["sigma"],
-                                                     source_indices, real_ks, plane,
-                                                     restore_mass=spec["restore_mass"])
+        _apply_key_logit_blur_single_plane_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'],
+                                             seq_len, HW, spec["sigma"], plane, background_index=None,
+                                             restore_mass=spec["restore_mass"])
 
     A = torch.softmax(z, dim=-1)
     out = torch.matmul(A.to(v_.dtype), V)
@@ -776,14 +715,25 @@ class _VariantBlurParallelAttnProcessor:
 
 def _variant_specs(args):
     specs = []
-    for src in args.sources:
-        for grp in args.groupings:
+    for scope in args.scopes:
+        if scope == "full_map":
+            # --sources has no meaning here (everything is included, there's no
+            # eligibility concept) -- iterate it exactly once to avoid emitting
+            # duplicate, identical variants for every --sources entry.
             for plane in args.planes:
                 for sigma in args.sigma_list:
                     sigma_tag = "inf" if math.isinf(sigma) else str(sigma).replace('.', 'p')
-                    name = f"src-{src}_grp-{grp}_pln-{plane}_sig-{sigma_tag}"
-                    specs.append(dict(name=name, source=src, grouping=grp, plane=plane, sigma=sigma,
+                    name = f"scope-full_map_pln-{plane}_sig-{sigma_tag}"
+                    specs.append(dict(name=name, source=None, scope=scope, plane=plane, sigma=sigma,
                                        restore_mass=args.restore_mass))
+        else:
+            for src in args.sources:
+                for plane in args.planes:
+                    for sigma in args.sigma_list:
+                        sigma_tag = "inf" if math.isinf(sigma) else str(sigma).replace('.', 'p')
+                        name = f"src-{src}_scope-{scope}_pln-{plane}_sig-{sigma_tag}"
+                        specs.append(dict(name=name, source=src, scope=scope, plane=plane, sigma=sigma,
+                                           restore_mass=args.restore_mass))
     return specs
 
 
@@ -795,33 +745,33 @@ def _compute_variant_maps(spec, layouts_with_bg, layouts_no_bg, qi, own_masks_fl
     plane = spec.get("plane", "both")
 
     z = z0.clone()
-    if plane == "both":
-        if spec["grouping"] == "per_source":
-            # Reuses the VALIDATED per-source blur exactly as-is -- background is
-            # included or excluded purely by whether its layout entry is present
-            # (layouts_no_bg has it nulled out, so the function's own
-            # `if layouts[kp] is None: continue` skips it naturally).
-            # background_index=None throughout: when background's layout IS present,
-            # this also blurs background's OWN row as an inert side effect of reusing
-            # the unmodified loop -- harmless, since that row is never read below.
-            _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, spec["sigma"],
-                                    verify_mass=False, background_index=None, restore_mass=restore_mass)
+    if spec["scope"] == "full_map":
+        # The opposite of cross_only: blurs the WHOLE canvas (k's own region and
+        # background included, no exclusions), so it needs none of layouts/
+        # own_masks_flat/own_ring_flat/source_indices -- just qi + real_ks + grid size.
+        if plane == "both":
+            _full_map_key_blur_(z, qi, seq_len, HW, image_token_H, image_token_W, spec["sigma"],
+                                 real_ks, restore_mass=restore_mass)
         else:
-            _combined_source_key_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
-                                        image_token_H, image_token_W, spec["sigma"], source_indices,
-                                        real_ks, restore_mass=restore_mass)
+            _full_map_key_blur_single_plane_(z, qi, seq_len, HW, image_token_H, image_token_W,
+                                              spec["sigma"], plane, real_ks, restore_mass=restore_mass)
+    elif plane == "both":
+        # Reuses the VALIDATED per-source blur exactly as-is -- background is
+        # included or excluded purely by whether its layout entry is present
+        # (layouts_no_bg has it nulled out, so the function's own
+        # `if layouts[kp] is None: continue` skips it naturally).
+        # background_index=None throughout: when background's layout IS present,
+        # this also blurs background's OWN row as an inert side effect of reusing
+        # the unmodified loop -- harmless, since that row is never read below.
+        _apply_key_logit_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, spec["sigma"],
+                                verify_mass=False, background_index=None, restore_mass=restore_mass)
     else:
         # Plane-isolated diagnostic: only `plane`'s keys are touched at all -- the
         # other plane is left byte-for-byte as it was pre-blur, including for mass
         # restoration (restored within `plane` alone, not the combined total).
-        if spec["grouping"] == "per_source":
-            _apply_key_logit_blur_single_plane_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
-                                                 spec["sigma"], plane, background_index=None,
-                                                 restore_mass=restore_mass)
-        else:
-            _combined_source_key_blur_single_plane_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
-                                                     image_token_H, image_token_W, spec["sigma"], source_indices,
-                                                     real_ks, plane, restore_mass=restore_mass)
+        _apply_key_logit_blur_single_plane_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
+                                             spec["sigma"], plane, background_index=None,
+                                             restore_mass=restore_mass)
 
     A = torch.softmax(z, dim=-1)
     maps = {}
@@ -887,13 +837,15 @@ def _render(args, maps_by_variant, sample, out_dir):
 
 
 def _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device,
-                       hard_masking_steps=None, relaxed_timesteps=None):
+                       hard_masking_steps=None, relaxed_timesteps=None,
+                       free_latent=None, free_context=None, free_LC=None, free_LL=None):
     """Runs one capture-only pipe() pass and returns QUERY_BLUR.captured (or None if
     the pipeline never hit the target (step, stream, layer) coordinate). Factored out
-    of run_sample so the default (masked) snapshot and the unmasked baseline below can
-    both be grabbed the same way, just with different masking kwargs -- capture always
-    stashes z BEFORE any blur is applied (see attention_query_blur.py), so "no
-    blurring" needs no special-casing here, only masking does.
+    of run_sample so the default (masked) snapshot and the baselines below (unmasked,
+    and fully-equipped-MICE) can all be grabbed the same way, just with different
+    masking kwargs -- capture always stashes z BEFORE any blur is applied (see
+    attention_query_blur.py), so "no blurring" needs no special-casing here, only
+    masking does. Every override param defaults to None, meaning "use args' value".
     """
     image = sample['image']
     w, h = image.size
@@ -925,8 +877,10 @@ def _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device,
             hard_masking_steps=args.masking_steps if hard_masking_steps is None else hard_masking_steps,
             relaxed_timesteps=args.relaxed_timesteps if relaxed_timesteps is None else relaxed_timesteps,
             attention_kwargs={"smooth_P_L": args.smooth_P_L},
-            free_latent=args.free_latent, free_context=args.free_context,
-            free_LC=args.free_LC, free_LL=args.free_LL,
+            free_latent=args.free_latent if free_latent is None else free_latent,
+            free_context=args.free_context if free_context is None else free_context,
+            free_LC=args.free_LC if free_LC is None else free_LC,
+            free_LL=args.free_LL if free_LL is None else free_LL,
             **kwargs,
         )
         logger.warning("Pipeline ran to completion without hitting the target snapshot point -- check --target_step/--target_layer.")
@@ -938,6 +892,27 @@ def _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device,
         QUERY_BLUR.capture_target = None
 
     return QUERY_BLUR.captured
+
+
+def _no_blur_maps(z_raw, qi, own_masks_flat, layouts_no_bg, real_ks, seq_len, HW, image_token_H, image_token_W):
+    """softmax(z_raw) (no blur -- z_raw is always pre-blur by construction) -> the same
+    per-instance {target, context, own_mask, stats} map dict _compute_variant_maps
+    produces, for a captured snapshot that isn't going through any blur spec at all.
+    Shared by both reference baselines in run_sample below."""
+    A = torch.softmax(z_raw, dim=-1)
+    maps = {}
+    for k in real_ks:
+        if layouts_no_bg[k] is None:
+            continue
+        qk = qi[k]
+        attn_row = A[:, qk, :].mean(dim=(0, 1))
+        maps[k] = dict(
+            target=attn_row[seq_len:seq_len + HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
+            context=attn_row[seq_len + HW:seq_len + 2 * HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
+            own_mask=own_masks_flat[k].reshape(image_token_H, image_token_W).cpu().numpy().astype(bool),
+            stats=_row_stats(attn_row, layouts_no_bg, k, seq_len, HW),
+        )
+    return maps
 
 
 def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
@@ -988,23 +963,36 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
     elif captured_um['seq_len'] != seq_len or captured_um['HW'] != HW:
         logger.warning("Unmasked/no-blur baseline snapshot has different geometry than the masked one -- skipping it.")
     else:
-        z_um = captured_um['z']
-        A_um = torch.softmax(z_um, dim=-1)
-        maps_um = {}
-        for k in real_ks:
-            if layouts_no_bg[k] is None:
-                continue
-            qk = qi[k]
-            attn_row = A_um[:, qk, :].mean(dim=(0, 1))
-            maps_um[k] = dict(
-                target=attn_row[seq_len:seq_len + HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
-                context=attn_row[seq_len + HW:seq_len + 2 * HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
-                own_mask=own_masks_flat[k].reshape(image_token_H, image_token_W).cpu().numpy().astype(bool),
-                stats=_row_stats(attn_row, layouts_no_bg, k, seq_len, HW),
-            )
+        maps_um = _no_blur_maps(captured_um['z'], qi, own_masks_flat, layouts_no_bg, real_ks,
+                                 seq_len, HW, image_token_H, image_token_W)
         if maps_um:
             maps_by_variant["0_no_mask_no_blur"] = maps_um
             logger.info("Computed unmasked/no-blur baseline")
+
+    # Baseline 2: a THIRD capture pass, with masking back on but forced to the
+    # ORIGINAL, fully-equipped MICE scheme -- free_latent/free_context/free_LC/free_LL
+    # all forced False regardless of what args set them to for the blur variants above,
+    # so this is vanilla MICE's own attention (target-latent<->context-latent kept
+    # closed by the normal Gaussian soft-mask bias, exactly as MICE intends), not the
+    # free_latent-relaxed structure the blur comparison above deliberately runs on top
+    # of. hard_masking_steps/relaxed_timesteps are left at args' values (that's the
+    # user's own masking SCHEDULE, orthogonal to the free_* escape hatches). Still no
+    # blur (capture is always pre-blur) -- this is "what MICE alone produces here,"
+    # the other natural reference point alongside the fully-open baseline above.
+    captured_mice = _capture_snapshot(
+        args, pipe, attn_proc, parallel_attn_proc, sample, device,
+        free_latent=False, free_context=False, free_LC=False, free_LL=False,
+    )
+    if captured_mice is None:
+        logger.warning("Fully-equipped-MICE baseline snapshot never hit the target coordinate -- skipping it.")
+    elif captured_mice['seq_len'] != seq_len or captured_mice['HW'] != HW:
+        logger.warning("Fully-equipped-MICE baseline snapshot has different geometry than the masked one -- skipping it.")
+    else:
+        maps_mice = _no_blur_maps(captured_mice['z'], qi, own_masks_flat, layouts_no_bg, real_ks,
+                                   seq_len, HW, image_token_H, image_token_W)
+        if maps_mice:
+            maps_by_variant["1_mice_masked_no_blur"] = maps_mice
+            logger.info("Computed fully-equipped-MICE (not free_latent) baseline")
 
     for spec in _variant_specs(args):
         maps = _compute_variant_maps(
