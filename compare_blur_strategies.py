@@ -35,15 +35,30 @@ point (combine other instances only, no background) that falls out of the same 2
 Renders one PNG per instance: all requested variants as columns, target/context as
 rows, pure colormapped heatmaps on a SHARED scale across every variant (so brightness
 is directly comparable), reusing visualize_attention_variants.py's rendering helpers.
+
+With --produce_images, ALSO runs one COMPLETE, independent generation per variant (blur
+genuinely active at every step/layer, not just the one frozen snapshot above) and saves
+the real resulting image. This needs the blur dispatch to run INSIDE the attention
+computation at every call, so it can't be done by post-processing a frozen tensor like
+the snapshot comparison above -- it requires its own attention processor classes. Per
+repeated instruction not to modify attention_query_blur.py (capture_query_blur_leakage.py's
+benchmark numbers depend on it staying exactly as validated), _VariantBlurAttnProcessor /
+_VariantBlurParallelAttnProcessor below are SEPARATE classes, local to this script,
+whose mask-construction/counter bodies are copied VERBATIM from
+Flux2APITASMQueryBlurAttnProcessor / Flux2ParallelSelfAttnProcessorAPITASMQueryBlur --
+the only change is which blur function the final dispatch calls. They are never
+imported by, registered with, or reachable from the validated pipeline.
 """
 import sys
 import argparse
 import math
 from pathlib import Path
+from typing import Optional
 
 import torch
 from PIL import Image, ImageDraw
 from loguru import logger
+from diffusers.models.embeddings import apply_rotary_emb
 
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
@@ -51,6 +66,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from mice_dataset import get_mice_dataloader
 from flux2.transformer_flux2_klein import Flux2Attention, Flux2ParallelSelfAttention
+from flux2.attention.attention_utils import _get_qkv_projections, MaskType
+from flux2.attention.attention_processor_APITASM_kernel_nonlap import (
+    fill_hard_text_bind_mask,
+    fill_image_bind_mask,
+    TRANSFORMER_NUM_LAYERS,
+    TRANSFORMER_SINGLE_NUM_LAYERS,
+)
 from flux2.attention.attention_query_blur import (
     Flux2APITASMQueryBlurAttnProcessor,
     Flux2ParallelSelfAttnProcessorAPITASMQueryBlur,
@@ -130,6 +152,13 @@ def parse_args():
     parser.add_argument("--map_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"])
     parser.add_argument("--map_px", type=int, default=320, help="Rendered width (px) of each attention-map panel")
     parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True)
+
+    # Real image generation: one COMPLETE, independent pipe() run per variant, blur
+    # genuinely active at every step/layer (not just the one frozen snapshot above).
+    # Off by default -- N full generations is much more expensive than one snapshot.
+    parser.add_argument("--produce_images", action="store_true",
+                         help="Also run one full generation per variant and save the actual resulting image, "
+                              "in addition to the attention-map snapshot comparison. Off by default.")
 
     args = parser.parse_args()
 
@@ -234,6 +263,381 @@ def _combined_source_key_blur_(z, layouts, qi, own_masks_flat, own_ring_flat, se
     return z
 
 
+# --------------------------------------------------------------------------------------
+# Real-generation support: one attention function + two processor classes, used ONLY by
+# --produce_images. Dispatches to THIS script's variant strategy (source scope x
+# grouping x sigma) instead of the validated per-(k,kp) default, every time the
+# processor fires -- i.e. blur genuinely active at every step/layer of a real run, not
+# applied once to a frozen snapshot like the comparison above.
+# --------------------------------------------------------------------------------------
+
+def _manual_attention_with_variant_blur(query, key, value, atten_mask, scale, instance_position_mask_list,
+                                         seq_len, HW, image_token_H, image_token_W, device,
+                                         spec, min_region_tokens, layout_cache, is_conditional):
+    """Same QK^T / mask / softmax / AV pipeline as attention_query_blur.py's
+    _manual_attention_with_blur, but dispatches to THIS script's variant blur functions.
+    `layout_cache` (a plain dict, one per processor instance / variant run) avoids
+    rebuilding the instance layout on every single attention call within a generation --
+    masks are constant for the whole sample, only is_conditional (cond vs uncond
+    branch, different seq_len) distinguishes cache entries, mirroring QUERY_BLUR's own
+    get_layout caching pattern without sharing its actual cache dict.
+    """
+    q = query.permute(0, 2, 1, 3).float()
+    k_ = key.permute(0, 2, 1, 3).float()
+    v_ = value.permute(0, 2, 1, 3)
+    z = torch.matmul(q, k_.transpose(-1, -2)) * scale
+    if atten_mask is not None:
+        z = z + atten_mask
+    assert z.shape[0] == 1, "variant-blur attention currently assumes batch_size == 1"
+    z = z[0]
+    V = v_[0]
+
+    if is_conditional not in layout_cache:
+        bg = _background_mask(instance_position_mask_list, image_token_H, image_token_W, device)
+        masks_with_bg = list(instance_position_mask_list) + [bg.reshape(-1)]
+        num_real = len(instance_position_mask_list)
+        layouts_with_bg, qi, _cross_keys, own_masks_flat, own_ring_flat = _build_instance_layout(
+            masks_with_bg, seq_len, HW, image_token_H, image_token_W, device,
+            min_region_tokens, background_index=None, ring_radius=0,
+        )
+        layouts_no_bg = list(layouts_with_bg)
+        layouts_no_bg[num_real] = None
+        layout_cache[is_conditional] = dict(
+            layouts_with_bg=layouts_with_bg, layouts_no_bg=layouts_no_bg, qi=qi,
+            own_masks_flat=own_masks_flat, own_ring_flat=own_ring_flat, num_real=num_real,
+        )
+    c = layout_cache[is_conditional]
+    layouts = c['layouts_with_bg'] if spec["source"] == "others_bg" else c['layouts_no_bg']
+    real_ks = list(range(c['num_real']))
+    source_indices = (list(range(c['num_real'] + 1)) if spec["source"] == "others_bg"
+                      else list(range(c['num_real'])))
+
+    if spec["grouping"] == "per_source":
+        _apply_key_logit_blur_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'], seq_len, HW,
+                                spec["sigma"], verify_mass=False, background_index=None,
+                                restore_mass=spec["restore_mass"])
+    else:
+        _combined_source_key_blur_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'], seq_len, HW,
+                                    image_token_H, image_token_W, spec["sigma"], source_indices, real_ks,
+                                    restore_mass=spec["restore_mass"])
+
+    A = torch.softmax(z, dim=-1)
+    out = torch.matmul(A.to(v_.dtype), V)
+    hidden_states = out.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+    return hidden_states
+
+
+class _VariantBlurAttnProcessor:
+    """Double-stream processor for --produce_images. Mask-construction/counter body
+    copied VERBATIM from Flux2APITASMQueryBlurAttnProcessor (attention_query_blur.py) --
+    the ONLY change is the final dispatch, which always calls
+    _manual_attention_with_variant_blur (this script's variant strategy) instead of
+    gating between _manual_attention_with_blur and dispatch_attention_fn via
+    QUERY_BLUR.should_apply. Never imported by or reachable from the validated pipeline."""
+
+    _attention_backend = None
+    _parallel_config = None
+    counter = 0
+    cond_hard_bind_mask = None
+    cond_soft_bind_mask = None
+    uncond_hard_bind_mask = None
+    uncond_soft_bind_mask = None
+    cfg_inference_steps_multiplier = 1
+
+    def __init__(self, spec, min_region_tokens, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False):
+        self.spec = spec
+        self.min_region_tokens = min_region_tokens
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.strict = strict
+        self.layout_cache = {}
+
+    @classmethod
+    def clear_cached_masks(cls):
+        cls.cond_hard_bind_mask = None
+        cls.cond_soft_bind_mask = None
+        cls.uncond_hard_bind_mask = None
+        cls.uncond_soft_bind_mask = None
+        cls.counter = 0
+
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pos_instance_text_index_lst=None,
+        neg_instance_text_index_lst=None,
+        pos_seq_len: Optional[int] = None,
+        neg_seq_len: Optional[int] = None,
+        instance_position_mask_list=None,
+        hard_image_attribute_binding_list_double=None,
+        hard_image_attribute_binding_list_single=None,
+        num_inference_steps: Optional[int] = None,
+        image_w_instance_token_index_list=None,
+        image_w_instance_token_H_list=None,
+        image_w_instance_token_W_list=None,
+        context_image_w_instance_token_index_list=None,
+        is_conditional: Optional[bool] = None,
+        hard_masking_steps=None,
+        relaxed_timesteps: str = None,
+        smooth_P_L: bool = False,
+        free_latent: bool = False,
+        free_context: bool = False,
+        free_LC: bool = False,
+        free_LL: bool = False,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        seq_len = pos_seq_len if is_conditional else neg_seq_len
+        instance_text_index_lst = pos_instance_text_index_lst if is_conditional else neg_instance_text_index_lst
+        HW = (query.shape[1] - seq_len) // 2
+        image_token_H = image_w_instance_token_H_list[0] // 16
+        image_token_W = image_w_instance_token_W_list[0] // 16
+        global_seq_len = pos_instance_text_index_lst[0].shape[0] if is_conditional else neg_instance_text_index_lst[0].shape[0]
+        instance_num = len(instance_position_mask_list)
+        _VariantBlurAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
+
+        if self.strict:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
+
+        if (_VariantBlurAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (_VariantBlurAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _VariantBlurAttnProcessor.cond_hard_bind_mask = atten_mask
+            else:
+                _VariantBlurAttnProcessor.uncond_hard_bind_mask = atten_mask
+
+        if (_VariantBlurAttnProcessor.cond_soft_bind_mask is None and is_conditional) or (_VariantBlurAttnProcessor.uncond_soft_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _VariantBlurAttnProcessor.cond_soft_bind_mask = atten_mask
+            else:
+                _VariantBlurAttnProcessor.uncond_soft_bind_mask = atten_mask
+
+        counter = _VariantBlurAttnProcessor.counter
+        layer_idx = counter % TRANSFORMER_NUM_LAYERS
+        step_idx = counter // TRANSFORMER_NUM_LAYERS
+
+        if layer_idx in hard_image_attribute_binding_list_double:
+            atten_mask = _VariantBlurAttnProcessor.cond_hard_bind_mask if is_conditional else _VariantBlurAttnProcessor.uncond_hard_bind_mask
+        else:
+            atten_mask = _VariantBlurAttnProcessor.cond_soft_bind_mask if is_conditional else _VariantBlurAttnProcessor.uncond_soft_bind_mask
+
+        if step_idx not in hard_masking_steps:
+            if relaxed_timesteps == "full":
+                atten_mask = None
+            elif relaxed_timesteps == "soft":
+                atten_mask = _VariantBlurAttnProcessor.cond_soft_bind_mask if is_conditional else _VariantBlurAttnProcessor.uncond_soft_bind_mask
+            else:
+                raise NotImplementedError(f"relaxed_timesteps={relaxed_timesteps}")
+
+        _VariantBlurAttnProcessor.counter += 1
+
+        scale = attn.head_dim ** -0.5
+        hidden_states = _manual_attention_with_variant_blur(
+            query, key, value, atten_mask, scale, instance_position_mask_list,
+            seq_len, HW, image_token_H, image_token_W, query.device,
+            self.spec, self.min_region_tokens, self.layout_cache, is_conditional,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if _VariantBlurAttnProcessor.counter % (num_inference_steps * TRANSFORMER_NUM_LAYERS * _VariantBlurAttnProcessor.cfg_inference_steps_multiplier) == 0:
+            _VariantBlurAttnProcessor.clear_cached_masks()
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class _VariantBlurParallelAttnProcessor:
+    """Single-stream analog of _VariantBlurAttnProcessor, body copied verbatim from
+    Flux2ParallelSelfAttnProcessorAPITASMQueryBlur."""
+
+    _attention_backend = None
+    _parallel_config = None
+    counter = 0
+    cond_hard_bind_mask = None
+    cond_soft_bind_mask = None
+    uncond_hard_bind_mask = None
+    uncond_soft_bind_mask = None
+    cfg_inference_steps_multiplier = 1
+
+    def __init__(self, spec, min_region_tokens, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False):
+        self.spec = spec
+        self.min_region_tokens = min_region_tokens
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.strict = strict
+        self.layout_cache = {}
+
+    @classmethod
+    def clear_cached_masks(cls):
+        cls.cond_hard_bind_mask = None
+        cls.cond_soft_bind_mask = None
+        cls.uncond_hard_bind_mask = None
+        cls.uncond_soft_bind_mask = None
+        cls.counter = 0
+
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pos_instance_text_index_lst=None,
+        neg_instance_text_index_lst=None,
+        pos_seq_len: Optional[int] = None,
+        neg_seq_len: Optional[int] = None,
+        instance_position_mask_list=None,
+        hard_image_attribute_binding_list_double=None,
+        hard_image_attribute_binding_list_single=None,
+        num_inference_steps: Optional[int] = None,
+        image_w_instance_token_index_list=None,
+        image_w_instance_token_H_list=None,
+        image_w_instance_token_W_list=None,
+        context_image_w_instance_token_index_list=None,
+        is_conditional: Optional[bool] = None,
+        hard_masking_steps=None,
+        relaxed_timesteps: str = None,
+        smooth_P_L: bool = False,
+        free_context: bool = False,
+        free_latent: bool = False,
+        free_LC: bool = False,
+        free_LL: bool = False,
+    ) -> torch.Tensor:
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        seq_len = pos_seq_len if is_conditional else neg_seq_len
+        instance_text_index_lst = pos_instance_text_index_lst if is_conditional else neg_instance_text_index_lst
+        HW = (query.shape[1] - seq_len) // 2
+        image_token_H = image_w_instance_token_H_list[0] // 16
+        image_token_W = image_w_instance_token_W_list[0] // 16
+        global_seq_len = pos_instance_text_index_lst[0].shape[0] if is_conditional else neg_instance_text_index_lst[0].shape[0]
+        instance_num = len(instance_position_mask_list)
+        _VariantBlurParallelAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
+
+        if self.strict:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
+
+        if (_VariantBlurParallelAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (_VariantBlurParallelAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _VariantBlurParallelAttnProcessor.cond_hard_bind_mask = atten_mask
+            else:
+                _VariantBlurParallelAttnProcessor.uncond_hard_bind_mask = atten_mask
+
+        if (_VariantBlurParallelAttnProcessor.cond_soft_bind_mask is None and is_conditional) or (_VariantBlurParallelAttnProcessor.uncond_soft_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _VariantBlurParallelAttnProcessor.cond_soft_bind_mask = atten_mask
+            else:
+                _VariantBlurParallelAttnProcessor.uncond_soft_bind_mask = atten_mask
+
+        counter = _VariantBlurParallelAttnProcessor.counter
+        layer_idx = counter % TRANSFORMER_SINGLE_NUM_LAYERS
+        step_idx = counter // TRANSFORMER_SINGLE_NUM_LAYERS
+
+        if layer_idx in hard_image_attribute_binding_list_single:
+            atten_mask = _VariantBlurParallelAttnProcessor.cond_hard_bind_mask if is_conditional else _VariantBlurParallelAttnProcessor.uncond_hard_bind_mask
+        else:
+            atten_mask = _VariantBlurParallelAttnProcessor.cond_soft_bind_mask if is_conditional else _VariantBlurParallelAttnProcessor.uncond_soft_bind_mask
+
+        if step_idx not in hard_masking_steps:
+            if relaxed_timesteps == "full":
+                atten_mask = None
+            elif relaxed_timesteps == "soft":
+                atten_mask = _VariantBlurParallelAttnProcessor.cond_soft_bind_mask if is_conditional else _VariantBlurParallelAttnProcessor.uncond_soft_bind_mask
+            else:
+                raise NotImplementedError(f"relaxed_timesteps={relaxed_timesteps}")
+
+        _VariantBlurParallelAttnProcessor.counter += 1
+
+        scale = attn.head_dim ** -0.5
+        hidden_states = _manual_attention_with_variant_blur(
+            query, key, value, atten_mask, scale, instance_position_mask_list,
+            seq_len, HW, image_token_H, image_token_W, query.device,
+            self.spec, self.min_region_tokens, self.layout_cache, is_conditional,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        if _VariantBlurParallelAttnProcessor.counter % (num_inference_steps * TRANSFORMER_SINGLE_NUM_LAYERS * _VariantBlurParallelAttnProcessor.cfg_inference_steps_multiplier) == 0:
+            _VariantBlurParallelAttnProcessor.clear_cached_masks()
+
+        return hidden_states
+
+
 def _variant_specs(args):
     specs = []
     for src in args.sources:
@@ -241,7 +645,7 @@ def _variant_specs(args):
             for sigma in args.sigma_list:
                 sigma_tag = "inf" if math.isinf(sigma) else str(sigma).replace('.', 'p')
                 name = f"src-{src}_grp-{grp}_sig-{sigma_tag}"
-                specs.append(dict(name=name, source=src, grouping=grp, sigma=sigma))
+                specs.append(dict(name=name, source=src, grouping=grp, sigma=sigma, restore_mass=args.restore_mass))
     return specs
 
 
@@ -415,6 +819,80 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         return
 
     _render(args, maps_by_variant, sample, out_dir)
+
+    if args.produce_images:
+        produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir)
+
+
+def produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
+    """One COMPLETE, independent pipe() call per variant -- blur genuinely active at
+    every step/layer throughout, unlike the single frozen-snapshot comparison above.
+    Swaps in _VariantBlurAttnProcessor/_VariantBlurParallelAttnProcessor (this script's
+    own classes, never touching attention_query_blur.py) for the duration, then
+    restores the original (validated) processors afterward."""
+    image = sample['image']
+    w, h = image.size
+    kwargs = {}
+    if args.use_masks:
+        kwargs['instance_masks_yx'] = sample['masks']
+    else:
+        kwargs['instance_bboxes_xyxy_normalized'] = sample['bboxes']
+
+    orig_w, orig_h = sample['original_size']
+    specs = _variant_specs(args)
+    logger.info(f"Producing {len(specs)} full generations ({args.num_inference_steps} steps each)...")
+
+    try:
+        for spec in specs:
+            variant_attn_proc = _VariantBlurAttnProcessor(
+                spec, args.min_region_tokens, kernel_size=args.kernel_size,
+                temperature=args.temperature, strict=args.strict,
+            )
+            variant_parallel_proc = _VariantBlurParallelAttnProcessor(
+                spec, args.min_region_tokens, kernel_size=args.kernel_size,
+                temperature=args.temperature, strict=args.strict,
+            )
+            for _, module in pipe.transformer.named_modules():
+                if isinstance(module, Flux2Attention):
+                    module.set_processor(variant_attn_proc)
+                elif isinstance(module, Flux2ParallelSelfAttention):
+                    module.set_processor(variant_parallel_proc)
+            variant_attn_proc.clear_cached_masks()
+            variant_parallel_proc.clear_cached_masks()
+            QUERY_BLUR.reset_records()
+
+            logger.info(f"[{spec['name']}] running full generation...")
+            result = pipe(
+                image=image, prompt=sample['prompt'], height=h, width=w,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                prompt_settings=args.prompt_settings,
+                attention_setting="apitasmkernelnonlap",
+                hard_image_attribute_binding_list_double=args.hard_image_attribute_binding_list_double,
+                hard_image_attribute_binding_list_single=args.hard_image_attribute_binding_list_single,
+                bring_area_to_1024_squared=args.bring_area_to_1024_squared,
+                generator=torch.Generator(device=device).manual_seed(SEED),
+                hard_masking_steps=args.masking_steps,
+                relaxed_timesteps=args.relaxed_timesteps,
+                attention_kwargs={"smooth_P_L": args.smooth_P_L},
+                free_latent=args.free_latent, free_context=args.free_context,
+                free_LC=args.free_LC, free_LL=args.free_LL,
+                **kwargs,
+            )
+            generated_image = result.images[0]
+            if generated_image.size != (orig_w, orig_h):
+                generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
+            image_path = out_dir / f"{sample['sample_id']}_{spec['name']}.png"
+            generated_image.save(image_path)
+            logger.info(f"[{spec['name']}] saved image to {image_path}")
+            del result, generated_image
+    finally:
+        # Restore the validated processors regardless of how the loop above exits.
+        for _, module in pipe.transformer.named_modules():
+            if isinstance(module, Flux2Attention):
+                module.set_processor(attn_proc)
+            elif isinstance(module, Flux2ParallelSelfAttention):
+                module.set_processor(parallel_attn_proc)
 
 
 def main():
