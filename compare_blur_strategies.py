@@ -886,7 +886,15 @@ def _render(args, maps_by_variant, sample, out_dir):
         logger.info(f"Saved {out_path}")
 
 
-def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
+def _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device,
+                       hard_masking_steps=None, relaxed_timesteps=None):
+    """Runs one capture-only pipe() pass and returns QUERY_BLUR.captured (or None if
+    the pipeline never hit the target (step, stream, layer) coordinate). Factored out
+    of run_sample so the default (masked) snapshot and the unmasked baseline below can
+    both be grabbed the same way, just with different masking kwargs -- capture always
+    stashes z BEFORE any blur is applied (see attention_query_blur.py), so "no
+    blurring" needs no special-casing here, only masking does.
+    """
     image = sample['image']
     w, h = image.size
 
@@ -914,22 +922,26 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
             hard_image_attribute_binding_list_single=args.hard_image_attribute_binding_list_single,
             bring_area_to_1024_squared=args.bring_area_to_1024_squared,
             generator=torch.Generator(device=device).manual_seed(SEED),
-            hard_masking_steps=args.masking_steps,
-            relaxed_timesteps=args.relaxed_timesteps,
+            hard_masking_steps=args.masking_steps if hard_masking_steps is None else hard_masking_steps,
+            relaxed_timesteps=args.relaxed_timesteps if relaxed_timesteps is None else relaxed_timesteps,
             attention_kwargs={"smooth_P_L": args.smooth_P_L},
             free_latent=args.free_latent, free_context=args.free_context,
             free_LC=args.free_LC, free_LL=args.free_LL,
             **kwargs,
         )
         logger.warning("Pipeline ran to completion without hitting the target snapshot point -- check --target_step/--target_layer.")
-        return
+        return None
     except _CaptureAbort:
         pass
     finally:
         QUERY_BLUR.capture_only = False
         QUERY_BLUR.capture_target = None
 
-    captured = QUERY_BLUR.captured
+    return QUERY_BLUR.captured
+
+
+def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
+    captured = _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device)
     if captured is None:
         logger.error("No snapshot captured.")
         return
@@ -957,6 +969,43 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
     source_indices_others_bg = list(range(num_real + 1))  # background included
 
     maps_by_variant = {}
+
+    # Baseline: a SECOND capture pass, identical in every way except masking is fully
+    # disabled (hard_masking_steps=[] so no step ever forces the hard/soft bind mask,
+    # relaxed_timesteps="full" so atten_mask becomes None for every one of those steps
+    # -- i.e. the entire additive mask tensor, text-bind and image-bind alike, is
+    # skipped). Capture is pre-blur by construction (see _capture_snapshot), so this is
+    # genuinely vanilla softmax(QK^T) attention: no masking AND no blurring. Rendered
+    # into the same comparison grid as a reference point; never fed to
+    # produce_variant_images (that only iterates _variant_specs(args), which this
+    # isn't part of), matching "don't produce image" for this one.
+    captured_um = _capture_snapshot(
+        args, pipe, attn_proc, parallel_attn_proc, sample, device,
+        hard_masking_steps=[], relaxed_timesteps="full",
+    )
+    if captured_um is None:
+        logger.warning("Unmasked/no-blur baseline snapshot never hit the target coordinate -- skipping it.")
+    elif captured_um['seq_len'] != seq_len or captured_um['HW'] != HW:
+        logger.warning("Unmasked/no-blur baseline snapshot has different geometry than the masked one -- skipping it.")
+    else:
+        z_um = captured_um['z']
+        A_um = torch.softmax(z_um, dim=-1)
+        maps_um = {}
+        for k in real_ks:
+            if layouts_no_bg[k] is None:
+                continue
+            qk = qi[k]
+            attn_row = A_um[:, qk, :].mean(dim=(0, 1))
+            maps_um[k] = dict(
+                target=attn_row[seq_len:seq_len + HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
+                context=attn_row[seq_len + HW:seq_len + 2 * HW].reshape(image_token_H, image_token_W).float().cpu().numpy(),
+                own_mask=own_masks_flat[k].reshape(image_token_H, image_token_W).cpu().numpy().astype(bool),
+                stats=_row_stats(attn_row, layouts_no_bg, k, seq_len, HW),
+            )
+        if maps_um:
+            maps_by_variant["0_no_mask_no_blur"] = maps_um
+            logger.info("Computed unmasked/no-blur baseline")
+
     for spec in _variant_specs(args):
         maps = _compute_variant_maps(
             spec, layouts_with_bg, layouts_no_bg, qi, own_masks_flat, own_ring_flat,
