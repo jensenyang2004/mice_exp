@@ -204,7 +204,20 @@ def parse_args():
                               "moves -- only edge mass gets pushed out. 'peak' instead builds a Gaussian "
                               "bump centered at each sibling's own centroid (width from its own mask "
                               "area) -- nonzero outward gradient everywhere except the single apex, so "
-                              "interior mass is evacuated too. See _other_instance_peak_potential.")
+                              "interior mass is evacuated too. See _other_instance_peak_potential. NOTE: "
+                              "'peak' was found to create its own failure in densely packed scenes (a "
+                              "saddle/valley between two separate nearby peaks -- the same convergence "
+                              "geometry already diagnosed for C-context peaks) -- prefer 'mesa' with "
+                              "--other_instance_extend>0 for dense scenes instead.")
+    parser.add_argument("--other_instance_extend", type=int, default=1,
+                         help="Dilate (grow outward) each OTHER instance's own mask by this many tokens "
+                              "before building the occupancy indicator -- the exact same growth idea as "
+                              "--ring_radius (boundary-adjacent tokens still have a real chance of "
+                              "belonging to the instance). In a dense cluster, this closes small gaps "
+                              "between siblings so their occupied regions fuse into one contiguous area "
+                              "with no interior dip (mesa shape only -- see _dilate_mask/"
+                              "_other_instance_occupancy), instead of leaving a narrow seam between "
+                              "them for mass to collect in. 0 disables (raw mask only).")
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of REAL instance indices to render")
 
@@ -270,8 +283,22 @@ def _compress_potential(C_raw: torch.Tensor, scale: str) -> torch.Tensor:
     raise ValueError(f"unknown c_scale {scale!r}")
 
 
+def _dilate_mask(mask_2d: torch.Tensor, radius: int) -> torch.Tensor:
+    """Grow a binary mask outward by `radius` cells (square/Chebyshev dilation via
+    iterated 3x3 max-pooling) -- the exact same simple growth idea this script's own
+    --ring_radius already uses for k's OWN wall (boundary-adjacent tokens still have
+    a real chance of belonging to the instance, so the protected footprint should be
+    mask+margin, not the raw mask). radius<=0 returns mask_2d unchanged."""
+    if radius <= 0:
+        return mask_2d
+    m = mask_2d.float().unsqueeze(0).unsqueeze(0)
+    for _ in range(radius):
+        m = torch.nn.functional.max_pool2d(m, kernel_size=3, stride=1, padding=1)
+    return (m.squeeze(0).squeeze(0) > 0.5)
+
+
 def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token_H: int, image_token_W: int,
-                               sigma: float) -> torch.Tensor:
+                               sigma: float, extend_radius: int = 0) -> torch.Tensor:
     """Smoothed [0,1]-ish indicator of every OTHER real instance's own footprint
     (union, excluding k itself), reshaped to [Himg, Wimg]. This is a DIRECT,
     EXACT structural signal -- own_masks_flat is ground-truth geometry already
@@ -294,6 +321,14 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
     additive to the SAME scalar potential drift already reads, same smoothing
     convention as C itself for continuity).
 
+    `extend_radius` (see _dilate_mask) grows each sibling's own footprint outward
+    by that many tokens BEFORE taking the union -- in a dense cluster, siblings
+    close enough that this dilation closes the gap between them get fused into one
+    contiguous occupied region with NO interior dip, eliminating the saddle/valley
+    that a fixed shape (e.g. the Gaussian-peak alternative) creates between
+    separate, non-overlapping repulsors -- the structural cause of mass piling up
+    in the narrow seams between densely packed instances.
+
     Smoothed the same way C is (reusing the caller's c_smooth_sigma, not a new
     independent knob) via the validated _blur_block primitive with an all-ones mask
     -- sigma=0 skips smoothing (raw binary indicator, hard edges). Returns an
@@ -306,7 +341,9 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
     for kp in range(num_real):
         if kp == k:
             continue
-        occ = torch.maximum(occ, own_masks_flat[kp].float())
+        mask_2d = own_masks_flat[kp].reshape(image_token_H, image_token_W)
+        mask_2d = _dilate_mask(mask_2d, extend_radius)
+        occ = torch.maximum(occ, mask_2d.reshape(-1).float())
     occ = occ.reshape(1, image_token_H, image_token_W, 1)
     if sigma > 0:
         ones_mask = torch.ones(1, image_token_H, image_token_W, 1, device=device)
@@ -315,7 +352,7 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
 
 
 def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_token_H: int,
-                                    image_token_W: int) -> torch.Tensor:
+                                    image_token_W: int, extend_radius: int = 0) -> torch.Tensor:
     """Alternative to _other_instance_occupancy's flat-topped mesa. A blurred binary
     mask is flat (zero gradient, hence zero drift force) across its ENTIRE interior
     except within one sigma of its boundary -- mass already sitting deep inside a
@@ -332,6 +369,13 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
     c_smooth_sigma). Combined across siblings via elementwise max (same combinator as
     _other_instance_occupancy), not sum, so two nearby siblings don't stack into an
     artificially taller ridge.
+
+    NOTE: unlike _other_instance_occupancy, `extend_radius` here does NOT fix the
+    dense-cluster saddle problem -- dilating a sibling's mask only grows its own
+    r_eff slightly, it does not merge two separate siblings' bumps into one
+    contiguous shape the way mesa's union+blur does, so two nearby peaks still
+    create a saddle between them regardless of extend_radius. For dense scenes,
+    prefer --occupancy_shape_list mesa with extend_radius>0, not peak.
     """
     device = own_masks_flat[0].device
     yy, xx = torch.meshgrid(
@@ -343,7 +387,8 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
     for kp in range(num_real):
         if kp == k:
             continue
-        mask_2d = own_masks_flat[kp].reshape(image_token_H, image_token_W).float()
+        mask_2d = own_masks_flat[kp].reshape(image_token_H, image_token_W)
+        mask_2d = _dilate_mask(mask_2d, extend_radius).float()
         area = mask_2d.sum()
         if area <= 0:
             continue
@@ -356,12 +401,15 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
     return occ
 
 
-def _other_instance_potential(occupancy_shape, own_masks_flat, k, num_real, image_token_H, image_token_W, sigma):
+def _other_instance_potential(occupancy_shape, own_masks_flat, k, num_real, image_token_H, image_token_W, sigma,
+                               extend_radius=0):
     """Single dispatch point used by both call sites below."""
     if occupancy_shape == "mesa":
-        return _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, sigma)
+        return _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, sigma,
+                                          extend_radius)
     if occupancy_shape == "peak":
-        return _other_instance_peak_potential(own_masks_flat, k, num_real, image_token_H, image_token_W)
+        return _other_instance_peak_potential(own_masks_flat, k, num_real, image_token_H, image_token_W,
+                                               extend_radius)
     raise ValueError(f"unknown occupancy_shape {occupancy_shape!r}")
 
 
@@ -611,7 +659,8 @@ def _manual_attention_with_transport(query, key, value, atten_mask, scale, insta
         other_penalty = spec.get("other_instance_penalty", 0.0)
         if other_penalty > 0:
             occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), c['own_masks_flat'], k,
-                                             c['num_real'], image_token_H, image_token_W, c_smooth_sigma)
+                                             c['num_real'], image_token_H, image_token_W, c_smooth_sigma,
+                                             spec.get("other_instance_extend", 0))
             C = C + other_penalty * occ   # broadcasts [Himg,Wimg] against C's [heads, n_k, Himg, Wimg]
 
         rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
@@ -1036,7 +1085,8 @@ def _variant_specs(args):
                                 specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
                                                    mobility=mobility, diffusion_eps=diffusion_eps,
                                                    other_instance_penalty=other_penalty,
-                                                   occupancy_shape=occ_shape))
+                                                   occupancy_shape=occ_shape,
+                                                   other_instance_extend=args.other_instance_extend))
     return specs
 
 
@@ -1062,7 +1112,8 @@ def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, 
         other_penalty = spec.get("other_instance_penalty", 0.0)
         if other_penalty > 0:
             occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), own_masks_flat, k, num_real,
-                                             image_token_H, image_token_W, c_smooth_sigma)
+                                             image_token_H, image_token_W, c_smooth_sigma,
+                                             spec.get("other_instance_extend", 0))
             C = C + other_penalty * occ
 
         own_mask_2d = own_masks_flat[k].reshape(image_token_H, image_token_W)
