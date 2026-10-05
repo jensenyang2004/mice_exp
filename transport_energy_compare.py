@@ -205,6 +205,16 @@ def parse_args():
                               "bump centered at each sibling's own centroid (width from its own mask "
                               "area) -- nonzero outward gradient everywhere except the single apex, so "
                               "interior mass is evacuated too. See _other_instance_peak_potential.")
+    parser.add_argument("--other_instance_decay_list", type=str, default="0.0",
+                         help="Comma list of Gaussian falloff lengths (tokens) -- only matters when "
+                              "--other_instance_penalty_list has a nonzero entry. 0.0 (default, "
+                              "backward-compatible) applies the SAME penalty strength to every other "
+                              "instance regardless of distance. >0 fades the penalty with the "
+                              "edge-to-edge gap between k and each sibling (full strength when "
+                              "adjacent/overlapping, fading toward 0 as the gap grows past this length) "
+                              "-- for dense scenes where a uniform penalty on every sibling, including "
+                              "far-away ones, was overkill while immediate neighbors still fused. See "
+                              "_instance_gap_weight.")
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of REAL instance indices to render")
 
@@ -236,6 +246,7 @@ def parse_args():
     args.diffusion_eps_list = [float(e) for e in args.diffusion_eps_list.split(',')]
     args.other_instance_penalty_list = [float(p) for p in args.other_instance_penalty_list.split(',')]
     args.occupancy_shape_list = args.occupancy_shape_list.split(',')
+    args.other_instance_decay_list = [float(d) for d in args.other_instance_decay_list.split(',')]
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for d in args.domains:
         if d not in ("cross_only", "full_map"):
@@ -270,8 +281,43 @@ def _compress_potential(C_raw: torch.Tensor, scale: str) -> torch.Tensor:
     raise ValueError(f"unknown c_scale {scale!r}")
 
 
+def _instance_centroid_and_reff(own_masks_flat, idx, image_token_H, image_token_W, yy, xx):
+    m = own_masks_flat[idx].reshape(image_token_H, image_token_W).float()
+    area = m.sum().clamp(min=1.0)
+    cy = (yy * m).sum() / area
+    cx = (xx * m).sum() / area
+    r_eff = torch.sqrt(area / torch.pi)
+    return cy, cx, r_eff
+
+
+def _instance_gap_weight(own_masks_flat, k, kp, image_token_H, image_token_W, decay, yy, xx):
+    """Falloff weight for how strongly kp's repulsion should apply to k, based on the
+    approximate EDGE-TO-EDGE gap between them -- not centroid distance, since two
+    large instances with touching boundaries but far-apart centroids should still
+    count as 'close'. Each instance is treated as a disc of its own effective radius
+    r_eff=sqrt(area/pi) (same quantity _other_instance_peak_potential already uses
+    for bump width): gap = max(0, centroid_dist - r_eff_k - r_eff_kp).
+
+    decay<=0 means OFF -- weight is always 1.0 regardless of distance, reproducing
+    the old one-size-fits-all penalty exactly (uniform strength on every other
+    instance). decay>0 is the Gaussian falloff length (tokens) over which the
+    penalty strength fades with increasing gap: adjacent/overlapping instances
+    (gap~0) keep full strength lambda, far-away ones fade toward 0 -- motivated by
+    dense scenes where a uniform penalty on every sibling, including ones already
+    far away, was overkill and the fusion failure was specifically with immediate
+    neighbors.
+    """
+    if decay <= 0:
+        return 1.0
+    cy_k, cx_k, r_k = _instance_centroid_and_reff(own_masks_flat, k, image_token_H, image_token_W, yy, xx)
+    cy_p, cx_p, r_p = _instance_centroid_and_reff(own_masks_flat, kp, image_token_H, image_token_W, yy, xx)
+    centroid_dist = torch.sqrt((cy_k - cy_p) ** 2 + (cx_k - cx_p) ** 2)
+    gap = (centroid_dist - r_k - r_p).clamp(min=0.0)
+    return torch.exp(-(gap * gap) / (2.0 * decay * decay)).item()
+
+
 def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token_H: int, image_token_W: int,
-                               sigma: float) -> torch.Tensor:
+                               sigma: float, decay: float = 0.0) -> torch.Tensor:
     """Smoothed [0,1]-ish indicator of every OTHER real instance's own footprint
     (union, excluding k itself), reshaped to [Himg, Wimg]. This is a DIRECT,
     EXACT structural signal -- own_masks_flat is ground-truth geometry already
@@ -302,11 +348,17 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
     like `domain` already does.
     """
     device = own_masks_flat[0].device
+    yy, xx = torch.meshgrid(
+        torch.arange(image_token_H, dtype=torch.float32, device=device),
+        torch.arange(image_token_W, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
     occ = torch.zeros(image_token_H * image_token_W, dtype=torch.float32, device=device)
     for kp in range(num_real):
         if kp == k:
             continue
-        occ = torch.maximum(occ, own_masks_flat[kp].float())
+        weight = _instance_gap_weight(own_masks_flat, k, kp, image_token_H, image_token_W, decay, yy, xx)
+        occ = torch.maximum(occ, own_masks_flat[kp].float() * weight)
     occ = occ.reshape(1, image_token_H, image_token_W, 1)
     if sigma > 0:
         ones_mask = torch.ones(1, image_token_H, image_token_W, 1, device=device)
@@ -315,7 +367,7 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
 
 
 def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_token_H: int,
-                                    image_token_W: int) -> torch.Tensor:
+                                    image_token_W: int, decay: float = 0.0) -> torch.Tensor:
     """Alternative to _other_instance_occupancy's flat-topped mesa. A blurred binary
     mask is flat (zero gradient, hence zero drift force) across its ENTIRE interior
     except within one sigma of its boundary -- mass already sitting deep inside a
@@ -331,7 +383,9 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
     (r_eff = sqrt(area/pi), no new independent tunable -- same spirit as C reusing
     c_smooth_sigma). Combined across siblings via elementwise max (same combinator as
     _other_instance_occupancy), not sum, so two nearby siblings don't stack into an
-    artificially taller ridge.
+    artificially taller ridge. `decay` -- see _instance_gap_weight -- scales each
+    sibling's bump height by a gap-based falloff instead of applying full strength
+    uniformly to every sibling regardless of distance.
     """
     device = own_masks_flat[0].device
     yy, xx = torch.meshgrid(
@@ -352,16 +406,18 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
         r_eff = torch.sqrt(area / torch.pi).clamp(min=1.0)
         d2 = (yy - cy) ** 2 + (xx - cx) ** 2
         bump = torch.exp(-d2 / (2.0 * r_eff * r_eff))
-        occ = torch.maximum(occ, bump)
+        weight = _instance_gap_weight(own_masks_flat, k, kp, image_token_H, image_token_W, decay, yy, xx)
+        occ = torch.maximum(occ, bump * weight)
     return occ
 
 
-def _other_instance_potential(occupancy_shape, own_masks_flat, k, num_real, image_token_H, image_token_W, sigma):
+def _other_instance_potential(occupancy_shape, own_masks_flat, k, num_real, image_token_H, image_token_W, sigma,
+                               decay=0.0):
     """Single dispatch point used by both call sites below."""
     if occupancy_shape == "mesa":
-        return _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, sigma)
+        return _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, sigma, decay)
     if occupancy_shape == "peak":
-        return _other_instance_peak_potential(own_masks_flat, k, num_real, image_token_H, image_token_W)
+        return _other_instance_peak_potential(own_masks_flat, k, num_real, image_token_H, image_token_W, decay)
     raise ValueError(f"unknown occupancy_shape {occupancy_shape!r}")
 
 
@@ -611,7 +667,8 @@ def _manual_attention_with_transport(query, key, value, atten_mask, scale, insta
         other_penalty = spec.get("other_instance_penalty", 0.0)
         if other_penalty > 0:
             occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), c['own_masks_flat'], k,
-                                             c['num_real'], image_token_H, image_token_W, c_smooth_sigma)
+                                             c['num_real'], image_token_H, image_token_W, c_smooth_sigma,
+                                             spec.get("other_instance_decay", 0.0))
             C = C + other_penalty * occ   # broadcasts [Himg,Wimg] against C's [heads, n_k, Himg, Wimg]
 
         rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
@@ -1026,17 +1083,21 @@ def _variant_specs(args):
                 for diffusion_eps in args.diffusion_eps_list:
                     for other_penalty in args.other_instance_penalty_list:
                         occ_shapes = args.occupancy_shape_list if other_penalty > 0 else ["mesa"]
+                        decays = args.other_instance_decay_list if other_penalty > 0 else [0.0]
                         for occ_shape in occ_shapes:
-                            for n_steps in args.n_steps_list:
-                                mob_tag = str(mobility).replace('.', 'p')
-                                eps_tag = str(diffusion_eps).replace('.', 'p')
-                                pen_tag = str(other_penalty).replace('.', 'p')
-                                name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
-                                        f"_pen-{pen_tag}_occ-{occ_shape}_steps-{n_steps}")
-                                specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
-                                                   mobility=mobility, diffusion_eps=diffusion_eps,
-                                                   other_instance_penalty=other_penalty,
-                                                   occupancy_shape=occ_shape))
+                            for decay in decays:
+                                for n_steps in args.n_steps_list:
+                                    mob_tag = str(mobility).replace('.', 'p')
+                                    eps_tag = str(diffusion_eps).replace('.', 'p')
+                                    pen_tag = str(other_penalty).replace('.', 'p')
+                                    decay_tag = str(decay).replace('.', 'p')
+                                    name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
+                                            f"_pen-{pen_tag}_occ-{occ_shape}_decay-{decay_tag}_steps-{n_steps}")
+                                    specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
+                                                       mobility=mobility, diffusion_eps=diffusion_eps,
+                                                       other_instance_penalty=other_penalty,
+                                                       occupancy_shape=occ_shape,
+                                                       other_instance_decay=decay))
     return specs
 
 
@@ -1062,7 +1123,8 @@ def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, 
         other_penalty = spec.get("other_instance_penalty", 0.0)
         if other_penalty > 0:
             occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), own_masks_flat, k, num_real,
-                                             image_token_H, image_token_W, c_smooth_sigma)
+                                             image_token_H, image_token_W, c_smooth_sigma,
+                                             spec.get("other_instance_decay", 0.0))
             C = C + other_penalty * occ
 
         own_mask_2d = own_masks_flat[k].reshape(image_token_H, image_token_W)
