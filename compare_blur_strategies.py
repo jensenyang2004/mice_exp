@@ -95,6 +95,14 @@ from visualize_attention_variants import (
 
 SEED = 0
 
+# Names of the two reference-baseline columns run_sample always adds (never part of
+# _variant_specs). Kept as a set so _render can exclude them from the shared vmax
+# computation below -- they're captured under a totally different masking regime
+# (fully open / fully closed) than the blur variants being compared, so their peak
+# attention value can be on a wildly different scale and would otherwise dominate the
+# shared color scale, making every real variant panel render uniformly dim.
+_BASELINE_VARIANT_NAMES = {"0_no_mask_no_blur", "1_mice_masked_no_blur"}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare key-axis blur strategies (source scope x blur scope x kernel size) on one sample's attention.")
@@ -133,6 +141,20 @@ def parse_args():
     parser.add_argument("--target_layer", type=int, default=0)
 
     # Strategy axes (cartesian product).
+    parser.add_argument("--mechanisms", type=str, default="blur,mass_transfer",
+                         help="Comma list from {blur, mass_transfer}. 'blur' = today's validated mechanism "
+                              "(reshapes cross-instance content, --scopes/--planes/--sigma_list apply). "
+                              "'mass_transfer' = NEW: caps cross-instance's TOTAL post-softmax mass at "
+                              "`beta` x everything-else's mass (--beta_list), applied as a uniform additive "
+                              "logit shift on cross-instance's keys ONLY -- no reshaping at all, shape of "
+                              "every group (including cross-instance's own) is left exactly as it was. "
+                              "--scopes/--planes/--sigma_list are ignored for mass_transfer (there's no "
+                              "spatial kernel or plane-isolation concept here, just one scalar cap).")
+    parser.add_argument("--beta_list", type=str, default="0.25",
+                         help="Comma list of beta values for --mechanisms=mass_transfer: cross-instance mass "
+                              "is capped at beta x (everything else's mass), only when currently exceeding "
+                              "that -- a floor/ceiling like text_grounding_alpha, never a boost. Ignored for "
+                              "--mechanisms=blur.")
     parser.add_argument("--sources", type=str, default="others,others_bg",
                          help="Comma list from {others, others_bg}. 'others' = today's validated default (only "
                               "other real instances are sources). 'others_bg' = background also becomes a source.")
@@ -176,11 +198,16 @@ def parse_args():
     args.masking_steps = list(range(0, args.num_inference_steps)) if args.masking_steps == "all" else str2list(args.masking_steps)
     args.hard_image_attribute_binding_list_double = parse_layer_range(args.hard_image_attribute_binding_list_double)
     args.hard_image_attribute_binding_list_single = parse_layer_range(args.hard_image_attribute_binding_list_single)
+    args.mechanisms = args.mechanisms.split(',')
+    args.beta_list = [float(b) for b in args.beta_list.split(',')]
     args.sources = args.sources.split(',')
     args.scopes = args.scopes.split(',')
     args.sigma_list = [float('inf') if s.strip().lower() == 'inf' else float(s) for s in args.sigma_list.split(',')]
     args.planes = args.planes.split(',')
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
+    for mech in args.mechanisms:
+        if mech not in ("blur", "mass_transfer"):
+            parser.error(f"--mechanisms entries must be 'blur' or 'mass_transfer', got {mech!r}")
     for s in args.sources:
         if s not in ("others", "others_bg"):
             parser.error(f"--sources entries must be 'others' or 'others_bg', got {s!r}")
@@ -330,6 +357,70 @@ def _full_map_key_blur_single_plane_(z, qi, seq_len, HW, image_token_H, image_to
     return z
 
 
+def _log_sub_exp(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """log(exp(a) - exp(b)), elementwise, assuming a >= b everywhere (true here since
+    b is always the LSE of a strict subset of the keys a's LSE is taken over). Uses the
+    standard log1mexp split (Maechler 2012) for numerical stability near b == a:
+    log(1 - exp(x)) via log(-expm1(x)) for x close to 0, log1p(-exp(x)) otherwise.
+    `eps`-clamps the gap away from exactly 0 to avoid log(0) in the fully-degenerate
+    case where the subset IS essentially the whole row (nothing else left at all)."""
+    x = (b - a).clamp(max=-eps)
+    log1mexp = torch.where(
+        x > -0.6931471805599453,  # -log(2)
+        torch.log(-torch.expm1(x)),
+        torch.log1p(-torch.exp(x)),
+    )
+    return a + log1mexp
+
+
+def _mass_transfer_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW, source_indices, real_ks, beta):
+    """NEW mechanism, deliberately NOT a reshaping operation at all: caps querying
+    instance k's TOTAL cross-instance mass (pooled over every eligible source in
+    `source_indices`, both target+context planes) at `beta` x everything-else's mass
+    in the row (text, own-context, own-latent-self, background, ring -- literally
+    whatever isn't cross-instance), only when currently exceeding that ceiling. A
+    uniform additive shift on cross-instance's own logits ONLY: every other group's
+    internal shape is untouched, and cross-instance's own internal shape is ALSO
+    untouched (no reshaping within cross-instance either -- this differs from every
+    blur variant above specifically in that respect). beta<=0 is undefined (skipped).
+    """
+    if beta <= 0:
+        return z
+    log_beta = math.log(beta)
+    for k in real_ks:
+        if layouts[k] is None:
+            continue
+        qk = qi[k]
+        n = qk.numel()
+        own_k = own_masks_flat[k]
+        ring_k = own_ring_flat[k]
+
+        parts = []
+        for kp in source_indices:
+            if kp == k or layouts[kp] is None:
+                continue
+            flat_kp = layouts[kp]['flat']
+            keep = ~own_k[flat_kp] & ~ring_k[flat_kp]
+            if keep.any():
+                parts.append(flat_kp[keep])
+        if not parts:
+            continue
+        combined_flat = torch.unique(torch.cat(parts))
+
+        kt = seq_len + combined_flat
+        kc = seq_len + HW + combined_flat
+        blk_t = z[:, qk][:, :, kt]      # [H, n, m]
+        blk_c = z[:, qk][:, :, kc]
+        lse_cross = torch.logsumexp(torch.cat([blk_t, blk_c], dim=-1), dim=-1)   # [H, n]
+        lse_total = torch.logsumexp(z[:, qk, :], dim=-1)                         # [H, n] -- the FULL row
+        lse_other = _log_sub_exp(lse_total, lse_cross)                          # [H, n] -- everything NOT cross
+
+        delta = (log_beta + lse_other - lse_cross).clamp(max=0.0)               # cap only, never boost
+        z[:, qk.unsqueeze(-1), kt] = blk_t + delta.unsqueeze(-1)
+        z[:, qk.unsqueeze(-1), kc] = blk_c + delta.unsqueeze(-1)
+    return z
+
+
 # --------------------------------------------------------------------------------------
 # Real-generation support: one attention function + two processor classes, used ONLY by
 # --produce_images. Dispatches to THIS script's variant strategy (source scope x
@@ -380,7 +471,10 @@ def _manual_attention_with_variant_blur(query, key, value, atten_mask, scale, in
                       else list(range(c['num_real'])))
 
     plane = spec.get("plane", "both")
-    if spec["scope"] == "full_map":
+    if spec["mechanism"] == "mass_transfer":
+        _mass_transfer_(z, layouts, c['qi'], c['own_masks_flat'], c['own_ring_flat'], seq_len, HW,
+                         source_indices, real_ks, spec["beta"])
+    elif spec["scope"] == "full_map":
         if plane == "both":
             _full_map_key_blur_(z, c['qi'], seq_len, HW, image_token_H, image_token_W, spec["sigma"],
                                  real_ks, restore_mass=spec["restore_mass"])
@@ -715,25 +809,37 @@ class _VariantBlurParallelAttnProcessor:
 
 def _variant_specs(args):
     specs = []
-    for scope in args.scopes:
-        if scope == "full_map":
-            # --sources has no meaning here (everything is included, there's no
-            # eligibility concept) -- iterate it exactly once to avoid emitting
-            # duplicate, identical variants for every --sources entry.
-            for plane in args.planes:
-                for sigma in args.sigma_list:
-                    sigma_tag = "inf" if math.isinf(sigma) else str(sigma).replace('.', 'p')
-                    name = f"scope-full_map_pln-{plane}_sig-{sigma_tag}"
-                    specs.append(dict(name=name, source=None, scope=scope, plane=plane, sigma=sigma,
-                                       restore_mass=args.restore_mass))
-        else:
+    for mech in args.mechanisms:
+        if mech == "mass_transfer":
+            # No spatial kernel, no plane-isolation concept -- just one scalar cap per
+            # (source, beta). --scopes/--planes/--sigma_list don't apply here at all.
             for src in args.sources:
+                for beta in args.beta_list:
+                    beta_tag = str(beta).replace('.', 'p')
+                    name = f"src-{src}_mech-mass_transfer_beta-{beta_tag}"
+                    specs.append(dict(name=name, source=src, mechanism="mass_transfer", beta=beta,
+                                       scope=None, plane="both", sigma=0.0, restore_mass=False))
+            continue
+
+        for scope in args.scopes:
+            if scope == "full_map":
+                # --sources has no meaning here (everything is included, there's no
+                # eligibility concept) -- iterate it exactly once to avoid emitting
+                # duplicate, identical variants for every --sources entry.
                 for plane in args.planes:
                     for sigma in args.sigma_list:
                         sigma_tag = "inf" if math.isinf(sigma) else str(sigma).replace('.', 'p')
-                        name = f"src-{src}_scope-{scope}_pln-{plane}_sig-{sigma_tag}"
-                        specs.append(dict(name=name, source=src, scope=scope, plane=plane, sigma=sigma,
-                                           restore_mass=args.restore_mass))
+                        name = f"scope-full_map_pln-{plane}_sig-{sigma_tag}"
+                        specs.append(dict(name=name, source=None, mechanism="blur", scope=scope, plane=plane,
+                                           sigma=sigma, restore_mass=args.restore_mass))
+            else:
+                for src in args.sources:
+                    for plane in args.planes:
+                        for sigma in args.sigma_list:
+                            sigma_tag = "inf" if math.isinf(sigma) else str(sigma).replace('.', 'p')
+                            name = f"src-{src}_scope-{scope}_pln-{plane}_sig-{sigma_tag}"
+                            specs.append(dict(name=name, source=src, mechanism="blur", scope=scope, plane=plane,
+                                               sigma=sigma, restore_mass=args.restore_mass))
     return specs
 
 
@@ -745,7 +851,12 @@ def _compute_variant_maps(spec, layouts_with_bg, layouts_no_bg, qi, own_masks_fl
     plane = spec.get("plane", "both")
 
     z = z0.clone()
-    if spec["scope"] == "full_map":
+    if spec["mechanism"] == "mass_transfer":
+        # No reshaping at all -- caps cross-instance's total mass, leaves every
+        # group's (cross-instance's own included) internal shape untouched.
+        _mass_transfer_(z, layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
+                         source_indices, real_ks, spec["beta"])
+    elif spec["scope"] == "full_map":
         # The opposite of cross_only: blurs the WHOLE canvas (k's own region and
         # background included, no exclusions), so it needs none of layouts/
         # own_masks_flat/own_ring_flat/source_indices -- just qi + real_ks + grid size.
@@ -799,9 +910,18 @@ def _render(args, maps_by_variant, sample, out_dir):
     label_h, row_label_w = 60, 110
 
     real_ks = sorted({k for mv in maps_by_variant.values() for k in mv.keys()})
+    # vmax is computed ONLY from the actual variants being compared, excluding the
+    # reference baselines -- those are captured under a different masking regime
+    # entirely (fully open / fully closed) and can peak much higher or lower, which
+    # would otherwise blow out (or wash out) the shared scale for every real variant.
+    # Baselines still render on that scale -- if their own peak exceeds it, they
+    # simply saturate at the top, which is informative rather than silently rescaling
+    # everything else to look dim.
+    non_baseline = {name: mv for name, mv in maps_by_variant.items() if name not in _BASELINE_VARIANT_NAMES}
+    vmax_source = non_baseline if non_baseline else maps_by_variant
     for k in real_ks:
-        target_vmax = max(mv[k]['target'].max() for mv in maps_by_variant.values() if k in mv)
-        context_vmax = max(mv[k]['context'].max() for mv in maps_by_variant.values() if k in mv)
+        target_vmax = max(mv[k]['target'].max() for mv in vmax_source.values() if k in mv)
+        context_vmax = max(mv[k]['context'].max() for mv in vmax_source.values() if k in mv)
         own_mask = next(mv[k]['own_mask'] for mv in maps_by_variant.values() if k in mv)
 
         canvas_w = row_label_w + panel_w * len(variant_names)
