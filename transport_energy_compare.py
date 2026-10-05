@@ -30,16 +30,35 @@ Mechanism, precisely:
            without it (this is the ablation that answers "could this recreate the
            fusion problem").
 
-Transport is a provably mass-conservative finite-volume upwind (donor-cell) advection
-scheme on the 4-connected grid: velocity on each face = -(C[neighbor] - C[cell]), flux
-on each face = velocity * rho[upwind cell], rho updated by -dt*divergence(flux), dt
-picked per step from a CFL condition on the actual velocity field so the scheme stays
-provably non-negative-preserving. NO diffusion term is folded in here -- this is pure
-advection, deliberately, so this script's own numerical checks can tell you whether the
-advection step ALONE already produces a smooth result or develops a pileup/shock where
-multiple drainage paths converge (a documented risk of pure advection -- see the
-"boundary pileup ratio" diagnostic below), before ever layering the validated blur on
-top as a separate pass.
+Transport is drift + diffusion (full Fokker-Planck form), each a provably
+mass-conservative finite-volume scheme on the 4-connected grid, applied per step via
+standard operator splitting (drift sub-step, then diffusion sub-step):
+  drift:     velocity on each face = -mobility*(C[neighbor]-C[cell]), flux = velocity *
+             rho[upwind cell] (donor-cell), dt from a CFL condition on the actual
+             velocity field -- see _transport_step.
+  diffusion: flux on each face = eps*(rho[far]-rho[near]) (Fick's law), dt from
+             diffusion's OWN stability bound (1/(4*eps), independent of drift's CFL --
+             conflating the two is an easy, unconditionally-unstable mistake, see
+             _diffusion_step's docstring) -- see _diffusion_step.
+--drift_mobility_list and --diffusion_eps_list are independent physical speed knobs
+(mobility=1, eps=0 reproduces plain, unscaled pure drift exactly -- the original,
+simpler version of this script). --cfl is purely numerical (stability margin), shared
+by both sub-steps against their own bounds, and should not change the physical answer.
+
+Why diffusion matters here, concretely (found empirically before building this in):
+pure drift (eps=0) was tested against a C field that monotonically decays outward from
+an instance's own boundary (the straightforward reading of "object edges are salient,
+fading into background") and produced an EXACT vacuum immediately outside the wall --
+rho driven to literal 0.0, with a hard cliff where the drained mass piled up further
+out. That's a new discontinuity of the same class this whole intervention is trying to
+avoid, just relocated and inverted (zero instead of max). Diffusion is the term that
+prevents a pure drift field from running away to a vacuum: it continuously exchanges a
+little mass with neighbors regardless of drift direction, so a cell being drained by
+drift still gets partially refilled. Whether a PRACTICAL diffusion_eps actually closes
+that gap to something reasonable (rather than needing to dominate drift so completely
+that the directional signal becomes pointless) is an open, not-yet-fully-characterized
+question -- see the "boundary pileup ratio" diagnostic below, which is exactly the
+number to watch when sweeping --diffusion_eps_list.
 
 Nothing here is wired into attention_query_blur.py or capture_query_blur_leakage.py --
 this is a read-only consumer of already-captured, already-validated snapshot machinery
@@ -139,9 +158,22 @@ def parse_args():
     parser.add_argument("--n_steps_list", type=str, default="0,4,16,64",
                          help="Comma list of advection step counts to render side by side (0 = untransported "
                               "reference, included as an ordinary variant rather than special-cased).")
+    parser.add_argument("--drift_mobility_list", type=str, default="1.0",
+                         help="Comma list of drift-speed multipliers: velocity = -mobility * grad(C). A pure "
+                              "physical SPEED knob, independent of --cfl (which only controls numerical step "
+                              "size/stability, not the actual rate mass moves at) and independent of "
+                              "--diffusion_eps_list (the two compete, see module docstring). 1.0 = unscaled.")
+    parser.add_argument("--diffusion_eps_list", type=str, default="0.0",
+                         help="Comma list of diffusion strengths, applied each step via standard operator "
+                              "splitting (drift, then diffusion) -- a heat-equation smoothing term folded in on "
+                              "top of drift, using a SEPARATELY mass-conservative flux-form Laplacian (not the "
+                              "validated _blur_block, which is a normalized local-mean smoother and is NOT "
+                              "exactly mass-conservative near a hard domain boundary -- see _diffusion_step). "
+                              "0.0 (default) skips diffusion entirely, reproducing pure-drift behavior exactly.")
     parser.add_argument("--cfl", type=float, default=0.4,
-                         help="CFL safety factor (0,1]; dt is chosen per step as cfl / (max|v_x|+max|v_y|) so the "
-                              "upwind scheme stays non-negative-preserving. Lower = slower but safer.")
+                         help="CFL safety factor (0,1], shared by both drift and diffusion sub-steps (each "
+                              "against its OWN stability bound) -- purely numerical, does not change the "
+                              "physical answer, only how finely/safely it's approximated. Lower = slower but safer.")
     parser.add_argument("--c_smooth_sigma", type=float, default=2.0,
                          help="Gaussian sigma (tokens) to smooth C with before differencing, via the validated "
                               "_blur_block primitive -- 0 skips smoothing (raw per-token C, noisier gradient).")
@@ -161,6 +193,8 @@ def parse_args():
     args.domains = args.domains.split(',')
     args.c_scales = args.c_scales.split(',')
     args.n_steps_list = [int(n) for n in args.n_steps_list.split(',')]
+    args.drift_mobility_list = [float(m) for m in args.drift_mobility_list.split(',')]
+    args.diffusion_eps_list = [float(e) for e in args.diffusion_eps_list.split(',')]
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for d in args.domains:
         if d not in ("cross_only", "full_map"):
@@ -192,20 +226,24 @@ def _compress_potential(C_raw: torch.Tensor, scale: str) -> torch.Tensor:
     raise ValueError(f"unknown c_scale {scale!r}")
 
 
-def _transport_step(rho: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, cfl: float):
+def _transport_step(rho: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, cfl: float, mobility: float = 1.0):
     """One explicit upwind-advection step. rho/C/domain: [Himg, Wimg] (float, float,
-    bool). Returns (rho_new, dt_used, max_speed, clamped). `domain` cells outside it
-    never exchange mass with inside (every face touching a non-domain cell is force-
-    zeroed) -- this IS the hard wall, not an approximation of one. `clamped` flags
-    whether a negative-rho numerical overshoot had to be clipped (should not happen
-    under a correctly respected CFL condition; surfaced so callers can detect if it
-    ever does)."""
+    bool). `mobility` scales the velocity field (v = -mobility * grad(C)) -- a pure
+    drift-SPEED knob, independent of `cfl` (which only controls the numerical step
+    size / stability margin, not the physical rate mass moves at) and independent of
+    diffusion strength (see _diffusion_step below). mobility=1.0 reproduces the
+    original, unscaled behavior exactly. Returns (rho_new, dt_used, max_speed,
+    clamped). `domain` cells outside it never exchange mass with inside (every face
+    touching a non-domain cell is force-zeroed) -- this IS the hard wall, not an
+    approximation of one. `clamped` flags whether a negative-rho numerical overshoot
+    had to be clipped (should not happen under a correctly respected CFL condition;
+    surfaced so callers can detect if it ever does)."""
     Himg, Wimg = rho.shape
     domain_f = domain.float()
 
-    # Face velocities: v = -(C[neighbor] - C[cell]), i.e. downhill is positive.
-    v_x = -(C[:, 1:] - C[:, :-1])   # [Himg, Wimg-1], between col x and x+1
-    v_y = -(C[1:, :] - C[:-1, :])   # [Himg-1, Wimg], between row y and y+1
+    # Face velocities: v = -mobility*(C[neighbor] - C[cell]), i.e. downhill is positive.
+    v_x = -mobility * (C[:, 1:] - C[:, :-1])   # [Himg, Wimg-1], between col x and x+1
+    v_y = -mobility * (C[1:, :] - C[:-1, :])   # [Himg-1, Wimg], between row y and y+1
 
     # A face is active only if BOTH adjacent cells are in-domain -- zero flux across
     # the wall by construction, not by clamping after the fact.
@@ -234,18 +272,62 @@ def _transport_step(rho: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, cf
     return rho_new, dt, max_speed, clamped
 
 
-def run_transport(rho0: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, n_steps: int, cfl: float):
-    """Runs `n_steps` of _transport_step. Returns (rho_final, diagnostics dict).
-    n_steps=0 is a true no-op (returns rho0 unchanged, by construction -- the loop
-    simply never executes)."""
+def _diffusion_step(rho: torch.Tensor, domain: torch.Tensor, eps: float, dt: float):
+    """One explicit diffusion (heat-equation) step: flux across a face = eps *
+    (rho[far] - rho[near]) (Fick's law -- mass flows from high to low concentration),
+    zeroed at any face touching outside the domain, same wall treatment as
+    _transport_step. Manifestly mass-conservative by the same telescoping-sum
+    argument as advection's divergence. `eps` is the diffusion STRENGTH, a separate
+    physical knob from drift's `mobility` -- the two compete (see module docstring)
+    rather than interacting numerically.
+
+    Stability note: an explicit 2D diffusion step is only non-negative-preserving
+    under its OWN bound, dt <= 1/(4*eps) -- NOT the same bound _transport_step's CFL
+    enforces for drift. Callers combining both (see run_transport) must take dt as
+    the min of both bounds, independently; reusing drift's dt here without that check
+    will blow up for any eps large enough that 1/(4*eps) < drift's dt (confirmed by
+    hand during development: skipping this bound produces mass errors of 1e11+ within
+    a few dozen steps -- not a subtle effect).
+    """
+    if eps <= 0:
+        return rho
+    domain_f = domain.float()
+    face_x_active = domain_f[:, :-1] * domain_f[:, 1:]
+    face_y_active = domain_f[:-1, :] * domain_f[1:, :]
+    flux_x = eps * (rho[:, 1:] - rho[:, :-1]) * face_x_active
+    flux_y = eps * (rho[1:, :] - rho[:-1, :]) * face_y_active
+
+    div = torch.zeros_like(rho)
+    div[:, :-1] -= flux_x
+    div[:, 1:] += flux_x
+    div[:-1, :] -= flux_y
+    div[1:, :] += flux_y
+
+    rho_new = rho - dt * div
+    return rho_new.clamp(min=0.0)
+
+
+def run_transport(rho0: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, n_steps: int, cfl: float,
+                   mobility: float = 1.0, diffusion_eps: float = 0.0):
+    """Runs `n_steps` of drift (_transport_step), optionally followed each step by
+    diffusion (_diffusion_step) via standard operator splitting. Returns (rho_final,
+    diagnostics dict). n_steps=0 is a true no-op (returns rho0 unchanged, by
+    construction -- the loop simply never executes). diffusion_eps=0.0 (default)
+    skips the diffusion half-step entirely, reproducing the original pure-drift
+    behavior exactly -- existing callers that never pass diffusion_eps are
+    unaffected."""
     rho = rho0.clone()
     any_clamped = False
     total_dt = 0.0
     for _ in range(n_steps):
-        rho, dt, max_speed, clamped = _transport_step(rho, C, domain, cfl)
+        rho, dt_drift, max_speed, clamped = _transport_step(rho, C, domain, cfl, mobility=mobility)
+        if diffusion_eps > 0:
+            dt_diff_max = 1.0 / (4.0 * diffusion_eps)
+            dt = min(dt_drift, cfl * dt_diff_max)   # each sub-step's OWN stability bound, not shared
+            rho = _diffusion_step(rho, domain, diffusion_eps, dt)
         any_clamped = any_clamped or clamped
-        total_dt += dt
-        if max_speed <= 1e-9:
+        total_dt += dt_drift
+        if max_speed <= 1e-9 and diffusion_eps == 0:
             break  # field has converged (flat C or flat rho within domain) -- no more motion possible
 
     domain_f = domain.float()
@@ -294,9 +376,14 @@ def _variant_specs(args):
     specs = []
     for domain in args.domains:
         for c_scale in args.c_scales:
-            for n_steps in args.n_steps_list:
-                name = f"dom-{domain}_cscale-{c_scale}_steps-{n_steps}"
-                specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps))
+            for mobility in args.drift_mobility_list:
+                for diffusion_eps in args.diffusion_eps_list:
+                    for n_steps in args.n_steps_list:
+                        mob_tag = str(mobility).replace('.', 'p')
+                        eps_tag = str(diffusion_eps).replace('.', 'p')
+                        name = f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}_steps-{n_steps}"
+                        specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
+                                           mobility=mobility, diffusion_eps=diffusion_eps))
     return specs
 
 
@@ -324,7 +411,8 @@ def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, 
         wall = own_mask_2d | ring_2d
         domain = ~wall if spec["domain"] == "cross_only" else torch.ones_like(wall)
 
-        rho_final, diag = run_transport(rho0, C, domain, spec["n_steps"], cfl)
+        rho_final, diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
+                                         mobility=spec["mobility"], diffusion_eps=spec["diffusion_eps"])
         diag["boundary_pileup_ratio"] = _boundary_pileup_ratio(rho_final, domain, wall)
 
         maps[k] = dict(
