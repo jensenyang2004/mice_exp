@@ -205,19 +205,33 @@ def parse_args():
                               "bump centered at each sibling's own centroid (width from its own mask "
                               "area) -- nonzero outward gradient everywhere except the single apex, so "
                               "interior mass is evacuated too. See _other_instance_peak_potential. NOTE: "
-                              "'peak' was found to create its own failure in densely packed scenes (a "
-                              "saddle/valley between two separate nearby peaks -- the same convergence "
-                              "geometry already diagnosed for C-context peaks) -- prefer 'mesa' with "
-                              "--other_instance_extend>0 for dense scenes instead.")
+                              "both shapes are isotropic/per-instance -- each pushes away from ITSELF "
+                              "only, blind to how many other siblings surround a given point. In a dense "
+                              "cluster that still sends escaping mass straight into the seams between "
+                              "instances (confirmed directly) -- see --occupancy_combine_list for the "
+                              "actual fix.")
     parser.add_argument("--other_instance_extend", type=int, default=1,
                          help="Dilate (grow outward) each OTHER instance's own mask by this many tokens "
                               "before building the occupancy indicator -- the exact same growth idea as "
                               "--ring_radius (boundary-adjacent tokens still have a real chance of "
-                              "belonging to the instance). In a dense cluster, this closes small gaps "
-                              "between siblings so their occupied regions fuse into one contiguous area "
-                              "with no interior dip (mesa shape only -- see _dilate_mask/"
-                              "_other_instance_occupancy), instead of leaving a narrow seam between "
-                              "them for mass to collect in. 0 disables (raw mask only).")
+                              "belonging to the instance). Secondary to --occupancy_combine_list=sum (on "
+                              "its own, confirmed NOT sufficient to stop dense-cluster seam pileup -- "
+                              "extend only closes mesa's literal gap between masks, it doesn't address "
+                              "the underlying 'which direction does mass flow' problem). 0 disables.")
+    parser.add_argument("--occupancy_combine_list", type=str, default="max",
+                         help="Comma list from {max, sum} -- how each sibling's contribution to the "
+                              "occupancy field is accumulated. 'max' (default, backward-compatible): a "
+                              "point's value AND gradient direction are set by whichever SINGLE sibling "
+                              "is strongest there -- blind to how many other siblings also surround that "
+                              "point, so the direction field flips discontinuously at the midline between "
+                              "two siblings, which is exactly the seam, steering mass ALONG it instead of "
+                              "out. 'sum': every sibling's contribution adds (field superposition / a "
+                              "kernel density estimate of instance crowding) -- since gradient is linear, "
+                              "the resulting drift at any point is the VECTOR SUM of every nearby "
+                              "sibling's own 'push away from me' direction, pointing toward whichever "
+                              "direction has the fewest/weakest neighbors rather than just away from the "
+                              "closest one. This is the actual fix for 'push toward more space, less "
+                              "instance' in dense scenes -- see _other_instance_occupancy's docstring.")
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of REAL instance indices to render")
 
@@ -249,6 +263,7 @@ def parse_args():
     args.diffusion_eps_list = [float(e) for e in args.diffusion_eps_list.split(',')]
     args.other_instance_penalty_list = [float(p) for p in args.other_instance_penalty_list.split(',')]
     args.occupancy_shape_list = args.occupancy_shape_list.split(',')
+    args.occupancy_combine_list = args.occupancy_combine_list.split(',')
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for d in args.domains:
         if d not in ("cross_only", "full_map"):
@@ -256,6 +271,9 @@ def parse_args():
     for o in args.occupancy_shape_list:
         if o not in ("mesa", "peak"):
             parser.error(f"--occupancy_shape_list entries must be 'mesa' or 'peak', got {o!r}")
+    for cm in args.occupancy_combine_list:
+        if cm not in ("max", "sum"):
+            parser.error(f"--occupancy_combine_list entries must be 'max' or 'sum', got {cm!r}")
     for c in args.c_scales:
         if c not in ("sqrt", "linear", "log"):
             parser.error(f"--c_scales entries must be 'sqrt', 'linear', or 'log', got {c!r}")
@@ -298,7 +316,7 @@ def _dilate_mask(mask_2d: torch.Tensor, radius: int) -> torch.Tensor:
 
 
 def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token_H: int, image_token_W: int,
-                               sigma: float, extend_radius: int = 0) -> torch.Tensor:
+                               sigma: float, extend_radius: int = 0, combine: str = "max") -> torch.Tensor:
     """Smoothed [0,1]-ish indicator of every OTHER real instance's own footprint
     (union, excluding k itself), reshaped to [Himg, Wimg]. This is a DIRECT,
     EXACT structural signal -- own_masks_flat is ground-truth geometry already
@@ -329,6 +347,21 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
     separate, non-overlapping repulsors -- the structural cause of mass piling up
     in the narrow seams between densely packed instances.
 
+    `combine` picks how each sibling's contribution is accumulated:
+    - "max" (default, backward-compatible): the point's value is set by whichever
+      SINGLE sibling is strongest there. This also means its GRADIENT only ever
+      reflects that one sibling -- a point between two siblings gets a direction
+      field that flips discontinuously at the exact midline where the "nearest"
+      sibling switches, and that midline is the seam itself, so escaping mass gets
+      steered ALONG the seam rather than out of the whole crowded region.
+    - "sum": every sibling's contribution adds up (field superposition, like
+      summing point charges / a kernel density estimate of instance crowding). A
+      point flanked by several siblings gets a correspondingly larger value AND,
+      because gradient is linear, its drift direction is the VECTOR SUM of every
+      nearby sibling's own "push away from me" vector -- pointing toward whichever
+      direction has the fewest/weakest neighbors, not just away from the closest
+      one. This is what actually answers "push toward more space, less instance."
+
     Smoothed the same way C is (reusing the caller's c_smooth_sigma, not a new
     independent knob) via the validated _blur_block primitive with an all-ones mask
     -- sigma=0 skips smoothing (raw binary indicator, hard edges). Returns an
@@ -343,7 +376,8 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
             continue
         mask_2d = own_masks_flat[kp].reshape(image_token_H, image_token_W)
         mask_2d = _dilate_mask(mask_2d, extend_radius)
-        occ = torch.maximum(occ, mask_2d.reshape(-1).float())
+        contrib = mask_2d.reshape(-1).float()
+        occ = occ + contrib if combine == "sum" else torch.maximum(occ, contrib)
     occ = occ.reshape(1, image_token_H, image_token_W, 1)
     if sigma > 0:
         ones_mask = torch.ones(1, image_token_H, image_token_W, 1, device=device)
@@ -352,7 +386,8 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
 
 
 def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_token_H: int,
-                                    image_token_W: int, extend_radius: int = 0) -> torch.Tensor:
+                                    image_token_W: int, extend_radius: int = 0,
+                                    combine: str = "max") -> torch.Tensor:
     """Alternative to _other_instance_occupancy's flat-topped mesa. A blurred binary
     mask is flat (zero gradient, hence zero drift force) across its ENTIRE interior
     except within one sigma of its boundary -- mass already sitting deep inside a
@@ -366,16 +401,20 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
     gradient EVERYWHERE except the single apex point, so interior mass is pushed out
     too, not just edge mass. Width is derived directly from kp's own mask area
     (r_eff = sqrt(area/pi), no new independent tunable -- same spirit as C reusing
-    c_smooth_sigma). Combined across siblings via elementwise max (same combinator as
-    _other_instance_occupancy), not sum, so two nearby siblings don't stack into an
-    artificially taller ridge.
+    c_smooth_sigma).
 
-    NOTE: unlike _other_instance_occupancy, `extend_radius` here does NOT fix the
-    dense-cluster saddle problem -- dilating a sibling's mask only grows its own
-    r_eff slightly, it does not merge two separate siblings' bumps into one
-    contiguous shape the way mesa's union+blur does, so two nearby peaks still
-    create a saddle between them regardless of extend_radius. For dense scenes,
-    prefer --occupancy_shape_list mesa with extend_radius>0, not peak.
+    `combine` -- see _other_instance_occupancy's docstring for the full
+    explanation -- "max" (default) takes only the single strongest sibling at each
+    point (both value AND gradient direction), which for two separate peaks
+    produces a saddle exactly at their shared midline (the seam). "sum" superposes
+    every sibling's bump (gradient is linear, so the resulting drift is the vector
+    sum of every nearby sibling's own "push away from me" direction) -- a true
+    crowding-aware field whose gradient points toward whichever direction has the
+    fewest/weakest nearby instances, not just away from the closest one. For dense
+    scenes, prefer combine="sum" over extend_radius (extend_radius alone does NOT
+    fix the saddle here -- dilating one sibling's mask only grows its own r_eff
+    slightly, it doesn't merge two separate bumps into one shape the way mesa's
+    union+blur does).
     """
     device = own_masks_flat[0].device
     yy, xx = torch.meshgrid(
@@ -397,19 +436,19 @@ def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_
         r_eff = torch.sqrt(area / torch.pi).clamp(min=1.0)
         d2 = (yy - cy) ** 2 + (xx - cx) ** 2
         bump = torch.exp(-d2 / (2.0 * r_eff * r_eff))
-        occ = torch.maximum(occ, bump)
+        occ = occ + bump if combine == "sum" else torch.maximum(occ, bump)
     return occ
 
 
 def _other_instance_potential(occupancy_shape, own_masks_flat, k, num_real, image_token_H, image_token_W, sigma,
-                               extend_radius=0):
+                               extend_radius=0, combine="max"):
     """Single dispatch point used by both call sites below."""
     if occupancy_shape == "mesa":
         return _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, sigma,
-                                          extend_radius)
+                                          extend_radius, combine)
     if occupancy_shape == "peak":
         return _other_instance_peak_potential(own_masks_flat, k, num_real, image_token_H, image_token_W,
-                                               extend_radius)
+                                               extend_radius, combine)
     raise ValueError(f"unknown occupancy_shape {occupancy_shape!r}")
 
 
@@ -660,7 +699,8 @@ def _manual_attention_with_transport(query, key, value, atten_mask, scale, insta
         if other_penalty > 0:
             occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), c['own_masks_flat'], k,
                                              c['num_real'], image_token_H, image_token_W, c_smooth_sigma,
-                                             spec.get("other_instance_extend", 0))
+                                             spec.get("other_instance_extend", 0),
+                                             spec.get("occupancy_combine", "max"))
             C = C + other_penalty * occ   # broadcasts [Himg,Wimg] against C's [heads, n_k, Himg, Wimg]
 
         rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
@@ -1075,18 +1115,21 @@ def _variant_specs(args):
                 for diffusion_eps in args.diffusion_eps_list:
                     for other_penalty in args.other_instance_penalty_list:
                         occ_shapes = args.occupancy_shape_list if other_penalty > 0 else ["mesa"]
+                        combines = args.occupancy_combine_list if other_penalty > 0 else ["max"]
                         for occ_shape in occ_shapes:
-                            for n_steps in args.n_steps_list:
-                                mob_tag = str(mobility).replace('.', 'p')
-                                eps_tag = str(diffusion_eps).replace('.', 'p')
-                                pen_tag = str(other_penalty).replace('.', 'p')
-                                name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
-                                        f"_pen-{pen_tag}_occ-{occ_shape}_steps-{n_steps}")
-                                specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
-                                                   mobility=mobility, diffusion_eps=diffusion_eps,
-                                                   other_instance_penalty=other_penalty,
-                                                   occupancy_shape=occ_shape,
-                                                   other_instance_extend=args.other_instance_extend))
+                            for combine in combines:
+                                for n_steps in args.n_steps_list:
+                                    mob_tag = str(mobility).replace('.', 'p')
+                                    eps_tag = str(diffusion_eps).replace('.', 'p')
+                                    pen_tag = str(other_penalty).replace('.', 'p')
+                                    name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
+                                            f"_pen-{pen_tag}_occ-{occ_shape}_cmb-{combine}_steps-{n_steps}")
+                                    specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
+                                                       mobility=mobility, diffusion_eps=diffusion_eps,
+                                                       other_instance_penalty=other_penalty,
+                                                       occupancy_shape=occ_shape,
+                                                       occupancy_combine=combine,
+                                                       other_instance_extend=args.other_instance_extend))
     return specs
 
 
@@ -1113,7 +1156,8 @@ def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, 
         if other_penalty > 0:
             occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), own_masks_flat, k, num_real,
                                              image_token_H, image_token_W, c_smooth_sigma,
-                                             spec.get("other_instance_extend", 0))
+                                             spec.get("other_instance_extend", 0),
+                                             spec.get("occupancy_combine", "max"))
             C = C + other_penalty * occ
 
         own_mask_2d = own_masks_flat[k].reshape(image_token_H, image_token_W)
