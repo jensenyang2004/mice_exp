@@ -71,10 +71,12 @@ import sys
 import argparse
 import math
 from pathlib import Path
+from typing import Optional
 
 import torch
 from PIL import Image, ImageDraw
 from loguru import logger
+from diffusers.models.embeddings import apply_rotary_emb
 
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
@@ -82,6 +84,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from mice_dataset import get_mice_dataloader
 from flux2.transformer_flux2_klein import Flux2Attention, Flux2ParallelSelfAttention
+from flux2.attention.attention_utils import _get_qkv_projections, MaskType
+from flux2.attention.attention_processor_APITASM_kernel_nonlap import (
+    fill_hard_text_bind_mask,
+    fill_image_bind_mask,
+    TRANSFORMER_NUM_LAYERS,
+    TRANSFORMER_SINGLE_NUM_LAYERS,
+)
 from flux2.attention.attention_query_blur import (
     Flux2APITASMQueryBlurAttnProcessor,
     Flux2ParallelSelfAttnProcessorAPITASMQueryBlur,
@@ -185,6 +194,17 @@ def parse_args():
     parser.add_argument("--map_px", type=int, default=320, help="Rendered width (px) of each attention-map panel")
     parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True)
 
+    # Real image generation: one COMPLETE, independent pipe() run per variant, transport
+    # genuinely active at every step/layer (not just the one frozen snapshot above).
+    # Off by default -- N full generations is much more expensive than one snapshot.
+    # Unlike the snapshot-comparison path (which averages over heads+queries for
+    # visualization), this runs transport per-query, per-head -- every one of
+    # instance k's own query rows gets its OWN independently transported result, no
+    # averaging, matching the fidelity the validated blur mechanisms already use.
+    parser.add_argument("--produce_images", action="store_true",
+                         help="Also run one full generation per variant and save the actual resulting image, "
+                              "in addition to the attention-map snapshot comparison. Off by default.")
+
     args = parser.parse_args()
 
     args.masking_steps = list(range(0, args.num_inference_steps)) if args.masking_steps == "all" else str2list(args.masking_steps)
@@ -227,43 +247,61 @@ def _compress_potential(C_raw: torch.Tensor, scale: str) -> torch.Tensor:
 
 
 def _transport_step(rho: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, cfl: float, mobility: float = 1.0):
-    """One explicit upwind-advection step. rho/C/domain: [Himg, Wimg] (float, float,
-    bool). `mobility` scales the velocity field (v = -mobility * grad(C)) -- a pure
+    """One explicit upwind-advection step. rho/C: [..., Himg, Wimg] -- any number of
+    leading batch dims (e.g. [] for the visualization path's single averaged field,
+    or [H, n_k] for real generation's per-head-per-query fields; see
+    _manual_attention_with_transport). domain: [Himg, Wimg], no batch dims -- it's a
+    pure function of which instance is querying, shared/broadcast across whatever
+    batch rho/C carry (every query and head of the SAME instance shares the SAME
+    wall). `mobility` scales the velocity field (v = -mobility * grad(C)) -- a pure
     drift-SPEED knob, independent of `cfl` (which only controls the numerical step
     size / stability margin, not the physical rate mass moves at) and independent of
     diffusion strength (see _diffusion_step below). mobility=1.0 reproduces the
     original, unscaled behavior exactly. Returns (rho_new, dt_used, max_speed,
-    clamped). `domain` cells outside it never exchange mass with inside (every face
-    touching a non-domain cell is force-zeroed) -- this IS the hard wall, not an
-    approximation of one. `clamped` flags whether a negative-rho numerical overshoot
-    had to be clipped (should not happen under a correctly respected CFL condition;
-    surfaced so callers can detect if it ever does)."""
-    Himg, Wimg = rho.shape
+    clamped) -- max_speed/clamped are GLOBAL across the whole batch (worst-case
+    across every head/query sets dt for all of them -- simple and safe, not
+    per-batch-element adaptive). `domain` cells outside it never exchange mass with
+    inside (every face touching a non-domain cell is force-zeroed) -- this IS the
+    hard wall, not an approximation of one. `clamped` flags whether a negative-rho
+    numerical overshoot had to be clipped (should not happen under a correctly
+    respected CFL condition; surfaced so callers can detect if it ever does)."""
     domain_f = domain.float()
 
     # Face velocities: v = -mobility*(C[neighbor] - C[cell]), i.e. downhill is positive.
-    v_x = -mobility * (C[:, 1:] - C[:, :-1])   # [Himg, Wimg-1], between col x and x+1
-    v_y = -mobility * (C[1:, :] - C[:-1, :])   # [Himg-1, Wimg], between row y and y+1
+    # [..., :-1]/[..., 1:] slice the LAST axis (Wimg); [..., :-1, :]/[..., 1:, :] slice
+    # the SECOND-TO-LAST axis (Himg) -- both correct regardless of how many leading
+    # batch dims rho/C carry (identical to plain [:, 1:]/[1:, :] when there are none).
+    v_x = -mobility * (C[..., 1:] - C[..., :-1])           # [..., Himg, Wimg-1]
+    v_y = -mobility * (C[..., 1:, :] - C[..., :-1, :])     # [..., Himg-1, Wimg]
 
     # A face is active only if BOTH adjacent cells are in-domain -- zero flux across
-    # the wall by construction, not by clamping after the fact.
-    face_x_active = domain_f[:, :-1] * domain_f[:, 1:]
-    face_y_active = domain_f[:-1, :] * domain_f[1:, :]
+    # the wall by construction, not by clamping after the fact. domain_f is unbatched
+    # ([Himg, Wimg]); broadcasts against v_x/v_y's batch dims automatically.
+    face_x_active = domain_f[..., :-1] * domain_f[..., 1:]
+    face_y_active = domain_f[..., :-1, :] * domain_f[..., 1:, :]
     v_x = v_x * face_x_active
     v_y = v_y * face_y_active
 
-    max_speed = max(v_x.abs().max().item(), v_y.abs().max().item(), 1e-12)
+    # 2D CFL for an operator-coupled upwind scheme needs the SUM of the two axes'
+    # max velocities, not just the larger one -- a single cell can have both a large
+    # vx AND a large vy simultaneously (true whenever C isn't smooth/correlated
+    # across directions, e.g. real attention noise, not just the smooth synthetic
+    # test potentials used during initial development). Using max() alone under-
+    # estimates the true bound and allows negative-density overshoot; confirmed by
+    # hand -- max() alone triggers the clamp path on noisy batched data where sum()
+    # does not.
+    max_speed = max(v_x.abs().max().item() + v_y.abs().max().item(), 1e-12)
     dt = cfl / max_speed
 
     # Upwind (donor-cell) flux: take rho from whichever side the flow originates.
-    flux_x = torch.where(v_x >= 0, v_x * rho[:, :-1], v_x * rho[:, 1:])
-    flux_y = torch.where(v_y >= 0, v_y * rho[:-1, :], v_y * rho[1:, :])
+    flux_x = torch.where(v_x >= 0, v_x * rho[..., :-1], v_x * rho[..., 1:])
+    flux_y = torch.where(v_y >= 0, v_y * rho[..., :-1, :], v_y * rho[..., 1:, :])
 
     div = torch.zeros_like(rho)
-    div[:, :-1] += flux_x
-    div[:, 1:] -= flux_x
-    div[:-1, :] += flux_y
-    div[1:, :] -= flux_y
+    div[..., :-1] += flux_x
+    div[..., 1:] -= flux_x
+    div[..., :-1, :] += flux_y
+    div[..., 1:, :] -= flux_y
 
     rho_new = rho - dt * div
     clamped = bool((rho_new < -1e-6).any().item())
@@ -276,7 +314,8 @@ def _diffusion_step(rho: torch.Tensor, domain: torch.Tensor, eps: float, dt: flo
     """One explicit diffusion (heat-equation) step: flux across a face = eps *
     (rho[far] - rho[near]) (Fick's law -- mass flows from high to low concentration),
     zeroed at any face touching outside the domain, same wall treatment as
-    _transport_step. Manifestly mass-conservative by the same telescoping-sum
+    _transport_step. rho: [..., Himg, Wimg], any leading batch dims (same convention
+    as _transport_step). Manifestly mass-conservative by the same telescoping-sum
     argument as advection's divergence. `eps` is the diffusion STRENGTH, a separate
     physical knob from drift's `mobility` -- the two compete (see module docstring)
     rather than interacting numerically.
@@ -292,16 +331,16 @@ def _diffusion_step(rho: torch.Tensor, domain: torch.Tensor, eps: float, dt: flo
     if eps <= 0:
         return rho
     domain_f = domain.float()
-    face_x_active = domain_f[:, :-1] * domain_f[:, 1:]
-    face_y_active = domain_f[:-1, :] * domain_f[1:, :]
-    flux_x = eps * (rho[:, 1:] - rho[:, :-1]) * face_x_active
-    flux_y = eps * (rho[1:, :] - rho[:-1, :]) * face_y_active
+    face_x_active = domain_f[..., :-1] * domain_f[..., 1:]
+    face_y_active = domain_f[..., :-1, :] * domain_f[..., 1:, :]
+    flux_x = eps * (rho[..., 1:] - rho[..., :-1]) * face_x_active
+    flux_y = eps * (rho[..., 1:, :] - rho[..., :-1, :]) * face_y_active
 
     div = torch.zeros_like(rho)
-    div[:, :-1] -= flux_x
-    div[:, 1:] += flux_x
-    div[:-1, :] -= flux_y
-    div[1:, :] += flux_y
+    div[..., :-1] -= flux_x
+    div[..., 1:] += flux_x
+    div[..., :-1, :] -= flux_y
+    div[..., 1:, :] += flux_y
 
     rho_new = rho - dt * div
     return rho_new.clamp(min=0.0)
@@ -366,6 +405,488 @@ def _boundary_pileup_ratio(rho: torch.Tensor, domain: torch.Tensor, wall: torch.
     near_mean = rho[near_wall].mean().item()
     far_mean = rho[far].mean().item()
     return near_mean / max(far_mean, 1e-12)
+
+
+def _smooth_potential_batched(C_raw: torch.Tensor, image_token_H: int, image_token_W: int, sigma: float):
+    """C_raw: [heads, n_k, Himg, Wimg]. Reuses the validated _blur_block primitive
+    (same one _compute_variant_maps already calls) by permuting into its expected
+    [H, Hk, Wk, m] axis convention (spatial dims in positions 1,2) and back --
+    _blur_block's "H"/"m" are both just generic batch dims to the implementation, so
+    this works identically whether m=1 (visualization path, no batching) or m=n_k
+    (real generation, every query transported independently)."""
+    if sigma <= 0:
+        return C_raw
+    heads, n_k = C_raw.shape[0], C_raw.shape[1]
+    Z = C_raw.permute(0, 2, 3, 1)   # [heads, Himg, Wimg, n_k]
+    ones_mask = torch.ones(1, image_token_H, image_token_W, 1, device=C_raw.device, dtype=Z.dtype)
+    Z_smoothed = _blur_block(Z, ones_mask, sigma)
+    return Z_smoothed.permute(0, 3, 1, 2)   # back to [heads, n_k, Himg, Wimg]
+
+
+# --------------------------------------------------------------------------------------
+# Real-generation support: one attention function + two processor classes, used ONLY
+# by --produce_images. Transport genuinely active at every step/layer of a real run,
+# PER QUERY PER HEAD (not averaged like the snapshot-comparison path above -- real
+# generation needs every one of instance k's own pixels to get its own independently
+# transported result, matching the fidelity the validated blur mechanisms already
+# use). Operates POST-softmax (unlike blur's pre-softmax logit edits): A = softmax(z)
+# is computed first, transport runs on A's relevant rows, then A @ V -- the dispatch
+# point moves to after the softmax line, everything else about the surrounding
+# mask-construction/counter machinery is unchanged from the validated pattern.
+# --------------------------------------------------------------------------------------
+
+def _manual_attention_with_transport(query, key, value, atten_mask, scale, instance_position_mask_list,
+                                      seq_len, HW, image_token_H, image_token_W, device,
+                                      spec, min_region_tokens, cfl, c_smooth_sigma, layout_cache, is_conditional):
+    """Same QK^T / mask / softmax pipeline as attention_query_blur.py's
+    _manual_attention_with_blur, but dispatches to THIS script's transport mechanism
+    AFTER softmax (not on the pre-softmax logits). `layout_cache` mirrors
+    _manual_attention_with_variant_blur's own caching pattern -- built once per
+    is_conditional branch, reused across every attention call within a generation.
+    Transport's domain never needs a background pseudo-instance (unlike blur's
+    --sources axis): background is automatically part of "everything except own+ring"
+    already, so this only ever builds the plain (no-background) layout.
+    """
+    q = query.permute(0, 2, 1, 3).float()
+    k_ = key.permute(0, 2, 1, 3).float()
+    v_ = value.permute(0, 2, 1, 3)
+    z = torch.matmul(q, k_.transpose(-1, -2)) * scale
+    if atten_mask is not None:
+        z = z + atten_mask
+    assert z.shape[0] == 1, "transport attention currently assumes batch_size == 1"
+    z = z[0]
+    V = v_[0]
+
+    A = torch.softmax(z, dim=-1)   # POST-softmax -- transport edits A directly, never z
+
+    if is_conditional not in layout_cache:
+        layouts, qi, _cross_keys, own_masks_flat, own_ring_flat = _build_instance_layout(
+            instance_position_mask_list, seq_len, HW, image_token_H, image_token_W, device,
+            min_region_tokens, background_index=None, ring_radius=0,
+        )
+        layout_cache[is_conditional] = dict(
+            layouts=layouts, qi=qi, own_masks_flat=own_masks_flat, own_ring_flat=own_ring_flat,
+            num_real=len(instance_position_mask_list),
+        )
+    c = layout_cache[is_conditional]
+    heads = A.shape[0]
+
+    for k in range(c['num_real']):
+        if c['layouts'][k] is None:
+            continue
+        qk = c['qi'][k]
+        n_k = qk.numel()
+
+        own_mask_2d = c['own_masks_flat'][k].reshape(image_token_H, image_token_W)
+        ring_2d = c['own_ring_flat'][k].reshape(image_token_H, image_token_W)
+        wall = own_mask_2d | ring_2d
+        domain = ~wall if spec["domain"] == "cross_only" else torch.ones_like(wall)
+
+        # Every one of k's own queries, every head, independently -- NOT averaged.
+        rho0 = A[:, qk, seq_len:seq_len + HW].reshape(heads, n_k, image_token_H, image_token_W)
+        C_raw = A[:, qk, seq_len + HW:seq_len + 2 * HW].reshape(heads, n_k, image_token_H, image_token_W)
+
+        C_smoothed = _smooth_potential_batched(C_raw, image_token_H, image_token_W, c_smooth_sigma)
+        C = _compress_potential(C_smoothed, spec["c_scale"])
+
+        rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
+                                          mobility=spec["mobility"], diffusion_eps=spec["diffusion_eps"])
+
+        A[:, qk, seq_len:seq_len + HW] = rho_final.reshape(heads, n_k, HW)
+        # Context-plane slice is NEVER written -- read-only potential throughout.
+
+    out = torch.matmul(A.to(v_.dtype), V)
+    hidden_states = out.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+    return hidden_states
+
+
+class _TransportBlurAttnProcessor:
+    """Double-stream processor for --produce_images. Mask-construction/counter body
+    copied VERBATIM from Flux2APITASMQueryBlurAttnProcessor (attention_query_blur.py),
+    same lineage as compare_blur_strategies.py's _VariantBlurAttnProcessor -- the ONLY
+    change is the final dispatch, which always calls
+    _manual_attention_with_transport (this script's transport mechanism) instead of
+    gating between _manual_attention_with_blur and dispatch_attention_fn via
+    QUERY_BLUR.should_apply. Never imported by or reachable from the validated pipeline."""
+
+    _attention_backend = None
+    _parallel_config = None
+    counter = 0
+    cond_hard_bind_mask = None
+    cond_soft_bind_mask = None
+    uncond_hard_bind_mask = None
+    uncond_soft_bind_mask = None
+    cfg_inference_steps_multiplier = 1
+
+    def __init__(self, spec, min_region_tokens, cfl, c_smooth_sigma, kernel_size: int = 11,
+                 temperature: float = 3.0, strict: bool = False):
+        self.spec = spec
+        self.min_region_tokens = min_region_tokens
+        self.cfl = cfl
+        self.c_smooth_sigma = c_smooth_sigma
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.strict = strict
+        self.layout_cache = {}
+
+    @classmethod
+    def clear_cached_masks(cls):
+        cls.cond_hard_bind_mask = None
+        cls.cond_soft_bind_mask = None
+        cls.uncond_hard_bind_mask = None
+        cls.uncond_soft_bind_mask = None
+        cls.counter = 0
+
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pos_instance_text_index_lst=None,
+        neg_instance_text_index_lst=None,
+        pos_seq_len: Optional[int] = None,
+        neg_seq_len: Optional[int] = None,
+        instance_position_mask_list=None,
+        hard_image_attribute_binding_list_double=None,
+        hard_image_attribute_binding_list_single=None,
+        num_inference_steps: Optional[int] = None,
+        image_w_instance_token_index_list=None,
+        image_w_instance_token_H_list=None,
+        image_w_instance_token_W_list=None,
+        context_image_w_instance_token_index_list=None,
+        is_conditional: Optional[bool] = None,
+        hard_masking_steps=None,
+        relaxed_timesteps: str = None,
+        smooth_P_L: bool = False,
+        free_latent: bool = False,
+        free_context: bool = False,
+        free_LC: bool = False,
+        free_LL: bool = False,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        seq_len = pos_seq_len if is_conditional else neg_seq_len
+        instance_text_index_lst = pos_instance_text_index_lst if is_conditional else neg_instance_text_index_lst
+        HW = (query.shape[1] - seq_len) // 2
+        image_token_H = image_w_instance_token_H_list[0] // 16
+        image_token_W = image_w_instance_token_W_list[0] // 16
+        global_seq_len = pos_instance_text_index_lst[0].shape[0] if is_conditional else neg_instance_text_index_lst[0].shape[0]
+        instance_num = len(instance_position_mask_list)
+        _TransportBlurAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
+
+        if self.strict:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
+
+        if (_TransportBlurAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (_TransportBlurAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _TransportBlurAttnProcessor.cond_hard_bind_mask = atten_mask
+            else:
+                _TransportBlurAttnProcessor.uncond_hard_bind_mask = atten_mask
+
+        if (_TransportBlurAttnProcessor.cond_soft_bind_mask is None and is_conditional) or (_TransportBlurAttnProcessor.uncond_soft_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _TransportBlurAttnProcessor.cond_soft_bind_mask = atten_mask
+            else:
+                _TransportBlurAttnProcessor.uncond_soft_bind_mask = atten_mask
+
+        counter = _TransportBlurAttnProcessor.counter
+        layer_idx = counter % TRANSFORMER_NUM_LAYERS
+        step_idx = counter // TRANSFORMER_NUM_LAYERS
+
+        if layer_idx in hard_image_attribute_binding_list_double:
+            atten_mask = _TransportBlurAttnProcessor.cond_hard_bind_mask if is_conditional else _TransportBlurAttnProcessor.uncond_hard_bind_mask
+        else:
+            atten_mask = _TransportBlurAttnProcessor.cond_soft_bind_mask if is_conditional else _TransportBlurAttnProcessor.uncond_soft_bind_mask
+
+        if step_idx not in hard_masking_steps:
+            if relaxed_timesteps == "full":
+                atten_mask = None
+            elif relaxed_timesteps == "soft":
+                atten_mask = _TransportBlurAttnProcessor.cond_soft_bind_mask if is_conditional else _TransportBlurAttnProcessor.uncond_soft_bind_mask
+            else:
+                raise NotImplementedError(f"relaxed_timesteps={relaxed_timesteps}")
+
+        _TransportBlurAttnProcessor.counter += 1
+
+        scale = attn.head_dim ** -0.5
+        hidden_states = _manual_attention_with_transport(
+            query, key, value, atten_mask, scale, instance_position_mask_list,
+            seq_len, HW, image_token_H, image_token_W, query.device,
+            self.spec, self.min_region_tokens, self.cfl, self.c_smooth_sigma, self.layout_cache, is_conditional,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if _TransportBlurAttnProcessor.counter % (num_inference_steps * TRANSFORMER_NUM_LAYERS * _TransportBlurAttnProcessor.cfg_inference_steps_multiplier) == 0:
+            _TransportBlurAttnProcessor.clear_cached_masks()
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class _TransportBlurParallelAttnProcessor:
+    """Single-stream analog of _TransportBlurAttnProcessor, body copied verbatim from
+    Flux2ParallelSelfAttnProcessorAPITASMQueryBlur."""
+
+    _attention_backend = None
+    _parallel_config = None
+    counter = 0
+    cond_hard_bind_mask = None
+    cond_soft_bind_mask = None
+    uncond_hard_bind_mask = None
+    uncond_soft_bind_mask = None
+    cfg_inference_steps_multiplier = 1
+
+    def __init__(self, spec, min_region_tokens, cfl, c_smooth_sigma, kernel_size: int = 11,
+                 temperature: float = 3.0, strict: bool = False):
+        self.spec = spec
+        self.min_region_tokens = min_region_tokens
+        self.cfl = cfl
+        self.c_smooth_sigma = c_smooth_sigma
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.strict = strict
+        self.layout_cache = {}
+
+    @classmethod
+    def clear_cached_masks(cls):
+        cls.cond_hard_bind_mask = None
+        cls.cond_soft_bind_mask = None
+        cls.uncond_hard_bind_mask = None
+        cls.uncond_soft_bind_mask = None
+        cls.counter = 0
+
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pos_instance_text_index_lst=None,
+        neg_instance_text_index_lst=None,
+        pos_seq_len: Optional[int] = None,
+        neg_seq_len: Optional[int] = None,
+        instance_position_mask_list=None,
+        hard_image_attribute_binding_list_double=None,
+        hard_image_attribute_binding_list_single=None,
+        num_inference_steps: Optional[int] = None,
+        image_w_instance_token_index_list=None,
+        image_w_instance_token_H_list=None,
+        image_w_instance_token_W_list=None,
+        context_image_w_instance_token_index_list=None,
+        is_conditional: Optional[bool] = None,
+        hard_masking_steps=None,
+        relaxed_timesteps: str = None,
+        smooth_P_L: bool = False,
+        free_context: bool = False,
+        free_latent: bool = False,
+        free_LC: bool = False,
+        free_LL: bool = False,
+    ) -> torch.Tensor:
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        seq_len = pos_seq_len if is_conditional else neg_seq_len
+        instance_text_index_lst = pos_instance_text_index_lst if is_conditional else neg_instance_text_index_lst
+        HW = (query.shape[1] - seq_len) // 2
+        image_token_H = image_w_instance_token_H_list[0] // 16
+        image_token_W = image_w_instance_token_W_list[0] // 16
+        global_seq_len = pos_instance_text_index_lst[0].shape[0] if is_conditional else neg_instance_text_index_lst[0].shape[0]
+        instance_num = len(instance_position_mask_list)
+        _TransportBlurParallelAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
+
+        if self.strict:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
+
+        if (_TransportBlurParallelAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (_TransportBlurParallelAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _TransportBlurParallelAttnProcessor.cond_hard_bind_mask = atten_mask
+            else:
+                _TransportBlurParallelAttnProcessor.uncond_hard_bind_mask = atten_mask
+
+        if (_TransportBlurParallelAttnProcessor.cond_soft_bind_mask is None and is_conditional) or (_TransportBlurParallelAttnProcessor.uncond_soft_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _TransportBlurParallelAttnProcessor.cond_soft_bind_mask = atten_mask
+            else:
+                _TransportBlurParallelAttnProcessor.uncond_soft_bind_mask = atten_mask
+
+        counter = _TransportBlurParallelAttnProcessor.counter
+        layer_idx = counter % TRANSFORMER_SINGLE_NUM_LAYERS
+        step_idx = counter // TRANSFORMER_SINGLE_NUM_LAYERS
+
+        if layer_idx in hard_image_attribute_binding_list_single:
+            atten_mask = _TransportBlurParallelAttnProcessor.cond_hard_bind_mask if is_conditional else _TransportBlurParallelAttnProcessor.uncond_hard_bind_mask
+        else:
+            atten_mask = _TransportBlurParallelAttnProcessor.cond_soft_bind_mask if is_conditional else _TransportBlurParallelAttnProcessor.uncond_soft_bind_mask
+
+        if step_idx not in hard_masking_steps:
+            if relaxed_timesteps == "full":
+                atten_mask = None
+            elif relaxed_timesteps == "soft":
+                atten_mask = _TransportBlurParallelAttnProcessor.cond_soft_bind_mask if is_conditional else _TransportBlurParallelAttnProcessor.uncond_soft_bind_mask
+            else:
+                raise NotImplementedError(f"relaxed_timesteps={relaxed_timesteps}")
+
+        _TransportBlurParallelAttnProcessor.counter += 1
+
+        scale = attn.head_dim ** -0.5
+        hidden_states = _manual_attention_with_transport(
+            query, key, value, atten_mask, scale, instance_position_mask_list,
+            seq_len, HW, image_token_H, image_token_W, query.device,
+            self.spec, self.min_region_tokens, self.cfl, self.c_smooth_sigma, self.layout_cache, is_conditional,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        if _TransportBlurParallelAttnProcessor.counter % (num_inference_steps * TRANSFORMER_SINGLE_NUM_LAYERS * _TransportBlurParallelAttnProcessor.cfg_inference_steps_multiplier) == 0:
+            _TransportBlurParallelAttnProcessor.clear_cached_masks()
+
+        return hidden_states
+
+
+def produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
+    """One COMPLETE, independent pipe() call per variant -- transport genuinely active
+    at every step/layer throughout, unlike the single frozen-snapshot comparison
+    above. Swaps in _TransportBlurAttnProcessor/_TransportBlurParallelAttnProcessor
+    (this script's own classes, never touching attention_query_blur.py) for the
+    duration, then restores the original (validated) processors afterward."""
+    image = sample['image']
+    w, h = image.size
+    kwargs = {}
+    if args.use_masks:
+        kwargs['instance_masks_yx'] = sample['masks']
+    else:
+        kwargs['instance_bboxes_xyxy_normalized'] = sample['bboxes']
+
+    orig_w, orig_h = sample['original_size']
+    specs = _variant_specs(args)
+    logger.info(f"Producing {len(specs)} full generations ({args.num_inference_steps} steps each)...")
+
+    try:
+        for spec in specs:
+            variant_attn_proc = _TransportBlurAttnProcessor(
+                spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma,
+                kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
+            )
+            variant_parallel_proc = _TransportBlurParallelAttnProcessor(
+                spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma,
+                kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
+            )
+            for _, module in pipe.transformer.named_modules():
+                if isinstance(module, Flux2Attention):
+                    module.set_processor(variant_attn_proc)
+                elif isinstance(module, Flux2ParallelSelfAttention):
+                    module.set_processor(variant_parallel_proc)
+            variant_attn_proc.clear_cached_masks()
+            variant_parallel_proc.clear_cached_masks()
+            QUERY_BLUR.reset_records()
+
+            logger.info(f"[{spec['name']}] running full generation...")
+            result = pipe(
+                image=image, prompt=sample['prompt'], height=h, width=w,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                prompt_settings=args.prompt_settings,
+                attention_setting="apitasmkernelnonlap",
+                hard_image_attribute_binding_list_double=args.hard_image_attribute_binding_list_double,
+                hard_image_attribute_binding_list_single=args.hard_image_attribute_binding_list_single,
+                bring_area_to_1024_squared=args.bring_area_to_1024_squared,
+                generator=torch.Generator(device=device).manual_seed(SEED),
+                hard_masking_steps=args.masking_steps,
+                relaxed_timesteps=args.relaxed_timesteps,
+                attention_kwargs={"smooth_P_L": args.smooth_P_L},
+                free_latent=args.free_latent, free_context=args.free_context,
+                free_LC=args.free_LC, free_LL=args.free_LL,
+                **kwargs,
+            )
+            generated_image = result.images[0]
+            if generated_image.size != (orig_w, orig_h):
+                generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
+            image_path = out_dir / f"{sample['sample_id']}_{spec['name']}.png"
+            generated_image.save(image_path)
+            logger.info(f"[{spec['name']}] saved image to {image_path}")
+            del result, generated_image
+    finally:
+        # Restore the validated processors regardless of how the loop above exits.
+        for _, module in pipe.transformer.named_modules():
+            if isinstance(module, Flux2Attention):
+                module.set_processor(attn_proc)
+            elif isinstance(module, Flux2ParallelSelfAttention):
+                module.set_processor(parallel_attn_proc)
 
 
 # --------------------------------------------------------------------------------------
@@ -512,6 +1033,9 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         return
 
     _render(args, maps_by_variant, sample, out_dir)
+
+    if args.produce_images:
+        produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir)
 
 
 def main():
