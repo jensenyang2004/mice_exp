@@ -195,6 +195,16 @@ def parse_args():
                               "evacuate mass from sibling edit targets (the merging-between-edit-targets "
                               "failure mode). 0.0 (default) skips it entirely, reproducing today's "
                               "context-only potential exactly.")
+    parser.add_argument("--occupancy_shape_list", type=str, default="mesa",
+                         help="Comma list from {mesa, peak} -- only matters when "
+                              "--other_instance_penalty_list has a nonzero entry. 'mesa' (default, "
+                              "backward-compatible) blurs each sibling's binary mask: flat-topped, zero "
+                              "gradient/drift-force across its whole interior except within one "
+                              "c_smooth_sigma of the edge, so mass already deep inside a sibling never "
+                              "moves -- only edge mass gets pushed out. 'peak' instead builds a Gaussian "
+                              "bump centered at each sibling's own centroid (width from its own mask "
+                              "area) -- nonzero outward gradient everywhere except the single apex, so "
+                              "interior mass is evacuated too. See _other_instance_peak_potential.")
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of REAL instance indices to render")
 
@@ -225,10 +235,14 @@ def parse_args():
     args.drift_mobility_list = [float(m) for m in args.drift_mobility_list.split(',')]
     args.diffusion_eps_list = [float(e) for e in args.diffusion_eps_list.split(',')]
     args.other_instance_penalty_list = [float(p) for p in args.other_instance_penalty_list.split(',')]
+    args.occupancy_shape_list = args.occupancy_shape_list.split(',')
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for d in args.domains:
         if d not in ("cross_only", "full_map"):
             parser.error(f"--domains entries must be 'cross_only' or 'full_map', got {d!r}")
+    for o in args.occupancy_shape_list:
+        if o not in ("mesa", "peak"):
+            parser.error(f"--occupancy_shape_list entries must be 'mesa' or 'peak', got {o!r}")
     for c in args.c_scales:
         if c not in ("sqrt", "linear", "log"):
             parser.error(f"--c_scales entries must be 'sqrt', 'linear', or 'log', got {c!r}")
@@ -298,6 +312,57 @@ def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token
         ones_mask = torch.ones(1, image_token_H, image_token_W, 1, device=device)
         occ = _blur_block(occ, ones_mask, sigma)
     return occ.reshape(image_token_H, image_token_W)
+
+
+def _other_instance_peak_potential(own_masks_flat, k: int, num_real: int, image_token_H: int,
+                                    image_token_W: int) -> torch.Tensor:
+    """Alternative to _other_instance_occupancy's flat-topped mesa. A blurred binary
+    mask is flat (zero gradient, hence zero drift force) across its ENTIRE interior
+    except within one sigma of its boundary -- mass already sitting deep inside a
+    sibling's footprint feels no force and never leaves; only mass already near the
+    rim gets pushed out. (Confirmed directly: real-generation runs showed mass
+    persisting at sibling centers while only edge mass flowed out -- exactly the
+    mesa's flat-top signature.)
+
+    This instead builds, per OTHER real instance kp, a potential that PEAKS at kp's
+    own centroid and decays radially outward (Gaussian bump) -- nonzero outward
+    gradient EVERYWHERE except the single apex point, so interior mass is pushed out
+    too, not just edge mass. Width is derived directly from kp's own mask area
+    (r_eff = sqrt(area/pi), no new independent tunable -- same spirit as C reusing
+    c_smooth_sigma). Combined across siblings via elementwise max (same combinator as
+    _other_instance_occupancy), not sum, so two nearby siblings don't stack into an
+    artificially taller ridge.
+    """
+    device = own_masks_flat[0].device
+    yy, xx = torch.meshgrid(
+        torch.arange(image_token_H, dtype=torch.float32, device=device),
+        torch.arange(image_token_W, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    occ = torch.zeros(image_token_H, image_token_W, dtype=torch.float32, device=device)
+    for kp in range(num_real):
+        if kp == k:
+            continue
+        mask_2d = own_masks_flat[kp].reshape(image_token_H, image_token_W).float()
+        area = mask_2d.sum()
+        if area <= 0:
+            continue
+        cy = (yy * mask_2d).sum() / area
+        cx = (xx * mask_2d).sum() / area
+        r_eff = torch.sqrt(area / torch.pi).clamp(min=1.0)
+        d2 = (yy - cy) ** 2 + (xx - cx) ** 2
+        bump = torch.exp(-d2 / (2.0 * r_eff * r_eff))
+        occ = torch.maximum(occ, bump)
+    return occ
+
+
+def _other_instance_potential(occupancy_shape, own_masks_flat, k, num_real, image_token_H, image_token_W, sigma):
+    """Single dispatch point used by both call sites below."""
+    if occupancy_shape == "mesa":
+        return _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, sigma)
+    if occupancy_shape == "peak":
+        return _other_instance_peak_potential(own_masks_flat, k, num_real, image_token_H, image_token_W)
+    raise ValueError(f"unknown occupancy_shape {occupancy_shape!r}")
 
 
 def _transport_step(rho: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, cfl: float, mobility: float = 1.0):
@@ -545,8 +610,8 @@ def _manual_attention_with_transport(query, key, value, atten_mask, scale, insta
 
         other_penalty = spec.get("other_instance_penalty", 0.0)
         if other_penalty > 0:
-            occ = _other_instance_occupancy(c['own_masks_flat'], k, c['num_real'],
-                                             image_token_H, image_token_W, c_smooth_sigma)
+            occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), c['own_masks_flat'], k,
+                                             c['num_real'], image_token_H, image_token_W, c_smooth_sigma)
             C = C + other_penalty * occ   # broadcasts [Himg,Wimg] against C's [heads, n_k, Himg, Wimg]
 
         rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
@@ -960,15 +1025,18 @@ def _variant_specs(args):
             for mobility in args.drift_mobility_list:
                 for diffusion_eps in args.diffusion_eps_list:
                     for other_penalty in args.other_instance_penalty_list:
-                        for n_steps in args.n_steps_list:
-                            mob_tag = str(mobility).replace('.', 'p')
-                            eps_tag = str(diffusion_eps).replace('.', 'p')
-                            pen_tag = str(other_penalty).replace('.', 'p')
-                            name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
-                                    f"_pen-{pen_tag}_steps-{n_steps}")
-                            specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
-                                               mobility=mobility, diffusion_eps=diffusion_eps,
-                                               other_instance_penalty=other_penalty))
+                        occ_shapes = args.occupancy_shape_list if other_penalty > 0 else ["mesa"]
+                        for occ_shape in occ_shapes:
+                            for n_steps in args.n_steps_list:
+                                mob_tag = str(mobility).replace('.', 'p')
+                                eps_tag = str(diffusion_eps).replace('.', 'p')
+                                pen_tag = str(other_penalty).replace('.', 'p')
+                                name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
+                                        f"_pen-{pen_tag}_occ-{occ_shape}_steps-{n_steps}")
+                                specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
+                                                   mobility=mobility, diffusion_eps=diffusion_eps,
+                                                   other_instance_penalty=other_penalty,
+                                                   occupancy_shape=occ_shape))
     return specs
 
 
@@ -993,7 +1061,8 @@ def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, 
 
         other_penalty = spec.get("other_instance_penalty", 0.0)
         if other_penalty > 0:
-            occ = _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, c_smooth_sigma)
+            occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), own_masks_flat, k, num_real,
+                                             image_token_H, image_token_W, c_smooth_sigma)
             C = C + other_penalty * occ
 
         own_mask_2d = own_masks_flat[k].reshape(image_token_H, image_token_W)
