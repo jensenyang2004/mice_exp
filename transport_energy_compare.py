@@ -186,6 +186,15 @@ def parse_args():
     parser.add_argument("--c_smooth_sigma", type=float, default=2.0,
                          help="Gaussian sigma (tokens) to smooth C with before differencing, via the validated "
                               "_blur_block primitive -- 0 skips smoothing (raw per-token C, noisier gradient).")
+    parser.add_argument("--other_instance_penalty_list", type=str, default="0.0",
+                         help="Comma list of lambda values: C_total = C_context + lambda*occupancy, where "
+                              "occupancy is a smoothed, EXACT indicator of every OTHER real instance's own "
+                              "footprint (excluding k) -- see _other_instance_occupancy. A direct, structural "
+                              "repulsion term added on top of the context-derived potential, for when "
+                              "context-plane salience alone is too weak/incidental a signal to reliably "
+                              "evacuate mass from sibling edit targets (the merging-between-edit-targets "
+                              "failure mode). 0.0 (default) skips it entirely, reproducing today's "
+                              "context-only potential exactly.")
 
     parser.add_argument("--instance_idx", type=str, default="all", help="'all' or a comma list of REAL instance indices to render")
 
@@ -215,6 +224,7 @@ def parse_args():
     args.n_steps_list = [int(n) for n in args.n_steps_list.split(',')]
     args.drift_mobility_list = [float(m) for m in args.drift_mobility_list.split(',')]
     args.diffusion_eps_list = [float(e) for e in args.diffusion_eps_list.split(',')]
+    args.other_instance_penalty_list = [float(p) for p in args.other_instance_penalty_list.split(',')]
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for d in args.domains:
         if d not in ("cross_only", "full_map"):
@@ -244,6 +254,50 @@ def _compress_potential(C_raw: torch.Tensor, scale: str) -> torch.Tensor:
     if scale == "log":
         return torch.log1p(C_raw.clamp(min=0.0) * 99.0)
     raise ValueError(f"unknown c_scale {scale!r}")
+
+
+def _other_instance_occupancy(own_masks_flat, k: int, num_real: int, image_token_H: int, image_token_W: int,
+                               sigma: float) -> torch.Tensor:
+    """Smoothed [0,1]-ish indicator of every OTHER real instance's own footprint
+    (union, excluding k itself), reshaped to [Himg, Wimg]. This is a DIRECT,
+    EXACT structural signal -- own_masks_flat is ground-truth geometry already
+    consumed by every validated mechanism's cross_keys/own_masks_flat exclusion
+    logic, not an inferred or assumed one.
+
+    Why this exists (see module docstring "merging between edit targets"): C built
+    purely from context-plane attention is only an INDIRECT proxy for "another edit
+    target is here" -- it tracks original-image salience, which usually but not
+    reliably coincides with where edit targets sit. Two nearby real objects create
+    two C-peaks with a shared low-C valley between them (the same convergence
+    geometry that produced a pileup_ratio ~7 in this script's own two-peak synthetic
+    test) -- drained mass from both sides can pool in that valley, and when the
+    valley happens to sit on or near a SIBLING instance's own footprint, that pooling
+    looks exactly like merging with it. Adding this occupancy term directly to the
+    potential (see callers: C_total = C_context + lambda*occupancy) makes every
+    other edit target a RELIABLE, strong repulsor regardless of how weak or
+    coincidental its own context-attention signal happens to be -- a structural
+    guarantee instead of an incidental one, with zero reshaping of anything (purely
+    additive to the SAME scalar potential drift already reads, same smoothing
+    convention as C itself for continuity).
+
+    Smoothed the same way C is (reusing the caller's c_smooth_sigma, not a new
+    independent knob) via the validated _blur_block primitive with an all-ones mask
+    -- sigma=0 skips smoothing (raw binary indicator, hard edges). Returns an
+    UNBATCHED [Himg, Wimg] field (this is a geometric fact independent of which
+    head/query is asking, unlike C itself) -- broadcasts against batched C exactly
+    like `domain` already does.
+    """
+    device = own_masks_flat[0].device
+    occ = torch.zeros(image_token_H * image_token_W, dtype=torch.float32, device=device)
+    for kp in range(num_real):
+        if kp == k:
+            continue
+        occ = torch.maximum(occ, own_masks_flat[kp].float())
+    occ = occ.reshape(1, image_token_H, image_token_W, 1)
+    if sigma > 0:
+        ones_mask = torch.ones(1, image_token_H, image_token_W, 1, device=device)
+        occ = _blur_block(occ, ones_mask, sigma)
+    return occ.reshape(image_token_H, image_token_W)
 
 
 def _transport_step(rho: torch.Tensor, C: torch.Tensor, domain: torch.Tensor, cfl: float, mobility: float = 1.0):
@@ -488,6 +542,12 @@ def _manual_attention_with_transport(query, key, value, atten_mask, scale, insta
 
         C_smoothed = _smooth_potential_batched(C_raw, image_token_H, image_token_W, c_smooth_sigma)
         C = _compress_potential(C_smoothed, spec["c_scale"])
+
+        other_penalty = spec.get("other_instance_penalty", 0.0)
+        if other_penalty > 0:
+            occ = _other_instance_occupancy(c['own_masks_flat'], k, c['num_real'],
+                                             image_token_H, image_token_W, c_smooth_sigma)
+            C = C + other_penalty * occ   # broadcasts [Himg,Wimg] against C's [heads, n_k, Himg, Wimg]
 
         rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
                                           mobility=spec["mobility"], diffusion_eps=spec["diffusion_eps"])
@@ -899,17 +959,21 @@ def _variant_specs(args):
         for c_scale in args.c_scales:
             for mobility in args.drift_mobility_list:
                 for diffusion_eps in args.diffusion_eps_list:
-                    for n_steps in args.n_steps_list:
-                        mob_tag = str(mobility).replace('.', 'p')
-                        eps_tag = str(diffusion_eps).replace('.', 'p')
-                        name = f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}_steps-{n_steps}"
-                        specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
-                                           mobility=mobility, diffusion_eps=diffusion_eps))
+                    for other_penalty in args.other_instance_penalty_list:
+                        for n_steps in args.n_steps_list:
+                            mob_tag = str(mobility).replace('.', 'p')
+                            eps_tag = str(diffusion_eps).replace('.', 'p')
+                            pen_tag = str(other_penalty).replace('.', 'p')
+                            name = (f"dom-{domain}_cscale-{c_scale}_mob-{mob_tag}_eps-{eps_tag}"
+                                    f"_pen-{pen_tag}_steps-{n_steps}")
+                            specs.append(dict(name=name, domain=domain, c_scale=c_scale, n_steps=n_steps,
+                                               mobility=mobility, diffusion_eps=diffusion_eps,
+                                               other_instance_penalty=other_penalty))
     return specs
 
 
 def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, seq_len, HW,
-                           image_token_H, image_token_W, real_ks, cfl, c_smooth_sigma):
+                           image_token_H, image_token_W, real_ks, num_real, cfl, c_smooth_sigma):
     maps = {}
     for k in real_ks:
         if layouts[k] is None:
@@ -926,6 +990,11 @@ def _compute_variant_maps(spec, qi, own_masks_flat, own_ring_flat, layouts, A0, 
         else:
             C_smoothed = C_raw
         C = _compress_potential(C_smoothed, spec["c_scale"])
+
+        other_penalty = spec.get("other_instance_penalty", 0.0)
+        if other_penalty > 0:
+            occ = _other_instance_occupancy(own_masks_flat, k, num_real, image_token_H, image_token_W, c_smooth_sigma)
+            C = C + other_penalty * occ
 
         own_mask_2d = own_masks_flat[k].reshape(image_token_H, image_token_W)
         ring_2d = own_ring_flat[k].reshape(image_token_H, image_token_W)
@@ -1014,7 +1083,7 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
     for spec in _variant_specs(args):
         maps = _compute_variant_maps(
             spec, qi, own_masks_flat, own_ring_flat, layouts, A0, seq_len, HW,
-            image_token_H, image_token_W, real_ks, args.cfl, args.c_smooth_sigma,
+            image_token_H, image_token_W, real_ks, num_real, args.cfl, args.c_smooth_sigma,
         )
         if maps:
             maps_by_variant[spec["name"]] = maps
