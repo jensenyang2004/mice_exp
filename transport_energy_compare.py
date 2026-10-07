@@ -256,15 +256,16 @@ def parse_args():
     # instance-separation job it's already benchmark-validated for), THEN this script's
     # post-softmax drift SECOND (now only has to redistribute whatever small residual
     # blur left behind, within open background -- no sibling wall, no occupancy penalty
-    # needed, see module docstring). --produce_images only; the cheap snapshot-comparison
-    # path above is unaffected (it works from already-captured post-softmax A, with no
-    # access to pre-softmax z, so pre-blur can't be retrofitted there without touching
-    # the capture mechanism -- out of scope for this verification).
+    # needed, see module docstring). Applies to BOTH paths: the cheap snapshot-comparison
+    # path (run_sample applies it to the captured z before building A0 -- _capture_snapshot
+    # always stashes z pre-blur, see its own docstring) and --produce_images (via the
+    # _BlurThenDriftAttnProcessor pair).
     parser.add_argument("--pre_blur_sigma", type=str, default="inf",
                          help="Sigma for the validated _apply_key_logit_blur_ pass, applied to z BEFORE "
                               "softmax and before drift ever runs. 'inf' (default) is the established "
                               "validated optimum (global masked-mean blur). 0 disables pre-blur entirely, "
-                              "falling back to the plain drift-only processor (today's behavior).")
+                              "falling back to today's plain drift-only behavior in both the "
+                              "snapshot-comparison path and --produce_images.")
     parser.add_argument("--pre_blur_restore_mass", action=argparse.BooleanOptionalAction, default=False,
                          help="Whether _apply_key_logit_blur_ restores each query's total cross-instance "
                               "mass after blurring (LSE correction) or leaves it reduced (Jensen's-"
@@ -1689,6 +1690,11 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         args.min_region_tokens, background_index=None, ring_radius=args.ring_radius,
     )
     real_ks = range(num_real) if args.instance_idx is None else sorted(args.instance_idx & set(range(num_real)))
+
+    if args.pre_blur_sigma != 0:
+        z0 = _apply_key_logit_blur_(z0.clone(), layouts, qi, own_masks_flat, own_ring_flat, seq_len, HW,
+                                     args.pre_blur_sigma, background_index=None,
+                                     restore_mass=args.pre_blur_restore_mass)
 
     A0 = torch.softmax(z0, dim=-1)
 
