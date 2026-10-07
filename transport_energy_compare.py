@@ -97,8 +97,9 @@ from flux2.attention.attention_query_blur import (
     QUERY_BLUR,
     _build_instance_layout,
     _blur_block,
+    _apply_key_logit_blur_,
 )
-from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range
+from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range, parse_sigma
 from visualize_attention_variants import (
     _attention_map_panel,
     _draw_mask_contour,
@@ -251,6 +252,25 @@ def parse_args():
                          help="Also run one full generation per variant and save the actual resulting image, "
                               "in addition to the attention-map snapshot comparison. Off by default.")
 
+    # Hybrid pipeline: validated pre-softmax cross-instance blur FIRST (handles the hard
+    # instance-separation job it's already benchmark-validated for), THEN this script's
+    # post-softmax drift SECOND (now only has to redistribute whatever small residual
+    # blur left behind, within open background -- no sibling wall, no occupancy penalty
+    # needed, see module docstring). --produce_images only; the cheap snapshot-comparison
+    # path above is unaffected (it works from already-captured post-softmax A, with no
+    # access to pre-softmax z, so pre-blur can't be retrofitted there without touching
+    # the capture mechanism -- out of scope for this verification).
+    parser.add_argument("--pre_blur_sigma", type=str, default="inf",
+                         help="Sigma for the validated _apply_key_logit_blur_ pass, applied to z BEFORE "
+                              "softmax and before drift ever runs. 'inf' (default) is the established "
+                              "validated optimum (global masked-mean blur). 0 disables pre-blur entirely, "
+                              "falling back to the plain drift-only processor (today's behavior).")
+    parser.add_argument("--pre_blur_restore_mass", action=argparse.BooleanOptionalAction, default=False,
+                         help="Whether _apply_key_logit_blur_ restores each query's total cross-instance "
+                              "mass after blurring (LSE correction) or leaves it reduced (Jensen's-"
+                              "inequality mass destruction -- the validated optimum, default off here to "
+                              "match it).")
+
     args = parser.parse_args()
 
     args.masking_steps = list(range(0, args.num_inference_steps)) if args.masking_steps == "all" else str2list(args.masking_steps)
@@ -264,6 +284,7 @@ def parse_args():
     args.other_instance_penalty_list = [float(p) for p in args.other_instance_penalty_list.split(',')]
     args.occupancy_shape_list = args.occupancy_shape_list.split(',')
     args.occupancy_combine_list = args.occupancy_combine_list.split(',')
+    args.pre_blur_sigma = parse_sigma(args.pre_blur_sigma)
     args.instance_idx = None if args.instance_idx == "all" else set(str2list(args.instance_idx))
     for d in args.domains:
         if d not in ("cross_only", "full_map"):
@@ -714,6 +735,97 @@ def _manual_attention_with_transport(query, key, value, atten_mask, scale, insta
     return hidden_states
 
 
+# --------------------------------------------------------------------------------------
+# Hybrid: validated pre-softmax cross-instance blur FIRST, this script's post-softmax
+# drift SECOND -- see module-level --pre_blur_sigma help text for the rationale. The
+# blur call is the EXACT validated primitive (_apply_key_logit_blur_), imported
+# unmodified from attention_query_blur.py; nothing about it is reimplemented or
+# approximated here.
+# --------------------------------------------------------------------------------------
+
+def _manual_attention_with_blur_then_drift(query, key, value, atten_mask, scale, instance_position_mask_list,
+                                            seq_len, HW, image_token_H, image_token_W, device,
+                                            spec, min_region_tokens, cfl, c_smooth_sigma, ring_radius,
+                                            pre_blur_sigma, pre_blur_restore_mass, layout_cache, is_conditional):
+    """Same pipeline as _manual_attention_with_transport, with one insertion: the
+    validated key-axis blur runs on `z` BEFORE softmax, suppressing cross-instance
+    leakage the way the real benchmark already does. Drift then runs post-softmax,
+    same as _manual_attention_with_transport, on whatever residual blur left behind --
+    domain is k's OWN wall only (no sibling wall: blur already did that job), and the
+    occupancy-penalty mechanism is expected to stay off (spec["other_instance_penalty"]
+    == 0) for this verification, though it still works if nonzero.
+
+    `_build_instance_layout` is called with the REAL `ring_radius` here (unlike
+    _manual_attention_with_transport, which hardcodes 0) -- blur's own validated
+    ring-exclusion logic (own_ring_flat) depends on it, and this function's whole
+    point is to reuse that validated behavior faithfully, not a stripped-down version
+    of it.
+    """
+    q = query.permute(0, 2, 1, 3).float()
+    k_ = key.permute(0, 2, 1, 3).float()
+    v_ = value.permute(0, 2, 1, 3)
+    z = torch.matmul(q, k_.transpose(-1, -2)) * scale
+    if atten_mask is not None:
+        z = z + atten_mask
+    assert z.shape[0] == 1, "transport attention currently assumes batch_size == 1"
+    z = z[0]
+    V = v_[0]
+
+    if is_conditional not in layout_cache:
+        layouts, qi, _cross_keys, own_masks_flat, own_ring_flat = _build_instance_layout(
+            instance_position_mask_list, seq_len, HW, image_token_H, image_token_W, device,
+            min_region_tokens, background_index=None, ring_radius=ring_radius,
+        )
+        layout_cache[is_conditional] = dict(
+            layouts=layouts, qi=qi, own_masks_flat=own_masks_flat, own_ring_flat=own_ring_flat,
+            num_real=len(instance_position_mask_list),
+        )
+    c = layout_cache[is_conditional]
+
+    if pre_blur_sigma != 0:
+        z = _apply_key_logit_blur_(z, c['layouts'], c['qi'], c['own_masks_flat'], c['own_ring_flat'],
+                                    seq_len, HW, pre_blur_sigma, background_index=None,
+                                    restore_mass=pre_blur_restore_mass)
+
+    A = torch.softmax(z, dim=-1)   # ONE softmax, after blur -- drift edits A directly, never z
+    heads = A.shape[0]
+
+    for k in range(c['num_real']):
+        if c['layouts'][k] is None:
+            continue
+        qk = c['qi'][k]
+        n_k = qk.numel()
+
+        own_mask_2d = c['own_masks_flat'][k].reshape(image_token_H, image_token_W)
+        ring_2d = c['own_ring_flat'][k].reshape(image_token_H, image_token_W)
+        wall = own_mask_2d | ring_2d
+        domain = ~wall if spec["domain"] == "cross_only" else torch.ones_like(wall)
+
+        rho0 = A[:, qk, seq_len:seq_len + HW].reshape(heads, n_k, image_token_H, image_token_W)
+        C_raw = A[:, qk, seq_len + HW:seq_len + 2 * HW].reshape(heads, n_k, image_token_H, image_token_W)
+
+        C_smoothed = _smooth_potential_batched(C_raw, image_token_H, image_token_W, c_smooth_sigma)
+        C = _compress_potential(C_smoothed, spec["c_scale"])
+
+        other_penalty = spec.get("other_instance_penalty", 0.0)
+        if other_penalty > 0:
+            occ = _other_instance_potential(spec.get("occupancy_shape", "mesa"), c['own_masks_flat'], k,
+                                             c['num_real'], image_token_H, image_token_W, c_smooth_sigma,
+                                             spec.get("other_instance_extend", 0),
+                                             spec.get("occupancy_combine", "max"))
+            C = C + other_penalty * occ
+
+        rho_final, _diag = run_transport(rho0, C, domain, spec["n_steps"], cfl,
+                                          mobility=spec["mobility"], diffusion_eps=spec["diffusion_eps"])
+
+        A[:, qk, seq_len:seq_len + HW] = rho_final.reshape(heads, n_k, HW)
+        # Context-plane slice is NEVER written -- read-only potential throughout.
+
+    out = torch.matmul(A.to(v_.dtype), V)
+    hidden_states = out.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+    return hidden_states
+
+
 class _TransportBlurAttnProcessor:
     """Double-stream processor for --produce_images. Mask-construction/counter body
     copied VERBATIM from Flux2APITASMQueryBlurAttnProcessor (attention_query_blur.py),
@@ -1032,6 +1144,331 @@ class _TransportBlurParallelAttnProcessor:
         return hidden_states
 
 
+class _BlurThenDriftAttnProcessor:
+    """Double-stream processor for --produce_images. Body copied VERBATIM from
+    _TransportBlurAttnProcessor -- the ONLY changes are the constructor (adds
+    ring_radius/pre_blur_sigma/pre_blur_restore_mass) and the final dispatch, which
+    calls _manual_attention_with_blur_then_drift instead of
+    _manual_attention_with_transport. Never imported by or reachable from the
+    validated pipeline."""
+
+    _attention_backend = None
+    _parallel_config = None
+    counter = 0
+    cond_hard_bind_mask = None
+    cond_soft_bind_mask = None
+    uncond_hard_bind_mask = None
+    uncond_soft_bind_mask = None
+    cfg_inference_steps_multiplier = 1
+
+    def __init__(self, spec, min_region_tokens, cfl, c_smooth_sigma, ring_radius, pre_blur_sigma,
+                 pre_blur_restore_mass, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False):
+        self.spec = spec
+        self.min_region_tokens = min_region_tokens
+        self.cfl = cfl
+        self.c_smooth_sigma = c_smooth_sigma
+        self.ring_radius = ring_radius
+        self.pre_blur_sigma = pre_blur_sigma
+        self.pre_blur_restore_mass = pre_blur_restore_mass
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.strict = strict
+        self.layout_cache = {}
+
+    @classmethod
+    def clear_cached_masks(cls):
+        cls.cond_hard_bind_mask = None
+        cls.cond_soft_bind_mask = None
+        cls.uncond_hard_bind_mask = None
+        cls.uncond_soft_bind_mask = None
+        cls.counter = 0
+
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pos_instance_text_index_lst=None,
+        neg_instance_text_index_lst=None,
+        pos_seq_len: Optional[int] = None,
+        neg_seq_len: Optional[int] = None,
+        instance_position_mask_list=None,
+        hard_image_attribute_binding_list_double=None,
+        hard_image_attribute_binding_list_single=None,
+        num_inference_steps: Optional[int] = None,
+        image_w_instance_token_index_list=None,
+        image_w_instance_token_H_list=None,
+        image_w_instance_token_W_list=None,
+        context_image_w_instance_token_index_list=None,
+        is_conditional: Optional[bool] = None,
+        hard_masking_steps=None,
+        relaxed_timesteps: str = None,
+        smooth_P_L: bool = False,
+        free_latent: bool = False,
+        free_context: bool = False,
+        free_LC: bool = False,
+        free_LL: bool = False,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        seq_len = pos_seq_len if is_conditional else neg_seq_len
+        instance_text_index_lst = pos_instance_text_index_lst if is_conditional else neg_instance_text_index_lst
+        HW = (query.shape[1] - seq_len) // 2
+        image_token_H = image_w_instance_token_H_list[0] // 16
+        image_token_W = image_w_instance_token_W_list[0] // 16
+        global_seq_len = pos_instance_text_index_lst[0].shape[0] if is_conditional else neg_instance_text_index_lst[0].shape[0]
+        instance_num = len(instance_position_mask_list)
+        _BlurThenDriftAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
+
+        if self.strict:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
+
+        if (_BlurThenDriftAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (_BlurThenDriftAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _BlurThenDriftAttnProcessor.cond_hard_bind_mask = atten_mask
+            else:
+                _BlurThenDriftAttnProcessor.uncond_hard_bind_mask = atten_mask
+
+        if (_BlurThenDriftAttnProcessor.cond_soft_bind_mask is None and is_conditional) or (_BlurThenDriftAttnProcessor.uncond_soft_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _BlurThenDriftAttnProcessor.cond_soft_bind_mask = atten_mask
+            else:
+                _BlurThenDriftAttnProcessor.uncond_soft_bind_mask = atten_mask
+
+        counter = _BlurThenDriftAttnProcessor.counter
+        layer_idx = counter % TRANSFORMER_NUM_LAYERS
+        step_idx = counter // TRANSFORMER_NUM_LAYERS
+
+        if layer_idx in hard_image_attribute_binding_list_double:
+            atten_mask = _BlurThenDriftAttnProcessor.cond_hard_bind_mask if is_conditional else _BlurThenDriftAttnProcessor.uncond_hard_bind_mask
+        else:
+            atten_mask = _BlurThenDriftAttnProcessor.cond_soft_bind_mask if is_conditional else _BlurThenDriftAttnProcessor.uncond_soft_bind_mask
+
+        if step_idx not in hard_masking_steps:
+            if relaxed_timesteps == "full":
+                atten_mask = None
+            elif relaxed_timesteps == "soft":
+                atten_mask = _BlurThenDriftAttnProcessor.cond_soft_bind_mask if is_conditional else _BlurThenDriftAttnProcessor.uncond_soft_bind_mask
+            else:
+                raise NotImplementedError(f"relaxed_timesteps={relaxed_timesteps}")
+
+        _BlurThenDriftAttnProcessor.counter += 1
+
+        scale = attn.head_dim ** -0.5
+        hidden_states = _manual_attention_with_blur_then_drift(
+            query, key, value, atten_mask, scale, instance_position_mask_list,
+            seq_len, HW, image_token_H, image_token_W, query.device,
+            self.spec, self.min_region_tokens, self.cfl, self.c_smooth_sigma, self.ring_radius,
+            self.pre_blur_sigma, self.pre_blur_restore_mass, self.layout_cache, is_conditional,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if _BlurThenDriftAttnProcessor.counter % (num_inference_steps * TRANSFORMER_NUM_LAYERS * _BlurThenDriftAttnProcessor.cfg_inference_steps_multiplier) == 0:
+            _BlurThenDriftAttnProcessor.clear_cached_masks()
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class _BlurThenDriftParallelAttnProcessor:
+    """Single-stream analog of _BlurThenDriftAttnProcessor, body copied verbatim from
+    _TransportBlurParallelAttnProcessor with the same two changes."""
+
+    _attention_backend = None
+    _parallel_config = None
+    counter = 0
+    cond_hard_bind_mask = None
+    cond_soft_bind_mask = None
+    uncond_hard_bind_mask = None
+    uncond_soft_bind_mask = None
+    cfg_inference_steps_multiplier = 1
+
+    def __init__(self, spec, min_region_tokens, cfl, c_smooth_sigma, ring_radius, pre_blur_sigma,
+                 pre_blur_restore_mass, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False):
+        self.spec = spec
+        self.min_region_tokens = min_region_tokens
+        self.cfl = cfl
+        self.c_smooth_sigma = c_smooth_sigma
+        self.ring_radius = ring_radius
+        self.pre_blur_sigma = pre_blur_sigma
+        self.pre_blur_restore_mass = pre_blur_restore_mass
+        self.kernel_size = kernel_size
+        self.temperature = temperature
+        self.strict = strict
+        self.layout_cache = {}
+
+    @classmethod
+    def clear_cached_masks(cls):
+        cls.cond_hard_bind_mask = None
+        cls.cond_soft_bind_mask = None
+        cls.uncond_hard_bind_mask = None
+        cls.uncond_soft_bind_mask = None
+        cls.counter = 0
+
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pos_instance_text_index_lst=None,
+        neg_instance_text_index_lst=None,
+        pos_seq_len: Optional[int] = None,
+        neg_seq_len: Optional[int] = None,
+        instance_position_mask_list=None,
+        hard_image_attribute_binding_list_double=None,
+        hard_image_attribute_binding_list_single=None,
+        num_inference_steps: Optional[int] = None,
+        image_w_instance_token_index_list=None,
+        image_w_instance_token_H_list=None,
+        image_w_instance_token_W_list=None,
+        context_image_w_instance_token_index_list=None,
+        is_conditional: Optional[bool] = None,
+        hard_masking_steps=None,
+        relaxed_timesteps: str = None,
+        smooth_P_L: bool = False,
+        free_context: bool = False,
+        free_latent: bool = False,
+        free_LC: bool = False,
+        free_LL: bool = False,
+    ) -> torch.Tensor:
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        seq_len = pos_seq_len if is_conditional else neg_seq_len
+        instance_text_index_lst = pos_instance_text_index_lst if is_conditional else neg_instance_text_index_lst
+        HW = (query.shape[1] - seq_len) // 2
+        image_token_H = image_w_instance_token_H_list[0] // 16
+        image_token_W = image_w_instance_token_W_list[0] // 16
+        global_seq_len = pos_instance_text_index_lst[0].shape[0] if is_conditional else neg_instance_text_index_lst[0].shape[0]
+        instance_num = len(instance_position_mask_list)
+        _BlurThenDriftParallelAttnProcessor.cfg_inference_steps_multiplier = 2 if not is_conditional else 1
+
+        if self.strict:
+            instance_position_mask_list = QUERY_BLUR.get_processed_masks(
+                instance_position_mask_list, query.device, image_token_H, image_token_W, self.strict,
+            )
+
+        if (_BlurThenDriftParallelAttnProcessor.cond_hard_bind_mask is None and is_conditional) or (_BlurThenDriftParallelAttnProcessor.uncond_hard_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _BlurThenDriftParallelAttnProcessor.cond_hard_bind_mask = atten_mask
+            else:
+                _BlurThenDriftParallelAttnProcessor.uncond_hard_bind_mask = atten_mask
+
+        if (_BlurThenDriftParallelAttnProcessor.cond_soft_bind_mask is None and is_conditional) or (_BlurThenDriftParallelAttnProcessor.uncond_soft_bind_mask is None and not is_conditional):
+            atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
+            atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            if is_conditional:
+                _BlurThenDriftParallelAttnProcessor.cond_soft_bind_mask = atten_mask
+            else:
+                _BlurThenDriftParallelAttnProcessor.uncond_soft_bind_mask = atten_mask
+
+        counter = _BlurThenDriftParallelAttnProcessor.counter
+        layer_idx = counter % TRANSFORMER_SINGLE_NUM_LAYERS
+        step_idx = counter // TRANSFORMER_SINGLE_NUM_LAYERS
+
+        if layer_idx in hard_image_attribute_binding_list_single:
+            atten_mask = _BlurThenDriftParallelAttnProcessor.cond_hard_bind_mask if is_conditional else _BlurThenDriftParallelAttnProcessor.uncond_hard_bind_mask
+        else:
+            atten_mask = _BlurThenDriftParallelAttnProcessor.cond_soft_bind_mask if is_conditional else _BlurThenDriftParallelAttnProcessor.uncond_soft_bind_mask
+
+        if step_idx not in hard_masking_steps:
+            if relaxed_timesteps == "full":
+                atten_mask = None
+            elif relaxed_timesteps == "soft":
+                atten_mask = _BlurThenDriftParallelAttnProcessor.cond_soft_bind_mask if is_conditional else _BlurThenDriftParallelAttnProcessor.uncond_soft_bind_mask
+            else:
+                raise NotImplementedError(f"relaxed_timesteps={relaxed_timesteps}")
+
+        _BlurThenDriftParallelAttnProcessor.counter += 1
+
+        scale = attn.head_dim ** -0.5
+        hidden_states = _manual_attention_with_blur_then_drift(
+            query, key, value, atten_mask, scale, instance_position_mask_list,
+            seq_len, HW, image_token_H, image_token_W, query.device,
+            self.spec, self.min_region_tokens, self.cfl, self.c_smooth_sigma, self.ring_radius,
+            self.pre_blur_sigma, self.pre_blur_restore_mass, self.layout_cache, is_conditional,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        if _BlurThenDriftParallelAttnProcessor.counter % (num_inference_steps * TRANSFORMER_SINGLE_NUM_LAYERS * _BlurThenDriftParallelAttnProcessor.cfg_inference_steps_multiplier) == 0:
+            _BlurThenDriftParallelAttnProcessor.clear_cached_masks()
+
+        return hidden_states
+
+
 def produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
     """One COMPLETE, independent pipe() call per variant -- transport genuinely active
     at every step/layer throughout, unlike the single frozen-snapshot comparison
@@ -1052,14 +1489,26 @@ def produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, de
 
     try:
         for spec in specs:
-            variant_attn_proc = _TransportBlurAttnProcessor(
-                spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma,
-                kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
-            )
-            variant_parallel_proc = _TransportBlurParallelAttnProcessor(
-                spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma,
-                kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
-            )
+            if args.pre_blur_sigma != 0:
+                variant_attn_proc = _BlurThenDriftAttnProcessor(
+                    spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma, args.ring_radius,
+                    args.pre_blur_sigma, args.pre_blur_restore_mass,
+                    kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
+                )
+                variant_parallel_proc = _BlurThenDriftParallelAttnProcessor(
+                    spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma, args.ring_radius,
+                    args.pre_blur_sigma, args.pre_blur_restore_mass,
+                    kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
+                )
+            else:
+                variant_attn_proc = _TransportBlurAttnProcessor(
+                    spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma,
+                    kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
+                )
+                variant_parallel_proc = _TransportBlurParallelAttnProcessor(
+                    spec, args.min_region_tokens, args.cfl, args.c_smooth_sigma,
+                    kernel_size=args.kernel_size, temperature=args.temperature, strict=args.strict,
+                )
             for _, module in pipe.transformer.named_modules():
                 if isinstance(module, Flux2Attention):
                     module.set_processor(variant_attn_proc)
