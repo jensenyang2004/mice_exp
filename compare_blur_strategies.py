@@ -937,7 +937,18 @@ def _render(args, maps_by_variant, sample, out_dir):
             m = maps_by_variant[name].get(k)
             if m is None:
                 continue
-            for row, (plane, vmax) in enumerate((("target", target_vmax), ("context", context_vmax))):
+            # Baselines are captured under a totally different masking regime (see the
+            # vmax_source comment above) -- forcing them onto the blur variants' shared
+            # scale makes them silently saturate/wash out even though the underlying
+            # data is correct, which looks like a bug (data looks "completely
+            # different" from a self-scaled render of the same capture) when it's
+            # really just a mismatched display scale. Self-scale baselines instead.
+            if name in _BASELINE_VARIANT_NAMES:
+                row_target_vmax = max(m['target'].max(), 1e-12)
+                row_context_vmax = max(m['context'].max(), 1e-12)
+            else:
+                row_target_vmax, row_context_vmax = target_vmax, context_vmax
+            for row, (plane, vmax) in enumerate((("target", row_target_vmax), ("context", row_context_vmax))):
                 y0 = label_h + row * panel_h
                 panel = _attention_map_panel(m[plane], vmax, panel_size, args.map_scale)
                 canvas.paste(panel, (x0, y0))
