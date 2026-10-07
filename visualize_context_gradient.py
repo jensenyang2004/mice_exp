@@ -162,18 +162,25 @@ def _render_context_gradient(args, maps, sample, out_dir):
     cell_w, cell_h = panel_w / image_token_W, panel_h / image_token_H
     label_h = 28
 
+    orig_panel = sample['image'].convert("RGB").resize(panel_size, resample=Image.BILINEAR)
+
     for k, m in maps.items():
         C_display = m['context']
         vmax = max(C_display.max(), 1e-12)
 
-        canvas = Image.new("RGB", (panel_w, label_h + panel_h), (255, 255, 255))
+        canvas = Image.new("RGB", (panel_w * 2, label_h + panel_h), (255, 255, 255))
         draw = ImageDraw.Draw(canvas)
-        draw.text((4, 4), f"context terrain + drift velocity field (-grad C), k={k}", fill=(0, 0, 0))
 
-        panel = _attention_map_panel(C_display, vmax, panel_size, args.map_scale)
-        canvas.paste(panel, (0, label_h))
+        draw.text((4, 4), "original (context source image)", fill=(0, 0, 0))
+        canvas.paste(orig_panel, (0, label_h))
         if args.outline_instance:
             _draw_mask_contour(draw, m['own_mask'], panel_size, (0, label_h), width=1)
+
+        draw.text((panel_w + 4, 4), f"context terrain + drift velocity field (-grad C), k={k}", fill=(0, 0, 0))
+        panel = _attention_map_panel(C_display, vmax, panel_size, args.map_scale)
+        canvas.paste(panel, (panel_w, label_h))
+        if args.outline_instance:
+            _draw_mask_contour(draw, m['own_mask'], panel_size, (panel_w, label_h), width=1)
 
         vy, vx = m['vy'], m['vx']
         domain = ~m['wall']
@@ -190,13 +197,13 @@ def _render_context_gradient(args, maps, sample, out_dir):
             for x in range(0, image_token_W, stride):
                 if not domain[y, x]:
                     continue
-                cx = (x + 0.5) * cell_w
+                cx = panel_w + (x + 0.5) * cell_w
                 cy = label_h + (y + 0.5) * cell_h
                 ex = cx + vx[y, x].item() * scale
                 ey = cy + vy[y, x].item() * scale
                 _draw_arrow(draw, (cx, cy), (ex, ey), args.arrow_color)
 
-        canvas.paste(_colorbar_strip(panel_w), (0, label_h + panel_h - 14))
+        canvas.paste(_colorbar_strip(panel_w), (panel_w, label_h + panel_h - 14))
         out_path = out_dir / f"{sample['sample_id']}_k{k}_context_gradient.png"
         canvas.save(out_path)
         logger.info(f"Saved {out_path}")
