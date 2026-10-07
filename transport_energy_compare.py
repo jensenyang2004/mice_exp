@@ -1558,6 +1558,15 @@ def produce_variant_images(args, pipe, attn_proc, parallel_attn_proc, sample, de
 # --------------------------------------------------------------------------------------
 
 def _variant_specs(args):
+    if all(p <= 0 for p in args.other_instance_penalty_list):
+        if args.occupancy_shape_list != ["mesa"] or args.occupancy_combine_list != ["max"]:
+            logger.warning(
+                f"--occupancy_shape_list {args.occupancy_shape_list} / --occupancy_combine_list "
+                f"{args.occupancy_combine_list} have NO EFFECT: --other_instance_penalty_list is all "
+                f"<=0 (occupancy penalty off), so every variant is forced to shape='mesa'/combine='max' "
+                f"regardless of what was requested. Pass --other_instance_penalty_list with a nonzero "
+                f"value to actually activate the occupancy mechanism."
+            )
     specs = []
     for domain in args.domains:
         for c_scale in args.c_scales:
