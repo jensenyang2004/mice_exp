@@ -70,6 +70,7 @@ from flux2.attention.attention_query_blur import (
 from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_range
 from visualize_attention_variants import _attention_map_panel, _draw_mask_contour, _colorbar_strip, _row_stats
 from compare_blur_strategies import _capture_snapshot
+from flux2.pipeline_utils import find_inner_sentence_token_span_qwen
 
 
 def parse_args():
@@ -142,22 +143,6 @@ def _text_group_id(seq_len: int, instance_text_index_lst, device) -> torch.Tenso
     return gid
 
 
-def _tokenize_segment(tokenizer, text: str, max_sequence_length: int) -> torch.Tensor:
-    """Reproduces, bit-for-bit, the exact tokenization
-    Flux2KleinPipeline._get_qwen3_prompt_embeds applies to one $BREAKFLAG$ segment
-    (pipeline_flux2_klein.py) -- same chat template, same padding/truncation -- so the
-    resulting input_ids match what the real captured run actually saw. Tokenization
-    only (no text-encoder forward pass): all we need is input_ids, to find the real
-    (non-padding) content length and decode it into labels."""
-    messages = [{"role": "user", "content": text}]
-    chat_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
-    )
-    inputs = tokenizer(chat_text, return_tensors="pt", padding="max_length",
-                        truncation=True, max_length=max_sequence_length)
-    return inputs["input_ids"][0]
-
-
 def _build_text_labels(pipe, sample, instance_text_index_lst, seq_len: int, args):
     """Returns (keep_mask [seq_len] bool, token_label [seq_len] list[str]).
 
@@ -166,18 +151,20 @@ def _build_text_labels(pipe, sample, instance_text_index_lst, seq_len: int, args
 
     Every other group (instance k's own local edit prompt, instance_text_index_lst[k+1])
     is, in 'outer_local_prompts' mode, a FIXED-SIZE window (pipeline_flux2_klein.py's
-    num_instance_text_tokens, default 200) regardless of the sentence's actual length --
-    most of those positions are right-padding, not real words (see num_tokens_to_select
-    in _get_qwen3_prompt_embeds). This re-tokenizes that instance's own sentence
-    (sample['prompt'] re-split on $BREAKFLAG$, identical to what the pipeline itself
-    does) purely to find the real content length (count of non-zero input_ids, the same
-    test outer_local_prompts_smart itself uses) and decode those real tokens for
-    labels -- padding positions get keep_mask=False and are dropped from the chart;
-    'outer_local_prompts_smart' already sizes windows to real content, so nothing there
-    ends up trimmed, but labels are still attached.
+    num_instance_text_tokens, default 200) regardless of the sentence's actual length.
+    Trimming on "non-padding" alone is NOT enough: the window also contains the Qwen
+    chat-template wrapper around the sentence (<|im_start|>user\\n ... <|im_end|>\\n
+    <|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n, from apply_chat_template with
+    add_generation_prompt=True) -- all of that is real, non-zero token ids too, so a
+    pad-only trim leaves the boilerplate in (denser and less readable than before, not
+    less). find_inner_sentence_token_span_qwen (flux2/pipeline_utils.py -- already used,
+    validated, for 'inner_local_prompts' mode) finds the literal (start, end) span of
+    the sentence's OWN tokens inside that wrapped encoding, by searching for the
+    sentence's bare token-id sequence as a contiguous match -- so only that span is
+    kept/labeled; the template wrapper on both sides, same as padding, is dropped.
 
     Only implemented for prompt_settings in {outer_local_prompts, outer_local_prompts_smart}
-    -- inner_local_prompts/base locate each instance's sentence as a SPAN inside one
+    -- inner_local_prompts/base locate each instance's sentence as a span inside one
     shared encoding rather than its own fixed window, a different indexing scheme this
     does not attempt to reconstruct.
     """
@@ -190,17 +177,22 @@ def _build_text_labels(pipe, sample, instance_text_index_lst, seq_len: int, args
 
     segments = sample['prompt'].split('$BREAKFLAG$')
     tokenizer = pipe.tokenizer
+    tokenizer_obj = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
     for i, idx in enumerate(instance_text_index_lst):
         if i == 0 or idx is None or idx.numel() == 0 or i >= len(segments):
             continue  # group 0 (global) left fully as-is, per request
         idx_cpu = idx.detach().cpu()
-        input_ids = _tokenize_segment(tokenizer, segments[i], args.max_sequence_length)
-        real_len = int((input_ids != 0).sum().item())
-        real_len = min(real_len, idx_cpu.numel())
-        if real_len < idx_cpu.numel():
-            keep_mask[idx_cpu[real_len:]] = False
-        toks = tokenizer.convert_ids_to_tokens(input_ids[:real_len].tolist())
-        for pos, tok in zip(idx_cpu[:real_len].tolist(), toks):
+        text = segments[i]
+        start, end = find_inner_sentence_token_span_qwen(tokenizer, text, text, args.max_sequence_length)
+        if start is None:
+            logger.warning(f"Could not locate instance {i - 1}'s own sentence within its tokenized "
+                            "window -- leaving it unlabeled/untrimmed.")
+            continue
+        start, end = min(start, idx_cpu.numel()), min(end, idx_cpu.numel())
+        keep_mask[idx_cpu[:start]] = False
+        keep_mask[idx_cpu[end:]] = False
+        toks = tokenizer_obj.convert_ids_to_tokens(tokenizer_obj.encode(text, add_special_tokens=False))
+        for pos, tok in zip(idx_cpu[start:end].tolist(), toks):
             clean = tok.replace('Ġ', '').replace('Ċ', '¶')
             token_label[pos] = clean if clean else '·'
     return keep_mask, token_label
