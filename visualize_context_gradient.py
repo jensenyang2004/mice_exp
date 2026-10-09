@@ -1,12 +1,12 @@
-"""Standalone, low-VRAM script: captures a sample's ORIGINAL (unmodified) context-plane
-attention for one instance, and overlays the drift mechanism's actual velocity field
-(-grad(C), the direction energy would flow under _transport_step) as arrows on top --
-for a presentation figure showing "the terrain" drift walks on.
+"""Standalone, low-VRAM script: captures a sample's attention for one instance and
+renders it as two panels, side by side:
+  LEFT:  latent -> context attention map, plain heatmap, no arrows.
+  RIGHT: latent -> latent (target plane) attention map, with the gradient of the
+         LEFT map (-grad(C), the direction _transport_step would actually push mass)
+         overlaid as arrows.
 
 Same capture-only, truncated-forward-pass mechanism as visualize_mice_baseline.py (no
-diffusion loop, no variant sweep) -- just the context map instead of target, plus a
-hand-rolled quiver (no matplotlib dependency, matching this repo's existing convention
-in visualize_attention_variants.py).
+diffusion loop, no variant sweep).
 
 Reuses, READ-ONLY, nothing reimplemented:
   - load_pipeline / str2list / parse_layer_range     (capture_query_blur_leakage.py)
@@ -17,19 +17,17 @@ Reuses, READ-ONLY, nothing reimplemented:
   - _attention_map_panel / _draw_mask_contour / _colorbar_strip
                                                        (visualize_attention_variants.py)
 
-The rendered field is the SAME terrain the real mechanism's gradient acts on: the raw
-captured context attention (always pre-blur, see _capture_snapshot's own docstring),
-smoothed by --c_smooth_sigma and compressed by --c_scale, exactly like
-_smooth_potential_batched/_compress_potential inside _manual_attention_with_transport --
-not a strawman of the noisy unsmoothed signal. Arrows are only drawn outside the
-querying instance's own wall (own mask + ring), matching the domain drift actually
-operates on; nothing is computed or drawn inside it.
+The gradient is computed from the latent->context potential, smoothed by
+--c_smooth_sigma and compressed by --c_scale -- exactly matching
+_smooth_potential_batched/_compress_potential inside _manual_attention_with_transport,
+so the arrows shown are the mechanism's actual velocity field, not a strawman. Arrows
+are only drawn outside the querying instance's own wall (mask + ring), matching the
+domain drift actually operates on.
 """
 import argparse
 import math
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
@@ -95,7 +93,7 @@ def parse_args():
                          help="'all' or a comma list of real instance indices to render")
 
     # Terrain construction -- same convention/defaults as transport_energy_compare.py,
-    # so this shows the actual field drift's gradient acts on, not a strawman.
+    # so the arrows shown are the actual field drift's gradient acts on.
     parser.add_argument("--c_smooth_sigma", type=float, default=2.0)
     parser.add_argument("--c_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"])
 
@@ -103,14 +101,17 @@ def parse_args():
     parser.add_argument("--arrow_stride", type=int, default=2,
                          help="Draw one arrow every N tokens in each direction (avoids a cluttered, "
                               "unreadable one-arrow-per-token quiver).")
-    parser.add_argument("--arrow_max_px", type=float, default=16.0,
+    parser.add_argument("--arrow_max_px", type=float, default=32.0,
                          help="Pixel length of the single LARGEST arrow on the panel; every other arrow "
                               "is scaled proportionally to it, so relative flow strength stays legible.")
+    parser.add_argument("--arrow_width", type=int, default=0,
+                         help="Arrow line width in pixels. 0 (default) = auto-scale with --map_px so "
+                              "arrows stay visible at any resolution instead of staying hairline-thin.")
     parser.add_argument("--arrow_color", type=str, default="255,255,255")
 
     # Rendering.
     parser.add_argument("--map_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"])
-    parser.add_argument("--map_px", type=int, default=420)
+    parser.add_argument("--map_px", type=int, default=840)
     parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True)
 
     args = parser.parse_args()
@@ -134,10 +135,14 @@ def _gradient_field(C: torch.Tensor):
     return -grad_y, -grad_x
 
 
-def _draw_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=2, head_len=6.0, head_angle_deg=28.0):
+def _draw_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=2, head_len=None, head_angle_deg=28.0):
     """Hand-rolled arrow (line + triangular head) -- no matplotlib dependency, matching
     this repo's existing convention (see visualize_attention_variants.py's hand-rolled
-    colormap). Skips drawing entirely if start==end (zero-length arrow, nothing to show)."""
+    colormap). Skips drawing entirely if start==end (zero-length, nothing to show).
+    head_len defaults to a multiple of width so thicker arrows (higher resolution) get
+    a proportionally bigger head instead of a stubby one."""
+    if head_len is None:
+        head_len = width * 3.0
     x0, y0 = start
     x1, y1 = end
     dx, dy = x1 - x0, y1 - y0
@@ -153,38 +158,41 @@ def _draw_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=2, head_len=
         draw.line([end, (x1 - hx * head_len, y1 - hy * head_len)], fill=color, width=width)
 
 
-def _render_context_gradient(args, maps, sample, out_dir):
+def _render_gradient_overlay(args, maps, sample, out_dir):
     panel_w = args.map_px
     any_k = next(iter(maps))
-    image_token_H, image_token_W = maps[any_k]['context'].shape
+    image_token_H, image_token_W = maps[any_k]['rho'].shape
     panel_h = max(1, int(round(panel_w * image_token_H / image_token_W)))
     panel_size = (panel_w, panel_h)
     cell_w, cell_h = panel_w / image_token_W, panel_h / image_token_H
     label_h = 28
 
-    orig_panel = sample['image'].convert("RGB").resize(panel_size, resample=Image.BILINEAR)
-
     for k, m in maps.items():
-        C_display = m['context']
-        vmax = max(C_display.max(), 1e-12)
+        rho = m['rho']
+        context = m['context']
+        rho_vmax = max(rho.max(), 1e-12)
+        context_vmax = max(context.max(), 1e-12)
 
         canvas = Image.new("RGB", (panel_w * 2, label_h + panel_h), (255, 255, 255))
         draw = ImageDraw.Draw(canvas)
 
-        draw.text((4, 4), "original (context source image)", fill=(0, 0, 0))
-        canvas.paste(orig_panel, (0, label_h))
+        draw.text((4, 4), f"latent -> context attention, k={k}", fill=(0, 0, 0))
+        context_panel = _attention_map_panel(context, context_vmax, panel_size, args.map_scale)
+        canvas.paste(context_panel, (0, label_h))
         if args.outline_instance:
             _draw_mask_contour(draw, m['own_mask'], panel_size, (0, label_h), width=1)
+        canvas.paste(_colorbar_strip(panel_w), (0, label_h + panel_h - 14))
 
-        draw.text((panel_w + 4, 4), f"context terrain + drift velocity field (-grad C), k={k}", fill=(0, 0, 0))
-        panel = _attention_map_panel(C_display, vmax, panel_size, args.map_scale)
-        canvas.paste(panel, (panel_w, label_h))
+        draw.text((panel_w + 4, 4), "latent -> latent attention + drift velocity (-grad C)", fill=(0, 0, 0))
+        rho_panel = _attention_map_panel(rho, rho_vmax, panel_size, args.map_scale)
+        canvas.paste(rho_panel, (panel_w, label_h))
         if args.outline_instance:
             _draw_mask_contour(draw, m['own_mask'], panel_size, (panel_w, label_h), width=1)
 
         vy, vx = m['vy'], m['vx']
         domain = ~m['wall']
         stride = max(1, args.arrow_stride)
+        arrow_width = args.arrow_width if args.arrow_width > 0 else max(2, round(panel_w / 140))
         mags = []
         for y in range(0, image_token_H, stride):
             for x in range(0, image_token_W, stride):
@@ -201,10 +209,10 @@ def _render_context_gradient(args, maps, sample, out_dir):
                 cy = label_h + (y + 0.5) * cell_h
                 ex = cx + vx[y, x].item() * scale
                 ey = cy + vy[y, x].item() * scale
-                _draw_arrow(draw, (cx, cy), (ex, ey), args.arrow_color)
+                _draw_arrow(draw, (cx, cy), (ex, ey), args.arrow_color, width=arrow_width)
 
         canvas.paste(_colorbar_strip(panel_w), (panel_w, label_h + panel_h - 14))
-        out_path = out_dir / f"{sample['sample_id']}_k{k}_context_gradient.png"
+        out_path = out_dir / f"{sample['sample_id']}_k{k}_latent_gradient_overlay.png"
         canvas.save(out_path)
         logger.info(f"Saved {out_path}")
 
@@ -236,6 +244,7 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
             continue
         qk = qi[k]
         attn_row = A0[:, qk, :].mean(dim=(0, 1))
+        rho_raw = attn_row[seq_len:seq_len + HW].reshape(image_token_H, image_token_W).float()
         C_raw = attn_row[seq_len + HW:seq_len + 2 * HW].reshape(image_token_H, image_token_W).float()
 
         if args.c_smooth_sigma > 0:
@@ -252,7 +261,8 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         wall = own_mask_2d | ring_2d
 
         maps[k] = dict(
-            context=C.cpu().numpy(),
+            rho=rho_raw.cpu().numpy(),
+            context=C_raw.cpu().numpy(),
             own_mask=own_mask_2d.cpu().numpy().astype(bool),
             wall=wall.cpu(),
             vy=vy.cpu(), vx=vx.cpu(),
@@ -262,7 +272,7 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         logger.error("No maps produced (every requested instance below --min_region_tokens?).")
         return
 
-    _render_context_gradient(args, maps, sample, out_dir)
+    _render_gradient_overlay(args, maps, sample, out_dir)
 
 
 def main():
