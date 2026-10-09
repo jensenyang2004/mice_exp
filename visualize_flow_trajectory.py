@@ -61,6 +61,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from loguru import logger
 
@@ -117,6 +118,11 @@ def parse_args():
     parser.add_argument("--map_px", type=int, default=320)
     parser.add_argument("--map_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"])
     parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--coherence_kernel_size", type=int, default=5,
+                         help="Odd token-grid window size for the local direction-coherence row ('dir (local)') "
+                              "-- how many neighboring tokens each token's deviation direction is compared "
+                              "against. Too large relative to your smallest instance washes its signal into the "
+                              "surrounding region; too small is close to the unsmoothed per-token noise.")
 
     args = parser.parse_args()
     args.hard_image_attribute_binding_list_double = parse_layer_range(args.hard_image_attribute_binding_list_double)
@@ -217,15 +223,70 @@ def _capture_full_trajectory(args, pipe, sample, device):
     return result.images[0], x0, x_source, step_latents, sigmas, image_token_H, image_token_W
 
 
-def _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_token_W):
+def _step_normalize(mag: torch.Tensor) -> torch.Tensor:
+    """mag: [HW] non-negative. Divide by this step's OWN median across the whole
+    frame (background-dominated, since background is the majority of tokens) --
+    NOT by each token's own value from elsewhere, which would blow up near-zero
+    background denominators into huge, meaningless ratios. Cancels whatever the
+    real (not necessarily linear-in-sigma) global growth trend across steps turns
+    out to be, since it's measured directly rather than assumed; after this,
+    background sits near 1.0 at every step by construction, and an edited region
+    reads as "how many multiples of background-typical" it is -- comparable step
+    to step on equal footing.
+
+    The denominator floor is relative to this step's OWN max, not an absolute
+    constant: if background is (near) exactly on-chord, the median can be ~0, and
+    dividing by a tiny absolute epsilon turns ordinary floating-point noise into an
+    arbitrarily huge, meaningless ratio. Flooring at max*1e-3 instead caps the
+    worst case at ~1000x and gracefully degrades to "a rescaled version of the raw
+    magnitude map" when there's no meaningful background level to compare against
+    yet, rather than exploding."""
+    med = mag.median()
+    floor = mag.max().clamp_min(1e-12) * 1e-3
+    return mag / torch.maximum(med, floor)
+
+
+def _local_direction_coherence(dev: torch.Tensor, image_token_H: int, image_token_W: int,
+                                kernel_size: int) -> torch.Tensor:
+    """dev: [HW, C] deviation vectors. For each token, cosine similarity (rescaled to
+    [0,1], same convention as `cos` in _compute_trajectory_maps) between its own
+    deviation vector and the box-filtered LOCAL mean deviation vector of its
+    kernel_size x kernel_size neighborhood (self included) -- a per-pixel, spatially
+    local version of `cos`'s whole-frame comparison. Meant to surface patchy/locally
+    incoherent drift (candidate fusion/source-dominance-leakage signature: part of a
+    region still points toward source, part points toward target) and sharp
+    boundary discontinuities (candidate harmonization signature) directly, without
+    needing a hand-picked whole-instance-mask average first."""
+    C = dev.shape[-1]
+    grid = dev.reshape(image_token_H, image_token_W, C).permute(2, 0, 1).unsqueeze(0)  # [1,C,Ht,Wt]
+    k = kernel_size
+    box = torch.full((C, 1, k, k), 1.0 / (k * k), dtype=grid.dtype, device=grid.device)
+    local_mean = F.conv2d(grid, box, padding=k // 2, groups=C)  # [1,C,Ht,Wt]
+    local_mean = local_mean.squeeze(0).permute(1, 2, 0).reshape(-1, C)  # [HW,C]
+
+    mag = dev.norm(dim=-1)
+    local_norm = local_mean.norm(dim=-1)
+    cos = (dev * local_mean).sum(dim=-1) / (mag.clamp_min(1e-12) * local_norm.clamp_min(1e-12))
+    cos = torch.where(local_norm > 1e-12, cos, torch.zeros_like(cos))
+    return (((cos + 1.0) * 0.5).clamp(0.0, 1.0)).reshape(image_token_H, image_token_W)
+
+
+def _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_token_W, coherence_kernel_size=5):
     """Per step i in 1..N: deviation of actual x_i from the straight chord between x0
     (sigma=1) and x1==step_latents[N] (sigma=0), evaluated at sigma_i. Returns
-    {i: {magnitude: [Ht,Wt], cos: [Ht,Wt] in [0,1], sigma: float}}; cos is
-    (cosine_similarity_to_this_step's_own_mean_deviation_direction + 1) / 2, i.e. 0.5
-    means "no particular relationship to the dominant drift direction", >0.5 means
-    "drifting the same way as most of the frame" (expected for background), <0.5
-    means "drifting a different way than most of the frame" (expected for a
-    region actually being edited, if the drift is semantically structured at all)."""
+    {i: {magnitude, magnitude_norm, cos, dir_local: [Ht,Wt], sigma, rms}}.
+    - magnitude: raw ||deviation||.
+    - magnitude_norm: magnitude / this step's own frame-median magnitude (see
+      _step_normalize) -- cancels the "everything drifts more at later steps" trend
+      so background reads ~1.0 at every step and an edited region reads as a
+      multiple of that, comparable across steps.
+    - cos: (cosine_similarity_to_this_step's_own_WHOLE-FRAME-mean_deviation_direction
+      + 1) / 2, i.e. 0.5 = unrelated to the dominant drift direction, 1 = same, 0 =
+      opposite.
+    - dir_local: same idea as cos but against each token's own LOCAL neighborhood
+      mean (see _local_direction_coherence) instead of the whole frame -- surfaces
+      WHERE a region internally disagrees with itself, not just whether it disagrees
+      with the rest of the image."""
     x1 = step_latents[N][0]
     maps = {}
     for i in range(1, N + 1):
@@ -240,9 +301,12 @@ def _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_t
             cos = (dev @ mean_dir) / (mag.clamp_min(1e-12) * mean_norm)
         else:
             cos = torch.zeros_like(mag)
+        dir_local = _local_direction_coherence(dev, image_token_H, image_token_W, coherence_kernel_size)
         maps[i] = dict(
             magnitude=mag.reshape(image_token_H, image_token_W).cpu().numpy(),
+            magnitude_norm=_step_normalize(mag).reshape(image_token_H, image_token_W).cpu().numpy(),
             cos=(((cos + 1.0) * 0.5).clamp(0.0, 1.0)).reshape(image_token_H, image_token_W).cpu().numpy(),
+            dir_local=dir_local.cpu().numpy(),
             sigma=sigma_i,
             rms=float(mag.pow(2).mean().sqrt()),
         )
@@ -258,7 +322,9 @@ def _compute_edit_vs_source_maps(x_source, x1, sigmas, N, image_token_H, image_t
     scaled by a single shrinking factor per step (0 near the start, 1 at the final
     step where sigma==0). The per-step view mainly shows that scaling-in; the
     spatial PATTERN itself is identical at every step (and exactly equal to the
-    final step's panel, which is the true, unattenuated ||x1 - x_source||)."""
+    final step's panel, which is the true, unattenuated ||x1 - x_source||).
+    edit_magnitude_norm is the same per-step frame-median normalization as
+    magnitude_norm above, applied to this quantity."""
     raw = (x1 - x_source).float()
     raw_mag = raw.norm(dim=-1)
     maps = {}
@@ -267,6 +333,7 @@ def _compute_edit_vs_source_maps(x_source, x1, sigmas, N, image_token_H, image_t
         mag = raw_mag * (1.0 - sigma_i)
         maps[i] = dict(
             edit_magnitude=mag.reshape(image_token_H, image_token_W).cpu().numpy(),
+            edit_magnitude_norm=_step_normalize(mag).reshape(image_token_H, image_token_W).cpu().numpy(),
             edit_rms=float(mag.pow(2).mean().sqrt()),
         )
     return maps
@@ -278,54 +345,66 @@ def _render_trajectory(args, maps, masks_2d_list, sample, out_dir):
     Ht, Wt = next(iter(maps.values()))['magnitude'].shape
     panel_h = max(1, int(round(panel_w * Ht / Wt)))
     panel_size = (panel_w, panel_h)
-    label_h = 48
+    label_h = 62
     cbar_h = 12
     row_label_w = 90
-    canvas_w = row_label_w + len(steps) * panel_w
-    canvas_h = label_h + 3 * (panel_h + cbar_h + 6)
 
     vmax_mag = max((float(m['magnitude'].max()) for m in maps.values()), default=1e-12) or 1e-12
+    vmax_mag_norm = max((float(m['magnitude_norm'].max()) for m in maps.values()), default=1e-12) or 1e-12
     vmax_edit = max((float(m['edit_magnitude'].max()) for m in maps.values()), default=1e-12) or 1e-12
+    vmax_edit_norm = max((float(m['edit_magnitude_norm'].max()) for m in maps.values()), default=1e-12) or 1e-12
+
+    # (map key, row label, vmax, display scale) -- raw/normalized/global/local pairs
+    # kept adjacent so they're easy to compare row-to-row.
+    row_specs = [
+        ('magnitude', '|dev|', vmax_mag, args.map_scale),
+        ('magnitude_norm', '|dev|\n/med', vmax_mag_norm, args.map_scale),
+        ('cos', 'dir', 1.0, 'linear'),
+        ('dir_local', 'dir\n(local)', 1.0, 'linear'),
+        ('edit_magnitude', '|edit|', vmax_edit, args.map_scale),
+        ('edit_magnitude_norm', '|edit|\n/med', vmax_edit_norm, args.map_scale),
+    ]
+    row_h = panel_h + cbar_h + 6
+    canvas_w = row_label_w + len(steps) * panel_w
+    canvas_h = label_h + len(row_specs) * row_h
 
     canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
     draw.text((4, 2), f"{sample['sample_id']}: deviation of actual x_t from the noise<->final straight chord",
               fill=(0, 0, 0))
-    draw.text((4, 18), "row1: |deviation|   row2: direction vs. this step's own frame-mean drift "
-                       "(0=opposite, 0.5=unrelated, 1=same)", fill=(0, 0, 0))
-    draw.text((4, 32), "row3: |final - source| (edit magnitude), attenuated by (1-sigma) -- same spatial "
-                       "pattern at every step, full strength only at the last column", fill=(0, 0, 0))
+    draw.text((4, 16), "|dev|/|edit|: raw magnitude.  /med: same, divided by that step's own frame-median "
+                       "(background ~1.0 at every step, edited region reads as a multiple of that)",
+              fill=(0, 0, 0))
+    draw.text((4, 30), "dir: cosine vs. this step's WHOLE-FRAME mean drift direction (0=opposite, "
+                       "0.5=unrelated, 1=same).  dir (local): same, vs. each token's own "
+                       f"{args.coherence_kernel_size}x{args.coherence_kernel_size}-token neighborhood mean "
+                       "(surfaces internal patchiness/boundary discontinuities)", fill=(0, 0, 0))
+    draw.text((4, 44), "|edit| is attenuated by (1-sigma) -- same spatial pattern at every step, full "
+                       "strength only at the last column", fill=(0, 0, 0))
 
-    y_mag = label_h
-    y_cos = y_mag + panel_h + cbar_h + 6
-    y_edit = y_cos + panel_h + cbar_h + 6
-    draw.text((4, y_mag + panel_h // 2 - 6), "|dev|", fill=(0, 0, 0))
-    draw.text((4, y_cos + panel_h // 2 - 6), "dir.", fill=(0, 0, 0))
-    draw.text((4, y_edit + panel_h // 2 - 6), "|edit|", fill=(0, 0, 0))
+    def _panel(values_2d, vmax, scale):
+        p = _attention_map_panel(values_2d, vmax, panel_size, scale)
+        if args.outline_instance:
+            pd = ImageDraw.Draw(p)
+            for k, mask2d in enumerate(masks_2d_list):
+                _draw_mask_contour(pd, mask2d, panel_size, (0, 0),
+                                    color=_INSTANCE_COLORS[k % len(_INSTANCE_COLORS)], width=1)
+        return p
+
+    for r, (key, label, vmax, scale) in enumerate(row_specs):
+        y = label_h + r * row_h
+        draw.text((4, y + panel_h // 2 - 10), label, fill=(0, 0, 0))
+        for c, i in enumerate(steps):
+            x = row_label_w + c * panel_w
+            canvas.paste(_panel(maps[i][key], vmax, scale), (x, y))
+        canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y + panel_h))
 
     for c, i in enumerate(steps):
         x = row_label_w + c * panel_w
         m = maps[i]
-        draw.text((x + 2, 2), f"step {i}", fill=(0, 0, 0))
-        draw.text((x + 2, 16), f"s={m['sigma']:.2f} rms={m['rms']:.3f}", fill=(0, 0, 0))
-        draw.text((x + 2, 30), f"edit_rms={m['edit_rms']:.3f}", fill=(0, 0, 0))
-
-        def _panel(values_2d, vmax, scale):
-            p = _attention_map_panel(values_2d, vmax, panel_size, scale)
-            if args.outline_instance:
-                pd = ImageDraw.Draw(p)
-                for k, mask2d in enumerate(masks_2d_list):
-                    _draw_mask_contour(pd, mask2d, panel_size, (0, 0),
-                                        color=_INSTANCE_COLORS[k % len(_INSTANCE_COLORS)], width=1)
-            return p
-
-        canvas.paste(_panel(m['magnitude'], vmax_mag, args.map_scale), (x, y_mag))
-        canvas.paste(_panel(m['cos'], 1.0, "linear"), (x, y_cos))
-        canvas.paste(_panel(m['edit_magnitude'], vmax_edit, args.map_scale), (x, y_edit))
-
-    canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y_mag + panel_h))
-    canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y_cos + panel_h))
-    canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y_edit + panel_h))
+        draw.text((x + 2, label_h - 14),
+                  f"step {i} s={m['sigma']:.2f} rms={m['rms']:.3f} edit_rms={m['edit_rms']:.3f}",
+                  fill=(0, 0, 0))
 
     out_path = out_dir / f"{sample['sample_id']}_flow_trajectory.png"
     canvas.save(out_path)
@@ -353,7 +432,8 @@ def run_sample(args, pipe, sample, device, out_dir):
         masks_2d_list = [m for k, m in enumerate(masks_2d_list) if k in args.instance_idx]
 
     N = args.num_inference_steps
-    maps = _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_token_W)
+    maps = _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_token_W,
+                                     coherence_kernel_size=args.coherence_kernel_size)
     edit_maps = _compute_edit_vs_source_maps(x_source, step_latents[N][0], sigmas, N,
                                               image_token_H, image_token_W)
     for i in maps:
