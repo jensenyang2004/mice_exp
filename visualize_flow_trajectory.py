@@ -14,6 +14,16 @@ from that chord -- both how much (magnitude) and whether the direction organizes
 itself by instance mask (cosine similarity to the frame's own mean deviation
 direction) rather than looking uniform/unstructured.
 
+Also renders a third row: the gap between the two straight chords noise->source and
+noise->final (both anchored at the same x_0), evaluated at each step. Since both
+chords share x_0, this collapses to a closed form -- (1-sigma)*|x1 - x_source| -- a
+FIXED spatial pattern (how much the final result differs from the untouched source
+image, per token) scaled by a single shrinking-then-growing factor per step; the
+pattern itself is identical at every step and exactly equals the true, unattenuated
+|x1 - x_source| at the final column. The expectation per the masking design: this
+should concentrate almost entirely inside the instance masks and be near-zero
+everywhere else (background preserved, only the edited regions actually changed).
+
 Captured via the pipeline's own SUPPORTED extension points only, no file edits, no
 attention hooks, no QUERY_BLUR:
   - callback_on_step_end (official diffusers hook already wired through
@@ -21,7 +31,10 @@ attention hooks, no QUERY_BLUR:
   - a runtime (not on-disk) wrap of pipe.prepare_latents, restored immediately after
     the call, grabs x_0 (the pure initial noise) BEFORE the loop starts -- the only
     value that function returns and nothing downstream re-exposes.
-Both are read-only taps on a normal forward run; nothing here can affect what the
+  - a runtime wrap of pipe.prepare_image_latents, same pattern, grabs x_source (the
+    source image encoded through the identical VAE-encode -> patchify -> pack path --
+    the "context" plane, fixed for the whole run, never touched by the scheduler).
+All three are read-only taps on a normal forward run; nothing here can affect what the
 pipeline computes or its benchmark numbers.
 
 Attention processor matches infer_flux2_mice.py's REAL benchmarked path exactly
@@ -116,9 +129,12 @@ def parse_args():
 
 def _capture_full_trajectory(args, pipe, sample, device):
     """Runs ONE ordinary (non-abort) generation, tapping x_0 (via a temporary wrap of
-    pipe.prepare_latents, restored in `finally`) and x_t after every step (via the
-    pipeline's own supported callback_on_step_end). Returns (image, x0 [HW,C],
-    step_latents {1..N: [HW,C]}, sigmas [N+1], image_token_H, image_token_W)."""
+    pipe.prepare_latents, restored in `finally`), x_source -- the source image encoded
+    through the identical VAE-encode -> patchify -> pack path, i.e. the "context"
+    plane, fixed for the whole run (via a temporary wrap of pipe.prepare_image_latents,
+    same pattern) -- and x_t after every step (via the pipeline's own supported
+    callback_on_step_end). Returns (image, x0 [HW,C], x_source [HW,C], step_latents
+    {1..N: [HW,C]}, sigmas [N+1], image_token_H, image_token_W)."""
     image = sample['image']
     w, h = image.size
 
@@ -129,6 +145,14 @@ def _capture_full_trajectory(args, pipe, sample, device):
         latents, latent_ids = orig_prepare_latents(*a, **kw)
         captured_x0['x0'] = latents.detach().clone()
         return latents, latent_ids
+
+    captured_xsrc = {}
+    orig_prepare_image_latents = pipe.prepare_image_latents
+
+    def _wrapped_prepare_image_latents(*a, **kw):
+        image_latents, image_latent_ids = orig_prepare_image_latents(*a, **kw)
+        captured_xsrc['xsrc'] = image_latents.detach().clone()
+        return image_latents, image_latent_ids
 
     step_latents = {}
 
@@ -143,6 +167,7 @@ def _capture_full_trajectory(args, pipe, sample, device):
         kwargs['instance_bboxes_xyxy_normalized'] = sample['bboxes']
 
     pipe.prepare_latents = _wrapped_prepare_latents
+    pipe.prepare_image_latents = _wrapped_prepare_image_latents
     try:
         result = pipe(
             image=image, prompt=sample['prompt'], height=h, width=w,
@@ -167,15 +192,29 @@ def _capture_full_trajectory(args, pipe, sample, device):
         )
     finally:
         pipe.prepare_latents = orig_prepare_latents
+        pipe.prepare_image_latents = orig_prepare_image_latents
 
     if 'x0' not in captured_x0 or len(step_latents) != args.num_inference_steps:
         logger.error("Did not capture a full trajectory (prepare_latents/callback not hit as expected) -- aborting.")
+        return None
+    if 'xsrc' not in captured_xsrc:
+        logger.error("Did not capture the source-image encoding (prepare_image_latents not hit) -- aborting.")
         return None
 
     sigmas = pipe.scheduler.sigmas.detach().float().cpu()
     image_token_H = h // pipe.vae_scale_factor // 2
     image_token_W = w // pipe.vae_scale_factor // 2
-    return result.images[0], captured_x0['x0'][0], step_latents, sigmas, image_token_H, image_token_W
+
+    x0 = captured_x0['x0'][0]
+    x_source = captured_xsrc['xsrc'][0]
+    if x_source.shape[0] != x0.shape[0]:
+        logger.error(f"x_source has {x_source.shape[0]} tokens but x0/latents has {x0.shape[0]} -- geometry "
+                      "mismatch (likely the source image's area exceeded 1024x1024 and got internally "
+                      "resized differently than --height/--width); aborting rather than comparing "
+                      "misaligned tokens.")
+        return None
+
+    return result.images[0], x0, x_source, step_latents, sigmas, image_token_H, image_token_W
 
 
 def _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_token_W):
@@ -210,67 +249,98 @@ def _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_t
     return maps
 
 
+def _compute_edit_vs_source_maps(x_source, x1, sigmas, N, image_token_H, image_token_W):
+    """Per step i in 1..N: gap between the two straight chords noise->source and
+    noise->final, both anchored at the SAME x0, evaluated at sigma_i. Since both
+    chords share x0, sigma_i*x0 cancels exactly and the gap collapses to a closed
+    form: chord_final(s) - chord_source(s) = (1-s)*(x1 - x_source) -- i.e. a FIXED
+    spatial pattern (how much the final result differs from the source, per token),
+    scaled by a single shrinking factor per step (0 near the start, 1 at the final
+    step where sigma==0). The per-step view mainly shows that scaling-in; the
+    spatial PATTERN itself is identical at every step (and exactly equal to the
+    final step's panel, which is the true, unattenuated ||x1 - x_source||)."""
+    raw = (x1 - x_source).float()
+    raw_mag = raw.norm(dim=-1)
+    maps = {}
+    for i in range(1, N + 1):
+        sigma_i = float(sigmas[i])
+        mag = raw_mag * (1.0 - sigma_i)
+        maps[i] = dict(
+            edit_magnitude=mag.reshape(image_token_H, image_token_W).cpu().numpy(),
+            edit_rms=float(mag.pow(2).mean().sqrt()),
+        )
+    return maps
+
+
 def _render_trajectory(args, maps, masks_2d_list, sample, out_dir):
     steps = sorted(maps.keys())
     panel_w = args.map_px
     Ht, Wt = next(iter(maps.values()))['magnitude'].shape
     panel_h = max(1, int(round(panel_w * Ht / Wt)))
     panel_size = (panel_w, panel_h)
-    label_h = 36
+    label_h = 48
     cbar_h = 12
     row_label_w = 90
     canvas_w = row_label_w + len(steps) * panel_w
-    canvas_h = label_h + 2 * (panel_h + cbar_h + 6)
+    canvas_h = label_h + 3 * (panel_h + cbar_h + 6)
 
     vmax_mag = max((float(m['magnitude'].max()) for m in maps.values()), default=1e-12) or 1e-12
+    vmax_edit = max((float(m['edit_magnitude'].max()) for m in maps.values()), default=1e-12) or 1e-12
 
     canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
     draw.text((4, 2), f"{sample['sample_id']}: deviation of actual x_t from the noise<->final straight chord",
               fill=(0, 0, 0))
-    draw.text((4, 18), "top: |deviation|   bottom: direction vs. this step's own frame-mean drift "
+    draw.text((4, 18), "row1: |deviation|   row2: direction vs. this step's own frame-mean drift "
                        "(0=opposite, 0.5=unrelated, 1=same)", fill=(0, 0, 0))
+    draw.text((4, 32), "row3: |final - source| (edit magnitude), attenuated by (1-sigma) -- same spatial "
+                       "pattern at every step, full strength only at the last column", fill=(0, 0, 0))
 
     y_mag = label_h
     y_cos = y_mag + panel_h + cbar_h + 6
+    y_edit = y_cos + panel_h + cbar_h + 6
     draw.text((4, y_mag + panel_h // 2 - 6), "|dev|", fill=(0, 0, 0))
     draw.text((4, y_cos + panel_h // 2 - 6), "dir.", fill=(0, 0, 0))
+    draw.text((4, y_edit + panel_h // 2 - 6), "|edit|", fill=(0, 0, 0))
 
     for c, i in enumerate(steps):
         x = row_label_w + c * panel_w
         m = maps[i]
         draw.text((x + 2, 2), f"step {i}", fill=(0, 0, 0))
         draw.text((x + 2, 16), f"s={m['sigma']:.2f} rms={m['rms']:.3f}", fill=(0, 0, 0))
+        draw.text((x + 2, 30), f"edit_rms={m['edit_rms']:.3f}", fill=(0, 0, 0))
 
-        p_mag = _attention_map_panel(m['magnitude'], vmax_mag, panel_size, args.map_scale)
-        if args.outline_instance:
-            pd = ImageDraw.Draw(p_mag)
-            for k, mask2d in enumerate(masks_2d_list):
-                _draw_mask_contour(pd, mask2d, panel_size, (0, 0), color=_INSTANCE_COLORS[k % len(_INSTANCE_COLORS)], width=1)
-        canvas.paste(p_mag, (x, y_mag))
+        def _panel(values_2d, vmax, scale):
+            p = _attention_map_panel(values_2d, vmax, panel_size, scale)
+            if args.outline_instance:
+                pd = ImageDraw.Draw(p)
+                for k, mask2d in enumerate(masks_2d_list):
+                    _draw_mask_contour(pd, mask2d, panel_size, (0, 0),
+                                        color=_INSTANCE_COLORS[k % len(_INSTANCE_COLORS)], width=1)
+            return p
 
-        p_cos = _attention_map_panel(m['cos'], 1.0, panel_size, "linear")
-        if args.outline_instance:
-            pd = ImageDraw.Draw(p_cos)
-            for k, mask2d in enumerate(masks_2d_list):
-                _draw_mask_contour(pd, mask2d, panel_size, (0, 0), color=_INSTANCE_COLORS[k % len(_INSTANCE_COLORS)], width=1)
-        canvas.paste(p_cos, (x, y_cos))
+        canvas.paste(_panel(m['magnitude'], vmax_mag, args.map_scale), (x, y_mag))
+        canvas.paste(_panel(m['cos'], 1.0, "linear"), (x, y_cos))
+        canvas.paste(_panel(m['edit_magnitude'], vmax_edit, args.map_scale), (x, y_edit))
 
     canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y_mag + panel_h))
     canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y_cos + panel_h))
+    canvas.paste(_colorbar_strip(len(steps) * panel_w, cbar_h), (row_label_w, y_edit + panel_h))
 
     out_path = out_dir / f"{sample['sample_id']}_flow_trajectory.png"
     canvas.save(out_path)
     logger.info(f"Saved {out_path}")
     logger.info("Per-step RMS deviation from the straight chord (0 == perfectly straight): "
                 + ", ".join(f"step{i}={maps[i]['rms']:.4f}" for i in steps))
+    logger.info("Per-step RMS |final-source| edit magnitude (should concentrate inside instance masks): "
+                + ", ".join(f"step{i}={maps[i]['edit_rms']:.4f}" for i in steps))
 
 
 def run_sample(args, pipe, sample, device, out_dir):
     captured = _capture_full_trajectory(args, pipe, sample, device)
     if captured is None:
         return
-    image, x0, step_latents, sigmas, image_token_H, image_token_W = captured
+    image, x0, x_source, step_latents, sigmas, image_token_H, image_token_W = captured
     image.save(out_dir / f"{sample['sample_id']}_generated.png")
 
     w, h = sample['image'].size
@@ -282,8 +352,12 @@ def run_sample(args, pipe, sample, device, out_dir):
     if args.instance_idx is not None:
         masks_2d_list = [m for k, m in enumerate(masks_2d_list) if k in args.instance_idx]
 
-    maps = _compute_trajectory_maps(x0, step_latents, sigmas, args.num_inference_steps,
-                                     image_token_H, image_token_W)
+    N = args.num_inference_steps
+    maps = _compute_trajectory_maps(x0, step_latents, sigmas, N, image_token_H, image_token_W)
+    edit_maps = _compute_edit_vs_source_maps(x_source, step_latents[N][0], sigmas, N,
+                                              image_token_H, image_token_W)
+    for i in maps:
+        maps[i].update(edit_maps[i])
     _render_trajectory(args, maps, masks_2d_list, sample, out_dir)
 
 
