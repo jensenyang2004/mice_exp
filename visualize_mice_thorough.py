@@ -71,6 +71,10 @@ from capture_query_blur_leakage import load_pipeline, str2list, parse_layer_rang
 from visualize_attention_variants import _attention_map_panel, _draw_mask_contour, _colorbar_strip, _row_stats
 from compare_blur_strategies import _capture_snapshot
 from flux2.pipeline_utils import find_inner_sentence_token_span_qwen
+from flux2.attention.attention_processor_APITASM_kernel_nonlap import (
+    TRANSFORMER_NUM_LAYERS,
+    TRANSFORMER_SINGLE_NUM_LAYERS,
+)
 
 
 def parse_args():
@@ -106,6 +110,13 @@ def parse_args():
     parser.add_argument("--target_step", type=int, default=0)
     parser.add_argument("--target_stream", type=str, default="double", choices=["double", "single"])
     parser.add_argument("--target_layer", type=int, default=0)
+    parser.add_argument("--dump_all_steps_layers", action="store_true",
+                         help="Ignore --target_step/--target_stream/--target_layer and instead sweep EVERY "
+                              "(step, stream, layer) coordinate across --num_inference_steps, writing each to "
+                              "its own uniquely-named file (no manual re-running/renaming needed). Each "
+                              "coordinate is still one from-scratch forward pass up to that point, same as "
+                              "today -- this just automates the sweep, it does not make deep coordinates "
+                              "cheaper, so a full sweep over many steps/layers will take a while.")
 
     parser.add_argument("--instance_idx", type=str, default="all",
                          help="'all' or a comma list of real instance indices to render")
@@ -467,34 +478,41 @@ _PANEL_KEYS = [
 ]
 
 
-def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
+def _capture_and_render(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir,
+                         after_name: str, before_name: str) -> bool:
+    """One (step, stream, layer) coordinate -- as set on args.target_step/target_stream/
+    target_layer by the caller -- captured and rendered as both states. Returns whether
+    anything was rendered (False on any skip: coordinate never reached, geometry
+    mismatch, or no instance met --min_region_tokens)."""
     captured_after = _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device,
                                         free_latent=False, free_context=False, free_LC=False, free_LL=False)
     if captured_after is None:
-        logger.error("No 'after' (MICE) snapshot captured.")
-        return
+        logger.warning(f"[{after_name}] No 'after' (MICE) snapshot captured at "
+                        f"step={args.target_step} stream={args.target_stream} layer={args.target_layer} -- skipping.")
+        return False
     captured_before = _capture_snapshot(args, pipe, attn_proc, parallel_attn_proc, sample, device,
                                          free_latent=True, free_context=True, free_LC=True, free_LL=True)
     if captured_before is None:
-        logger.error("No 'before' (open-spatial) snapshot captured.")
-        return
+        logger.warning(f"[{before_name}] No 'before' (open-spatial) snapshot captured at "
+                        f"step={args.target_step} stream={args.target_stream} layer={args.target_layer} -- skipping.")
+        return False
     if (captured_after['seq_len'] != captured_before['seq_len']
             or captured_after['HW'] != captured_before['HW']):
-        logger.error("'before'/'after' snapshots have different geometry -- aborting.")
-        return
+        logger.error(f"[{after_name}] 'before'/'after' snapshots have different geometry -- skipping.")
+        return False
 
     seq_len, HW = captured_after['seq_len'], captured_after['HW']
     image_token_H, image_token_W = captured_after['image_token_H'], captured_after['image_token_W']
     real_masks = captured_after['instance_position_mask_list']
     instance_text_index_lst = captured_after['instance_text_index_lst']
     num_real = len(real_masks)
-    device = captured_after['z'].device
+    cap_device = captured_after['z'].device
 
     layouts, qi, _cross_keys, own_masks_flat, _own_ring_flat = _build_instance_layout(
-        real_masks, seq_len, HW, image_token_H, image_token_W, device,
+        real_masks, seq_len, HW, image_token_H, image_token_W, cap_device,
         args.min_region_tokens, background_index=None, ring_radius=0,
     )
-    group_id = _text_group_id(seq_len, instance_text_index_lst, device)
+    group_id = _text_group_id(seq_len, instance_text_index_lst, cap_device)
     real_ks = range(num_real) if args.instance_idx is None else sorted(args.instance_idx & set(range(num_real)))
     keep_mask, token_label = _build_text_labels(pipe, sample, instance_text_index_lst, seq_len, args)
     keep_mask = keep_mask.cpu().numpy()
@@ -511,8 +529,9 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         maps_before[k] = _compute_state_maps(A_before, layouts, qi, own_masks_flat, instance_text_index_lst,
                                               group_id, k, seq_len, HW, image_token_H, image_token_W)
     if not maps_after:
-        logger.error("No maps produced (every requested instance below --min_region_tokens?).")
-        return
+        logger.warning(f"[{after_name}] No maps produced (every requested instance below "
+                        "--min_region_tokens?) -- skipping.")
+        return False
 
     # Shared vmax per panel-type, across both states AND all instances, so every panel
     # of that type in either PNG is on the same color scale.
@@ -521,8 +540,44 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         vals = [mm[key].max() for maps in (maps_after, maps_before) for mm in maps.values() if key in mm]
         vmax_by_key[key] = max((float(v) for v in vals), default=1e-12) or 1e-12
 
-    _render_state(args, maps_after, sample, out_dir, "after_mice", vmax_by_key, keep_mask, token_label)
-    _render_state(args, maps_before, sample, out_dir, "before_open_spatial", vmax_by_key, keep_mask, token_label)
+    _render_state(args, maps_after, sample, out_dir, after_name, vmax_by_key, keep_mask, token_label)
+    _render_state(args, maps_before, sample, out_dir, before_name, vmax_by_key, keep_mask, token_label)
+    return True
+
+
+def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir):
+    if not args.dump_all_steps_layers:
+        _capture_and_render(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir,
+                             "after_mice", "before_open_spatial")
+        return
+
+    combos = []
+    for step in range(args.num_inference_steps):
+        for layer in range(TRANSFORMER_NUM_LAYERS):
+            combos.append((step, "double", layer))
+        for layer in range(TRANSFORMER_SINGLE_NUM_LAYERS):
+            combos.append((step, "single", layer))
+
+    logger.warning(
+        f"--dump_all_steps_layers: sweeping {len(combos)} (step, stream, layer) coordinates x 2 states = "
+        f"{2 * len(combos)} capture passes, each a from-scratch forward pass up to that coordinate. Deeper "
+        "coordinates (later steps, later layers) cost proportionally more compute/VRAM than step 0 layer 0 -- "
+        "this is expected (see the dense-attention-per-layer discussion), not a bug, and a full sweep will "
+        "take a while. Calling torch.cuda.empty_cache() between coordinates to limit fragmentation."
+    )
+    done = 0
+    for step, stream, layer in combos:
+        args.target_step, args.target_stream, args.target_layer = step, stream, layer
+        tag = f"step{step:02d}_{stream}_layer{layer:02d}"
+        try:
+            hit = _capture_and_render(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_dir,
+                                       f"after_mice__{tag}", f"before_open_spatial__{tag}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        done += int(hit)
+        logger.info(f"[{tag}] {'rendered' if hit else 'skipped'} ({done}/{len(combos)} rendered so far)")
+    logger.info(f"--dump_all_steps_layers finished: {done}/{len(combos)} coordinates rendered to {out_dir}")
 
 
 def main():
