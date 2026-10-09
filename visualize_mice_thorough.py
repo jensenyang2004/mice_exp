@@ -113,6 +113,13 @@ def parse_args():
     parser.add_argument("--map_scale", type=str, default="sqrt", choices=["sqrt", "linear", "log"])
     parser.add_argument("--map_px", type=int, default=320)
     parser.add_argument("--bar_h", type=int, default=150, help="Height of each text-attention bar chart, px")
+    parser.add_argument("--bar_label_h", type=int, default=70,
+                         help="Height reserved under the instance-prompt bars for rotated per-token labels, px")
+    parser.add_argument("--global_bar_frac", type=float, default=0.15,
+                         help="Fraction of the bar chart's width given to the (untrimmed, unlabeled) global-prompt strip")
+    parser.add_argument("--max_sequence_length", type=int, default=512,
+                         help="Must match the pipeline's own tokenizer max_length -- only used to reproduce "
+                              "input_ids for decoding real (non-padding) instance-prompt tokens into bar labels")
     parser.add_argument("--outline_instance", action=argparse.BooleanOptionalAction, default=True)
 
     args = parser.parse_args()
@@ -133,6 +140,70 @@ def _text_group_id(seq_len: int, instance_text_index_lst, device) -> torch.Tenso
         if idx is not None and idx.numel() > 0:
             gid[idx] = i
     return gid
+
+
+def _tokenize_segment(tokenizer, text: str, max_sequence_length: int) -> torch.Tensor:
+    """Reproduces, bit-for-bit, the exact tokenization
+    Flux2KleinPipeline._get_qwen3_prompt_embeds applies to one $BREAKFLAG$ segment
+    (pipeline_flux2_klein.py) -- same chat template, same padding/truncation -- so the
+    resulting input_ids match what the real captured run actually saw. Tokenization
+    only (no text-encoder forward pass): all we need is input_ids, to find the real
+    (non-padding) content length and decode it into labels."""
+    messages = [{"role": "user", "content": text}]
+    chat_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    )
+    inputs = tokenizer(chat_text, return_tensors="pt", padding="max_length",
+                        truncation=True, max_length=max_sequence_length)
+    return inputs["input_ids"][0]
+
+
+def _build_text_labels(pipe, sample, instance_text_index_lst, seq_len: int, args):
+    """Returns (keep_mask [seq_len] bool, token_label [seq_len] list[str]).
+
+    Group 0 (global prompt) is left completely untouched: keep_mask is True for every
+    one of its positions, no labels -- per request, not the point of this view.
+
+    Every other group (instance k's own local edit prompt, instance_text_index_lst[k+1])
+    is, in 'outer_local_prompts' mode, a FIXED-SIZE window (pipeline_flux2_klein.py's
+    num_instance_text_tokens, default 200) regardless of the sentence's actual length --
+    most of those positions are right-padding, not real words (see num_tokens_to_select
+    in _get_qwen3_prompt_embeds). This re-tokenizes that instance's own sentence
+    (sample['prompt'] re-split on $BREAKFLAG$, identical to what the pipeline itself
+    does) purely to find the real content length (count of non-zero input_ids, the same
+    test outer_local_prompts_smart itself uses) and decode those real tokens for
+    labels -- padding positions get keep_mask=False and are dropped from the chart;
+    'outer_local_prompts_smart' already sizes windows to real content, so nothing there
+    ends up trimmed, but labels are still attached.
+
+    Only implemented for prompt_settings in {outer_local_prompts, outer_local_prompts_smart}
+    -- inner_local_prompts/base locate each instance's sentence as a SPAN inside one
+    shared encoding rather than its own fixed window, a different indexing scheme this
+    does not attempt to reconstruct.
+    """
+    keep_mask = torch.ones(seq_len, dtype=torch.bool)
+    token_label = [""] * seq_len
+    if args.prompt_settings not in ("outer_local_prompts", "outer_local_prompts_smart"):
+        logger.warning(f"Padding trim/labels not implemented for prompt_settings={args.prompt_settings!r}; "
+                        "showing the full (padded, unlabeled) text axis.")
+        return keep_mask, token_label
+
+    segments = sample['prompt'].split('$BREAKFLAG$')
+    tokenizer = pipe.tokenizer
+    for i, idx in enumerate(instance_text_index_lst):
+        if i == 0 or idx is None or idx.numel() == 0 or i >= len(segments):
+            continue  # group 0 (global) left fully as-is, per request
+        idx_cpu = idx.detach().cpu()
+        input_ids = _tokenize_segment(tokenizer, segments[i], args.max_sequence_length)
+        real_len = int((input_ids != 0).sum().item())
+        real_len = min(real_len, idx_cpu.numel())
+        if real_len < idx_cpu.numel():
+            keep_mask[idx_cpu[real_len:]] = False
+        toks = tokenizer.convert_ids_to_tokens(input_ids[:real_len].tolist())
+        for pos, tok in zip(idx_cpu[:real_len].tolist(), toks):
+            clean = tok.replace('Ġ', '').replace('Ċ', '¶')
+            token_label[pos] = clean if clean else '·'
+    return keep_mask, token_label
 
 
 def _query_row(A: torch.Tensor, q_idx: torch.Tensor) -> torch.Tensor:
@@ -193,38 +264,81 @@ def _compute_state_maps(A, layouts, qi, own_masks_flat, instance_text_index_lst,
 _BAR_GLOBAL = (140, 140, 140)
 _BAR_OWN = (40, 170, 90)
 _BAR_OTHER = (220, 110, 40)
-_BAR_UNASSIGNED = (225, 225, 225)
 
 
-def _bar_chart(vec: np.ndarray, group_id: np.ndarray, own_group: int, width: int, height: int) -> Image.Image:
-    """Per-token bar chart of a text-attention row, bars colored by which group owns
-    that text position -- gray=global/source prompt, green=instance k's own local
-    prompt ("target"), orange=some OTHER instance's local prompt, light gray=unassigned."""
-    n = len(vec)
-    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+def _vertical_label(text: str) -> Image.Image:
+    """Renders `text` with PIL's default bitmap font, cropped tight, then rotated 90deg
+    so it reads bottom-to-top under a narrow bar -- the only way a per-token label fits
+    under bars that are often <20px wide. Returns a transparent RGBA image sized
+    (~font_height, text_pixel_length); empty string -> a 1x1 transparent stub."""
+    if not text:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    tmp = Image.new("RGBA", (260, 16), (255, 255, 255, 0))
+    d = ImageDraw.Draw(tmp)
+    d.text((0, 0), text, fill=(0, 0, 0, 255))
+    bbox = tmp.getbbox()
+    if bbox is None:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    return tmp.crop(bbox).rotate(90, expand=True)
+
+
+def _bar_chart_split(vec: np.ndarray, group_id: np.ndarray, own_group: int,
+                      keep_mask: np.ndarray, token_label, width: int, bar_h: int, label_h: int,
+                      global_frac: float) -> Image.Image:
+    """Two-part bar chart over the text axis, side by side:
+
+    LEFT (global_frac of width): the global prompt (group 0), every position,
+    untrimmed, unlabeled -- exactly the original full bar chart, just compacted, since
+    it's not the point of this view.
+
+    RIGHT (the rest): every OTHER group (each instance's own local edit prompt),
+    PADDING POSITIONS DROPPED (keep_mask over group_id>0) so only real content tokens
+    get a bar, each one labeled with its actual decoded token text, rotated vertical,
+    underneath. Bars colored green=own_group (this panel's instance), orange=any other
+    instance -- so cross-instance text leakage is still visible, just padding-free.
+    """
+    canvas = Image.new("RGB", (width, bar_h + label_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
-    if n == 0:
-        return canvas
-    vmax = max(float(vec.max()), 1e-12)
-    bar_w = width / n
-    base_y = height - 2
-    prev_gid = None
-    for i in range(n):
-        gid = int(group_id[i])
-        if gid == 0:
-            color = _BAR_GLOBAL
-        elif gid == own_group:
-            color = _BAR_OWN
-        elif gid == -1:
-            color = _BAR_UNASSIGNED
-        else:
-            color = _BAR_OTHER
-        h = (vec[i] / vmax) * (height - 4)
-        x0, x1 = i * bar_w, (i + 1) * bar_w
-        draw.rectangle([x0, base_y - h, x1, base_y], fill=color)
-        if prev_gid is not None and gid != prev_gid:
-            draw.line([(x0, 0), (x0, height)], fill=(0, 0, 0), width=1)
-        prev_gid = gid
+    base_y = bar_h - 2
+
+    global_idx = np.nonzero(group_id == 0)[0]
+    inst_idx = np.nonzero((group_id > 0) & keep_mask)[0]
+
+    global_w = int(width * global_frac) if len(global_idx) else 0
+    gap = 6 if global_w and len(inst_idx) else 0
+    inst_w = width - global_w - gap
+
+    if len(global_idx):
+        vmax_g = max(float(vec[global_idx].max()), 1e-12)
+        bw = global_w / len(global_idx)
+        for n, i in enumerate(global_idx):
+            h = (vec[i] / vmax_g) * (bar_h - 4)
+            x0, x1 = n * bw, (n + 1) * bw
+            draw.rectangle([x0, base_y - h, x1, base_y], fill=_BAR_GLOBAL)
+        draw.text((2, 2), "global (padded, untrimmed)", fill=(0, 0, 0))
+        draw.line([(global_w, 0), (global_w, bar_h + label_h)], fill=(0, 0, 0), width=1)
+
+    if len(inst_idx):
+        x_off = global_w + gap
+        vmax_i = max(float(vec[inst_idx].max()), 1e-12)
+        bw = inst_w / len(inst_idx)
+        prev_gid = None
+        for n, i in enumerate(inst_idx):
+            gid = int(group_id[i])
+            color = _BAR_OWN if gid == own_group else _BAR_OTHER
+            h = (vec[i] / vmax_i) * (bar_h - 4)
+            x0, x1 = x_off + n * bw, x_off + (n + 1) * bw
+            draw.rectangle([x0, base_y - h, x1, base_y], fill=color)
+            if prev_gid is not None and gid != prev_gid:
+                draw.line([(x0, 0), (x0, bar_h + label_h)], fill=(0, 0, 0), width=1)
+            prev_gid = gid
+            lbl = _vertical_label(token_label[i])
+            if lbl.size[0] > 1:
+                lx = int(x_off + n * bw + (bw - lbl.size[0]) / 2)
+                canvas.paste(lbl, (max(x_off, lx), bar_h + 2), lbl)
+        draw.text((x_off + 2, 2), "instance local prompts (padding removed, real tokens, labeled)", fill=(0, 0, 0))
+    elif len(global_idx) == 0:
+        draw.text((2, 2), "(no text groups found)", fill=(0, 0, 0))
     return canvas
 
 
@@ -236,7 +350,7 @@ def _panel_with_contour(values_2d, vmax, panel_size, scale, own_mask, outline):
     return panel
 
 
-def _render_state(args, maps, sample, out_dir, state_name, vmax_by_key):
+def _render_state(args, maps, sample, out_dir, state_name, vmax_by_key, keep_mask, token_label):
     panel_w = args.map_px
     any_k = next(iter(maps))
     image_token_H, image_token_W = maps[any_k]['own_mask'].shape
@@ -245,14 +359,13 @@ def _render_state(args, maps, sample, out_dir, state_name, vmax_by_key):
     label_h = 22
     cbar_h = 12
     bar_h = args.bar_h
+    bar_label_h = args.bar_label_h
     canvas_w = panel_w * 4
 
     for k, m in maps.items():
         y = 0
-        canvas = Image.new("RGB", (canvas_w, 1), (255, 255, 255))  # placeholder, resized below
-        rows = []  # list of (y_offset, draw_fn) not needed -- build full height first
 
-        section1_h = label_h + panel_h + cbar_h + 4 + bar_h + 16
+        section1_h = label_h + panel_h + cbar_h + 4 + bar_h + bar_label_h + 16
         section2_h = section1_h
         section3_h = label_h + panel_h + cbar_h + 4 + 18
         total_h = section1_h + section2_h + section3_h
@@ -277,9 +390,10 @@ def _render_state(args, maps, sample, out_dir, state_name, vmax_by_key):
         canvas.paste(_colorbar_strip(panel_w, cbar_h), (0, y))
         canvas.paste(_colorbar_strip(panel_w, cbar_h), (panel_w, y))
         y += cbar_h + 4
-        bar = _bar_chart(m['latent_q_text'], m['group_id'], k + 1, canvas_w, bar_h)
+        bar = _bar_chart_split(m['latent_q_text'], m['group_id'], k + 1, keep_mask, token_label,
+                                canvas_w, bar_h, bar_label_h, args.global_bar_frac)
         canvas.paste(bar, (0, y))
-        y += bar_h
+        y += bar_h + bar_label_h
         own_m, cross_m, text_m, other_m = m['latent_q_stats']
         draw.text((4, y), f"own={own_m:.3f} cross={cross_m:.3f} text={text_m:.3f} other={other_m:.3f}  "
                           f"(text bars: gray=global/source, green=own/target, orange=other instance)",
@@ -302,9 +416,10 @@ def _render_state(args, maps, sample, out_dir, state_name, vmax_by_key):
         canvas.paste(_colorbar_strip(panel_w, cbar_h), (0, y))
         canvas.paste(_colorbar_strip(panel_w, cbar_h), (panel_w, y))
         y += cbar_h + 4
-        bar = _bar_chart(m['context_q_text'], m['group_id'], k + 1, canvas_w, bar_h)
+        bar = _bar_chart_split(m['context_q_text'], m['group_id'], k + 1, keep_mask, token_label,
+                                canvas_w, bar_h, bar_label_h, args.global_bar_frac)
         canvas.paste(bar, (0, y))
-        y += bar_h
+        y += bar_h + bar_label_h
         own_m, cross_m, text_m, other_m = m['context_q_stats']
         draw.text((4, y), f"own={own_m:.3f} cross={cross_m:.3f} text={text_m:.3f} other={other_m:.3f}",
                   fill=(0, 0, 0))
@@ -389,6 +504,8 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
     )
     group_id = _text_group_id(seq_len, instance_text_index_lst, device)
     real_ks = range(num_real) if args.instance_idx is None else sorted(args.instance_idx & set(range(num_real)))
+    keep_mask, token_label = _build_text_labels(pipe, sample, instance_text_index_lst, seq_len, args)
+    keep_mask = keep_mask.cpu().numpy()
 
     A_after = torch.softmax(captured_after['z'], dim=-1)
     A_before = torch.softmax(captured_before['z'], dim=-1)
@@ -412,8 +529,8 @@ def run_sample(args, pipe, attn_proc, parallel_attn_proc, sample, device, out_di
         vals = [mm[key].max() for maps in (maps_after, maps_before) for mm in maps.values() if key in mm]
         vmax_by_key[key] = max((float(v) for v in vals), default=1e-12) or 1e-12
 
-    _render_state(args, maps_after, sample, out_dir, "after_mice", vmax_by_key)
-    _render_state(args, maps_before, sample, out_dir, "before_open_spatial", vmax_by_key)
+    _render_state(args, maps_after, sample, out_dir, "after_mice", vmax_by_key, keep_mask, token_label)
+    _render_state(args, maps_before, sample, out_dir, "before_open_spatial", vmax_by_key, keep_mask, token_label)
 
 
 def main():
