@@ -20,12 +20,11 @@ using the source-image latents as mu_k (x1_hat is unknown before the first forwa
 proximity(k, j) = exp(-gap(k, j) / tau), gap = min token distance - 1  (1 when touching)
 similarity(k, j) = max(0, cos(mu_k - mu_all, mu_j - mu_all)) (or 1 if disabled)
 
-Diffusion drift (noise_ratio > 0): on top of the deterministic push, every token of instance k
-also gets independent Gaussian noise,
-    n_token = noise_ratio * sigma_{i+1}^power * walk_k * min(1, sum_j w_kj) * eps / sqrt(C)
-so its per-token norm is noise_ratio x this step's walk, scaled down for instances with no
-close/similar neighbor. Zero-mean, so it doesn't move mu_k; it decorrelates instance regions
-from each other instead of painting a uniform offset. strength=0 gives noise only.
+Direction jitter (jitter_deg > 0): instead of every token of instance k moving along exactly d_k,
+each token moves the same distance ||d_k|| but along a direction tilted by exactly jitter_deg
+away from d_k, toward its own random perpendicular direction:
+    d_token = ||d_k|| * (cos(theta) * d_k_hat + sin(theta) * e_token),  e_token random, unit, _|_ d_k
+The coherent (shared) component is cos(theta) * d_k; the rest differs per token.
 """
 from dataclasses import dataclass, field
 
@@ -40,15 +39,15 @@ class InstanceDrift:
     use_similarity: bool = True
     drift_init: bool = False
     init_strength: float = 0.1
-    noise_ratio: float = 0.0
-    noise_seed: int = 0
+    jitter_deg: float = 0.0
+    jitter_seed: int = 0
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device, dtype=torch.float32):
         """masks_2d: per-instance [Ht, Wt] token-grid masks. Precomputes flat token masks and
         the pairwise proximity weights."""
         self.stats = []
-        self.generator = torch.Generator(device=device).manual_seed(self.noise_seed)
+        self.generator = torch.Generator(device=device).manual_seed(self.jitter_seed)
         Ht, Wt = masks_2d[0].shape
         flat = torch.stack([m.reshape(-1) > 0.5 for m in masks_2d]).to(device)  # [K, HW]
         self.masks = flat
@@ -92,7 +91,20 @@ class InstanceDrift:
         """latents: [B, HW, C]; d: [K, C]. Tokens in several masks get the mean of their drifts."""
         cover = self.mask_w.sum(dim=0).clamp_min(1.0)  # [HW]
         field_ = (self.mask_w.T @ d) / cover[:, None]  # [HW, C]
+        if self.jitter_deg > 0.0:
+            field_ = self._jitter(field_)
         return (latents.float() + field_[None]).to(latents.dtype)
+
+    def _jitter(self, field_: torch.Tensor) -> torch.Tensor:
+        """Tilt each token's drift by exactly jitter_deg toward a random perpendicular direction,
+        keeping its length. Tokens with no drift stay at zero."""
+        mag = field_.norm(dim=-1, keepdim=True)  # [HW, 1]
+        u = field_ / mag.clamp_min(1e-12)
+        eps = torch.randn(field_.shape, generator=self.generator, device=field_.device)
+        eps = eps - (eps * u).sum(dim=-1, keepdim=True) * u
+        e = torch.nn.functional.normalize(eps, dim=-1)
+        theta = torch.tensor(self.jitter_deg * torch.pi / 180.0)
+        return mag * (torch.cos(theta) * u + torch.sin(theta) * e)
 
     def init_noise(self, latents: torch.Tensor, image_latents: torch.Tensor) -> torch.Tensor:
         """Drift the initial noise using the source-image latents as instance identities.
@@ -111,7 +123,7 @@ class InstanceDrift:
              sigma: float, sigma_next: float, step_idx: int) -> torch.Tensor:
         """Called right after the Euler step. latents: x_t before the step, noise_pred: v at x_t,
         latents_next: x_{t+1}. Returns drifted x_{t+1}."""
-        if self.masks.shape[0] < 2 or sigma_next <= 0.0 or (self.strength == 0.0 and self.noise_ratio == 0.0):
+        if self.masks.shape[0] < 2 or sigma_next <= 0.0 or self.strength == 0.0:
             return latents_next
         v = noise_pred[0].float()
         x1_hat = latents[0].float() - sigma * v
@@ -124,16 +136,7 @@ class InstanceDrift:
         d = self.strength * decay * walk[:, None] * dirs
         out = self._apply(latents_next, d)
 
-        noise_scale = torch.zeros_like(walk)
-        if self.noise_ratio > 0.0:
-            noise_scale = self.noise_ratio * decay * walk * w.sum(dim=1).clamp(max=1.0)  # [K]
-            C = v.shape[-1]
-            eps = torch.randn(v.shape, generator=self.generator, device=v.device) / C ** 0.5  # [HW, C]
-            cover = self.mask_w.sum(dim=0).clamp_min(1.0)
-            token_scale = (self.mask_w.T @ noise_scale) / cover  # [HW]
-            out = (out.float() + (token_scale[:, None] * eps)[None]).to(latents_next.dtype)
-
         self.stats.append(dict(step=step_idx, sigma=sigma, sigma_next=sigma_next, weights=w.tolist(),
                                walk=walk.tolist(), drift_norm=d.norm(dim=-1).tolist(),
-                               noise_norm=noise_scale.tolist(), mu_dist=torch.cdist(mu, mu).tolist()))
+                               mu_dist=torch.cdist(mu, mu).tolist()))
         return out

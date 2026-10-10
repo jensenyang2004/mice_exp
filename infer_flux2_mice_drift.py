@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument("--exp_name", type=str, required=True, help="Experiment name for results subfolder")
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples (for debugging)")
     parser.add_argument("--sample_ids", type=str, default=None, help="Comma list of sample ids to run (default: all)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Regenerate samples even if a result already exists in the output folder")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_id", type=int, default=0)
@@ -80,9 +82,9 @@ def parse_args():
                         help="Don't weight the drift by semantic similarity between instances")
     parser.add_argument("--drift_init_strength", type=float, default=0.0,
                         help="Also drift the initial noise (fraction of per-token noise norm; 0 disables)")
-    parser.add_argument("--drift_noise_ratio", type=float, default=0.0,
-                        help="Diffusion drift: per-token Gaussian noise inside instances, as a fraction of each "
-                             "instance's per-step walk (0 disables). Use with --drift_strength 0 for noise only")
+    parser.add_argument("--drift_jitter_deg", type=float, default=0.0,
+                        help="Tilt each token's drift direction by this many degrees toward its own random "
+                             "perpendicular direction, keeping its length (0 = uniform push, 90 = no shared part)")
 
     args = parser.parse_args()
 
@@ -160,8 +162,20 @@ def main():
 
     save_dir = Path(args.output_dir) / f"mice_flux2_klein_drift_{args.exp_name}"
     save_dir.mkdir(parents=True, exist_ok=True)
-    with open(save_dir / "args.json", "w") as f:
-        json.dump({k: (sorted(v) if isinstance(v, set) else v) for k, v in vars(args).items()}, f, indent=2)
+    # Existing results are skipped, so a folder must never mix settings: refuse to reuse one made
+    # with different generation args (run-control args like sample selection/device may differ).
+    run_control = {"num_samples", "sample_ids", "device", "num_shards", "shard_id", "multi_gpu", "overwrite"}
+    settings = {k: v for k, v in vars(args).items() if k not in run_control}
+    args_path = save_dir / "args.json"
+    if args_path.exists() and not args.overwrite:
+        with open(args_path) as f:
+            old = {k: v for k, v in json.load(f).items() if k not in run_control}
+        diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys() if old.get(k) != settings.get(k)}
+        if diff:
+            raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
+                             f"Use a new --exp_name, or --overwrite to regenerate everything here.")
+    with open(args_path, "w") as f:
+        json.dump(settings, f, indent=2)
     logger.info(f"Results will be saved to {save_dir}")
 
     pipe = load_pipeline(args, device)
@@ -182,8 +196,8 @@ def main():
         use_similarity=not args.drift_no_similarity,
         drift_init=args.drift_init_strength > 0,
         init_strength=args.drift_init_strength,
-        noise_ratio=args.drift_noise_ratio,
-        noise_seed=SEED,
+        jitter_deg=args.drift_jitter_deg,
+        jitter_seed=SEED,
     )
     logger.info(f"Instance drift: {drift}")
 
@@ -199,7 +213,8 @@ def main():
             if args.sample_ids is not None and sample_id not in args.sample_ids:
                 continue
             save_path = save_dir / f"{sample_id}_result.png"
-            if save_path.exists():
+            if save_path.exists() and not args.overwrite:
+                logger.info(f"Skipping {sample_id}: result already exists")
                 continue
 
             for proc in (attn_proc, parallel_attn_proc):

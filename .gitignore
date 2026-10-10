@@ -1,6 +1,6 @@
 /mice_attn_capture_capture
 /mice_attn_capture_capture_v2
-
+/drift_latent_exp
 __pycache__/
 *.py[cod]
 *$py.class
