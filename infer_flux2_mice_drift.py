@@ -80,6 +80,9 @@ def parse_args():
                         help="Don't weight the drift by semantic similarity between instances")
     parser.add_argument("--drift_init_strength", type=float, default=0.0,
                         help="Also drift the initial noise (fraction of per-token noise norm; 0 disables)")
+    parser.add_argument("--drift_noise_ratio", type=float, default=0.0,
+                        help="Diffusion drift: per-token Gaussian noise inside instances, as a fraction of each "
+                             "instance's per-step walk (0 disables). Use with --drift_strength 0 for noise only")
 
     args = parser.parse_args()
 
@@ -179,6 +182,8 @@ def main():
         use_similarity=not args.drift_no_similarity,
         drift_init=args.drift_init_strength > 0,
         init_strength=args.drift_init_strength,
+        noise_ratio=args.drift_noise_ratio,
+        noise_seed=SEED,
     )
     logger.info(f"Instance drift: {drift}")
 
