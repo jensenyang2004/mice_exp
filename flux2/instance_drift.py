@@ -25,6 +25,12 @@ each token moves the same distance ||d_k|| but along a direction tilted away fro
 random angle theta_token ~ Uniform[0, jitter_deg], toward its own random perpendicular direction:
     d_token = ||d_k|| * (cos(theta_token) * d_k_hat + sin(theta_token) * e_token),  e_token random, unit, _|_ d_k
 The coherent (shared) component is E[cos(theta_token)] * d_k; the rest differs per token.
+
+Init release (init_release r > 0): the init push D (a per-token field) is treated like part of the
+noise, which the schedule scales by sigma. After each step i, (sigma_i - sigma_{i+1}) * r * D is
+subtracted, so the leftover init push is (1 - r + r * sigma) * D and, at sigma=0, (1 - r) * D.
+The last step's share is subtracted from the final latent directly. Runs even when the per-step
+push is off (strength=0).
 """
 from dataclasses import dataclass, field
 
@@ -41,12 +47,14 @@ class InstanceDrift:
     init_strength: float = 0.1
     jitter_deg: float = 0.0
     jitter_seed: int = 0
+    init_release: float = 0.0
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device, dtype=torch.float32):
         """masks_2d: per-instance [Ht, Wt] token-grid masks. Precomputes flat token masks and
         the pairwise proximity weights."""
         self.stats = []
+        self.init_field = None
         self.generator = torch.Generator(device=device).manual_seed(self.jitter_seed)
         Ht, Wt = masks_2d[0].shape
         flat = torch.stack([m.reshape(-1) > 0.5 for m in masks_2d]).to(device)  # [K, HW]
@@ -87,12 +95,16 @@ class InstanceDrift:
         dirs = (w[..., None] * u).sum(dim=1)  # [K, C]; magnitude encodes sum of weights
         return dirs, w, mu
 
-    def _apply(self, latents: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
-        """latents: [B, HW, C]; d: [K, C]. Tokens in several masks get the mean of their drifts."""
+    def _field(self, d: torch.Tensor) -> torch.Tensor:
+        """d: [K, C] -> per-token drift field [HW, C]. Tokens in several masks get the mean of their drifts."""
         cover = self.mask_w.sum(dim=0).clamp_min(1.0)  # [HW]
         field_ = (self.mask_w.T @ d) / cover[:, None]  # [HW, C]
         if self.jitter_deg > 0.0:
             field_ = self._jitter(field_)
+        return field_
+
+    @staticmethod
+    def _add(latents: torch.Tensor, field_: torch.Tensor) -> torch.Tensor:
         return (latents.float() + field_[None]).to(latents.dtype)
 
     def _jitter(self, field_: torch.Tensor) -> torch.Tensor:
@@ -117,12 +129,15 @@ class InstanceDrift:
         d = self.init_strength * token_norm * dirs
         self.stats.append(dict(step="init", weights=w.tolist(), drift_norm=d.norm(dim=-1).tolist(),
                                mu_dist=torch.cdist(mu, mu).tolist()))
-        return self._apply(latents, d)
+        self.init_field = self._field(d)
+        return self._add(latents, self.init_field)
 
     def step(self, latents_next: torch.Tensor, latents: torch.Tensor, noise_pred: torch.Tensor,
              sigma: float, sigma_next: float, step_idx: int) -> torch.Tensor:
         """Called right after the Euler step. latents: x_t before the step, noise_pred: v at x_t,
         latents_next: x_{t+1}. Returns drifted x_{t+1}."""
+        if self.init_field is not None and self.init_release > 0.0:
+            latents_next = self._add(latents_next, -self.init_release * (sigma - sigma_next) * self.init_field)
         if self.masks.shape[0] < 2 or sigma_next <= 0.0 or self.strength == 0.0:
             return latents_next
         v = noise_pred[0].float()
@@ -134,7 +149,7 @@ class InstanceDrift:
                                           self.mask_w.sum(dim=1).clamp_min(1.0)).sqrt()  # [K]
         decay = sigma_next ** self.power
         d = self.strength * decay * walk[:, None] * dirs
-        out = self._apply(latents_next, d)
+        out = self._add(latents_next, self._field(d))
 
         self.stats.append(dict(step=step_idx, sigma=sigma, sigma_next=sigma_next, weights=w.tolist(),
                                walk=walk.tolist(), drift_norm=d.norm(dim=-1).tolist(),

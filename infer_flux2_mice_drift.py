@@ -82,6 +82,9 @@ def parse_args():
                         help="Don't weight the drift by semantic similarity between instances")
     parser.add_argument("--drift_init_strength", type=float, default=0.0,
                         help="Also drift the initial noise (fraction of per-token noise norm; 0 disables)")
+    parser.add_argument("--drift_init_release", type=float, default=0.0,
+                        help="Fraction of the init push taken back during the flow, in proportion to the sigma "
+                             "drop each step (1 = fully gone at sigma=0, 0 = kept)")
     parser.add_argument("--drift_jitter_deg", type=float, default=0.0,
                         help="Tilt each token's drift direction by a random angle of at most this many degrees, "
                              "toward its own random perpendicular direction, keeping its length (0 = uniform push)")
@@ -197,6 +200,7 @@ def main():
         drift_init=args.drift_init_strength > 0,
         init_strength=args.drift_init_strength,
         jitter_deg=args.drift_jitter_deg,
+        init_release=args.drift_init_release,
         jitter_seed=SEED,
     )
     logger.info(f"Instance drift: {drift}")
