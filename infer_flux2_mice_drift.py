@@ -83,8 +83,8 @@ def parse_args():
     parser.add_argument("--drift_init_strength", type=float, default=0.0,
                         help="Also drift the initial noise (fraction of per-token noise norm; 0 disables)")
     parser.add_argument("--drift_jitter_deg", type=float, default=0.0,
-                        help="Tilt each token's drift direction by this many degrees toward its own random "
-                             "perpendicular direction, keeping its length (0 = uniform push, 90 = no shared part)")
+                        help="Tilt each token's drift direction by a random angle of at most this many degrees, "
+                             "toward its own random perpendicular direction, keeping its length (0 = uniform push)")
 
     args = parser.parse_args()
 

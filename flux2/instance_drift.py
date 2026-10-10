@@ -21,10 +21,10 @@ proximity(k, j) = exp(-gap(k, j) / tau), gap = min token distance - 1  (1 when t
 similarity(k, j) = max(0, cos(mu_k - mu_all, mu_j - mu_all)) (or 1 if disabled)
 
 Direction jitter (jitter_deg > 0): instead of every token of instance k moving along exactly d_k,
-each token moves the same distance ||d_k|| but along a direction tilted by exactly jitter_deg
-away from d_k, toward its own random perpendicular direction:
-    d_token = ||d_k|| * (cos(theta) * d_k_hat + sin(theta) * e_token),  e_token random, unit, _|_ d_k
-The coherent (shared) component is cos(theta) * d_k; the rest differs per token.
+each token moves the same distance ||d_k|| but along a direction tilted away from d_k by its own
+random angle theta_token ~ Uniform[0, jitter_deg], toward its own random perpendicular direction:
+    d_token = ||d_k|| * (cos(theta_token) * d_k_hat + sin(theta_token) * e_token),  e_token random, unit, _|_ d_k
+The coherent (shared) component is E[cos(theta_token)] * d_k; the rest differs per token.
 """
 from dataclasses import dataclass, field
 
@@ -96,14 +96,14 @@ class InstanceDrift:
         return (latents.float() + field_[None]).to(latents.dtype)
 
     def _jitter(self, field_: torch.Tensor) -> torch.Tensor:
-        """Tilt each token's drift by exactly jitter_deg toward a random perpendicular direction,
-        keeping its length. Tokens with no drift stay at zero."""
+        """Tilt each token's drift by a random angle in [0, jitter_deg] toward a random perpendicular
+        direction, keeping its length. Tokens with no drift stay at zero."""
         mag = field_.norm(dim=-1, keepdim=True)  # [HW, 1]
         u = field_ / mag.clamp_min(1e-12)
         eps = torch.randn(field_.shape, generator=self.generator, device=field_.device)
         eps = eps - (eps * u).sum(dim=-1, keepdim=True) * u
         e = torch.nn.functional.normalize(eps, dim=-1)
-        theta = torch.tensor(self.jitter_deg * torch.pi / 180.0)
+        theta = torch.rand(mag.shape, generator=self.generator, device=field_.device) * (self.jitter_deg * torch.pi / 180.0)
         return mag * (torch.cos(theta) * u + torch.sin(theta) * e)
 
     def init_noise(self, latents: torch.Tensor, image_latents: torch.Tensor) -> torch.Tensor:
