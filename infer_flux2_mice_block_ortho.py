@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from torch.utils.data import DataLoader, Subset
 from loguru import logger
 
 from mice_dataset import get_mice_dataloader
@@ -205,19 +206,26 @@ def main():
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
                                      num_shards=args.num_shards, shard_id=args.shard_id)
+    # Select samples by id BEFORE loading: the dataset decodes/resizes the image and reads every mask
+    # in __getitem__, but the ids are known up front from the json.
+    ds = dataloader.dataset
+    base, indices = (ds.dataset, list(ds.indices)) if isinstance(ds, Subset) else (ds, list(range(len(ds))))
+    if args.num_samples:
+        indices = indices[:args.num_samples]
+    n_requested = len(indices)
+    if args.sample_ids is not None:
+        indices = [j for j in indices if base.sorted_ids[j] in args.sample_ids]
+    if not args.overwrite:
+        indices = [j for j in indices if not (save_dir / f"{base.sorted_ids[j]}_result.png").exists()]
+    logger.info(f"{len(indices)} samples to run ({n_requested - len(indices)} filtered out by --sample_ids "
+                f"or already done)")
+    dataloader = DataLoader(Subset(base, indices), batch_size=1, shuffle=False,
+                            collate_fn=dataloader.collate_fn)
 
-    for i, batch in enumerate(tqdm(dataloader)):
-        if args.num_samples and i >= args.num_samples:
-            break
-
+    for batch in tqdm(dataloader):
         for sample in batch:
             sample_id = sample['sample_id']
-            if args.sample_ids is not None and sample_id not in args.sample_ids:
-                continue
             save_path = save_dir / f"{sample_id}_result.png"
-            if save_path.exists() and not args.overwrite:
-                logger.info(f"Skipping {sample_id}: result already exists")
-                continue
 
             for proc in (attn_proc, parallel_attn_proc):
                 if proc and hasattr(proc, 'clear_cached_masks'):
