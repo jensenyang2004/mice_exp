@@ -104,9 +104,10 @@ def parse_args():
                              "between neighboring instances where they meet (1 ~ x0.37 weight). 0 = off")
     parser.add_argument("--gap_tau", type=float, default=2.0,
                         help="Contact gap falloff in tokens away from the contact")
-    parser.add_argument("--gap_ring", type=int, default=1,
-                        help="Grow every instance region by this many tokens before carving the gap "
-                             "(the resized masks under-cover the object)")
+    parser.add_argument("--gap_margin", type=int, default=1,
+                        help="Margin (tokens, square neighbourhood) around the QUERYING instance that is never "
+                             "dimmed: the resized masks under-cover the object, so those tokens may hold its own "
+                             "content. Other instances are not grown")
     parser.add_argument("--gap_steps", type=str, default="all", help="Denoising steps for the gap, or \"all\"")
     parser.add_argument("--gap_exclude_double", type=str, default="",
                         help="Double-stream blocks without the gap (same syntax as --exclude_double)")
@@ -198,7 +199,7 @@ def auto_exp_name(args) -> str:
             if blocks:
                 parts.append(f"{tag}ex{kind[0]}" + fmt_blocks(blocks))
     if args.gap_lambda > 0:
-        parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gr{args.gap_ring}_gs"
+        parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gm{args.gap_margin}_gs"
                      + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
         if args.gap_exclude_double:
             parts.append("gexd" + fmt_blocks(args.gap_exclude_double))
@@ -292,7 +293,7 @@ def main():
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"))
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
-    gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, ring=args.gap_ring, steps=args.gap_steps,
+    gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),
                      exclude_single=resolve(args.gap_exclude_single, n_single))
     if gap.lam > 0:

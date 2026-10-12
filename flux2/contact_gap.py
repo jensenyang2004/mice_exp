@@ -3,14 +3,18 @@ Contact gap: a small, local negative bias on latent-to-latent self-attention bet
 instances, only where they meet. The reverse of MICE's smooth mask (which cuts more the farther a
 key is from the instance): here nothing is cut except a thin gap at each contact.
 
-Each instance region is grown by a ring of `ring` tokens (nearest-resized masks under-cover the
-object, so the ring tokens still contain it). For every ordered pair (k, j):
-    query weight   q_kj(t) = exp(-max(dist_j(t) - 1, 0) / tau)   for t in ring(k), t not in j
-    key weight     q_jk(s) = exp(-max(dist_k(s) - 1, 0) / tau)   for s in ring(j), s not in k
+Only the QUERYING instance gets a margin: nearest-resized masks under-cover the object, so the
+tokens just outside k (within `margin` tokens, square neighbourhood) may still hold k's own
+content, and k must stay free to read them. Other instances are never grown -- growing them would
+only hand them more of the contact. For every ordered pair (k, j):
+    queries        t in mask(k)
+    keys           s in mask(j), s outside margin(k) = dilate(mask(k), margin)
+    query weight   q_kj(t) = exp(-max(dist_j(t) - 1, 0) / tau)              1 at the contact
+    key weight     q_jk(s) = exp(-max(cheb_k(s) - 1 - margin, 0) / tau)     1 at the first key past k's margin
     bias(t -> s)   = -lam * max over pairs of q_kj(t) * q_jk(s)
-dist_j(t) is the token distance from t to the nearest token of j's (un-grown) mask, so both
-weights are 1 at the contact and fade inward. A token's attention to its own instance is never
-biased. lam is in logit units: lam = 1 scales an attention weight by e^-1 ~ 0.37 before
+dist_j is the Euclidean token distance to j's mask, cheb_k the Chebyshev (square) distance to k's
+mask, matching the max-pool dilation of the margin. A token's attention to its own instance, to
+its own margin, to the background and to the source image is never biased. lam is in logit units: lam = 1 scales an attention weight by e^-1 ~ 0.37 before
 renormalization -- a dimming, not a mask.
 
 Attached without touching the processor: the MICE processor module's `dispatch_attention_fn` is
@@ -27,7 +31,7 @@ import torch
 class ContactGap:
     lam: float = 0.0
     tau: float = 2.0
-    ring: int = 1
+    margin: int = 1
     steps: list | None = None  # denoising step indices to act on; None = all
     exclude_double: list = field(default_factory=list)
     exclude_single: list = field(default_factory=list)
@@ -45,25 +49,32 @@ class ContactGap:
             if masks[j].any():
                 cj = coords[masks[j]]
                 dist[j] = torch.cat([torch.cdist(chunk, cj).min(dim=1).values for chunk in coords.split(1024)])
-        grown = dist <= self.ring  # [K, HW], includes the mask itself (dist 0)
+        cheb = torch.full((K, self.HW), float("inf"), device=device)  # square-neighbourhood distance
+        for j in range(K):
+            if masks[j].any():
+                cj = coords[masks[j]]
+                cheb[j] = torch.cat([torch.cdist(chunk, cj, p=float("inf")).min(dim=1).values
+                                     for chunk in coords.split(1024)])
+        own_margin = cheb <= self.margin  # [K, HW], mask(k) plus its margin
 
         gap = torch.zeros(self.HW, self.HW, device=device)
         for k in range(K):
             for j in range(K):
                 if k == j:
                     continue
-                q = torch.exp(-(dist[j] - 1.0).clamp_min(0.0) / self.tau) * (grown[k] & ~masks[j])
-                s = torch.exp(-(dist[k] - 1.0).clamp_min(0.0) / self.tau) * (grown[j] & ~masks[k])
+                q = torch.exp(-(dist[j] - 1.0).clamp_min(0.0) / self.tau) * (masks[k] & ~masks[j])
+                s = (torch.exp(-(cheb[k] - 1.0 - self.margin).clamp_min(0.0) / self.tau)
+                     * (masks[j] & ~own_margin[k]))
                 rows, cols = (q > 1e-3).nonzero().squeeze(1), (s > 1e-3).nonzero().squeeze(1)
                 if len(rows) == 0 or len(cols) == 0:
                     continue
                 block = torch.outer(q[rows], s[cols])
                 gap[rows[:, None], cols] = torch.maximum(gap[rows[:, None], cols], block)
         self.bias = -self.lam * gap  # [HW, HW], query rows x key cols
-        self.stats = dict(lam=self.lam, tau=self.tau, ring=self.ring,
+        self.stats = dict(lam=self.lam, tau=self.tau, margin=self.margin,
                           biased_pairs_frac=float((gap > 1e-3).float().mean()),
                           biased_queries=int((gap > 1e-3).any(dim=1).sum()),
-                          grown_tokens=[int(g.sum()) for g in grown])
+                          margin_tokens=[int((own_margin[k] & ~masks[k]).sum()) for k in range(K)])
         self._cache = {}
         self.step_idx, self.layer = None, None
 
