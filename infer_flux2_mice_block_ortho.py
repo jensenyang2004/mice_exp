@@ -50,7 +50,7 @@ def parse_args():
                         help="Optional prefix for the results subfolder; the steering settings are always "
                              "appended automatically (e.g. a10_b0_p1_t4_sall_exclude_none)")
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples (for debugging)")
-    parser.add_argument("--sample_ids", type=str, default=None, help="Comma list of sample ids to run (default: all)")
+    parser.add_argument("--sample_ids", type=str, default=None, help="Comma list of sample ids to run, or \"all\" (default: all)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Regenerate samples even if a result already exists in the output folder")
     parser.add_argument("--device", type=str, default=None)
@@ -158,7 +158,8 @@ def parse_args():
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
                 "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
-    args.sample_ids = None if args.sample_ids is None else set(args.sample_ids.split(','))
+    args.sample_ids = (None if args.sample_ids is None or args.sample_ids.lower() == "all"
+                       else set(args.sample_ids.split(',')))
 
     if not (0 <= args.shard_id < args.num_shards):
         parser.error(f"--shard_id must be in [0, {args.num_shards})")
