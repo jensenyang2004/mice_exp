@@ -19,7 +19,10 @@ def main():
     files = sorted(Path(args.folder).glob("*_block_ortho.json"))
     rows = defaultdict(lambda: defaultdict(list))
     for f in files:
-        for s in json.load(open(f)):
+        data = json.load(open(f))
+        if isinstance(data, dict):  # run with the contact gap: {"steering": [...], "gap": {...}}
+            data = data["steering"]
+        for s in data:
             if args.step is not None and s["step"] != args.step:
                 continue
             key = (s["step"], s["layer"])

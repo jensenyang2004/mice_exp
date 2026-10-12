@@ -29,6 +29,8 @@ from flux2.transformer_flux2_klein import Flux2Attention, Flux2ParallelSelfAtten
 from flux2.attention import get_attention_processors, AttentionSetting
 from flux2.pipeline_utils import create_position_mask_list, resize_mask
 from flux2.block_ortho import BlockOrtho
+from flux2.contact_gap import ContactGap
+import flux2.attention.attention_processor_APITASM_kernel_nonlap as mice_attn_module
 
 SEED = 0
 torch.manual_seed(SEED)
@@ -96,6 +98,20 @@ def parse_args():
                         help=">=0: don't steer a token away from neighbor j if it is within this many tokens of "
                              "j (1 = overlapping or touching tokens, which hold both instances). -1 = off")
     parser.add_argument("--ortho_steps", type=str, default="all", help="Denoising steps to act on, or \"all\"")
+
+    parser.add_argument("--gap_lambda", type=float, default=0.0,
+                        help="Contact gap (flux2/contact_gap.py): logit bias -lambda on latent->latent attention "
+                             "between neighboring instances where they meet (1 ~ x0.37 weight). 0 = off")
+    parser.add_argument("--gap_tau", type=float, default=2.0,
+                        help="Contact gap falloff in tokens away from the contact")
+    parser.add_argument("--gap_ring", type=int, default=1,
+                        help="Grow every instance region by this many tokens before carving the gap "
+                             "(the resized masks under-cover the object)")
+    parser.add_argument("--gap_steps", type=str, default="all", help="Denoising steps for the gap, or \"all\"")
+    parser.add_argument("--gap_exclude_double", type=str, default="",
+                        help="Double-stream blocks without the gap (same syntax as --exclude_double)")
+    parser.add_argument("--gap_exclude_single", type=str, default="",
+                        help="Single-stream blocks without the gap (same syntax as --exclude_single)")
     parser.add_argument("--exclude_double", type=str, default="",
                         help="Double-stream block indices to leave untouched: comma list, ranges as start:end "
                              "(end exclusive), or \"all\". e.g. \"0\", \"all\"")
@@ -137,8 +153,9 @@ def parse_args():
                 out.append(int(item))
         return out
 
+    args.gap_steps = None if args.gap_steps == "all" else str2list(args.gap_steps)
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
-                "beta_exclude_double", "beta_exclude_single"):
+                "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = None if args.sample_ids is None else set(args.sample_ids.split(','))
 
@@ -180,13 +197,20 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"{term}_exclude_{kind}")
             if blocks:
                 parts.append(f"{tag}ex{kind[0]}" + fmt_blocks(blocks))
+    if args.gap_lambda > 0:
+        parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gr{args.gap_ring}_gs"
+                     + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
+        if args.gap_exclude_double:
+            parts.append("gexd" + fmt_blocks(args.gap_exclude_double))
+        if args.gap_exclude_single:
+            parts.append("gexs" + fmt_blocks(args.gap_exclude_single))
     if not args.free_latent:
         parts.append("nofree")
     name = "_".join(parts)
     return f"{args.exp_name}_{name}" if args.exp_name else name
 
 
-def run_with_ortho(pipe, ortho: BlockOrtho, sample, use_masks: bool, **pipe_kwargs):
+def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, sample, use_masks: bool, **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`)."""
     orig_prepare_latents = pipe.prepare_latents
 
@@ -199,16 +223,20 @@ def run_with_ortho(pipe, ortho: BlockOrtho, sample, use_masks: bool, **pipe_kwar
         else:
             masks = create_position_mask_list(sample['bboxes'], height, width, pipe.vae_scale_factor)
         ortho.setup(masks, device=latents.device)
+        gap.setup(masks, device=latents.device)
         return latents, latent_ids
 
     def _pre_forward(module, args, kwargs):
         i = pipe.scheduler.step_index if pipe.scheduler.step_index is not None else pipe.scheduler.begin_index
         ortho.begin_forward(sigmas=pipe.scheduler.sigmas.tolist(), step_idx=i,
                             img_len=kwargs['hidden_states'].shape[1])
+        gap.begin_forward(step_idx=i)
 
     pipe.prepare_latents = _prepare_latents
     handles = [pipe.transformer.register_forward_pre_hook(_pre_forward, with_kwargs=True)]
     handles += ortho.attach(pipe.transformer)
+    if gap.lam > 0:
+        handles += gap.attach(pipe.transformer, mice_attn_module)
     try:
         return pipe(**pipe_kwargs)
     finally:
@@ -264,6 +292,13 @@ def main():
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"))
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
+    gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, ring=args.gap_ring, steps=args.gap_steps,
+                     exclude_double=resolve(args.gap_exclude_double, n_double),
+                     exclude_single=resolve(args.gap_exclude_single, n_single))
+    if gap.lam > 0:
+        if attn_setting_enum.value.lower() != "apitasmkernelnonlap":
+            raise SystemExit("--gap_lambda needs --attention_setting apitasmkernelnonlap")
+        logger.info(f"Contact gap: {gap}")
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
                                      num_shards=args.num_shards, shard_id=args.shard_id)
@@ -304,7 +339,7 @@ def main():
 
             try:
                 result = run_with_ortho(
-                    pipe, ortho, sample, args.use_masks,
+                    pipe, ortho, gap, sample, args.use_masks,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
@@ -333,7 +368,7 @@ def main():
                     generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
                 generated_image.save(save_path)
                 with open(save_dir / f"{sample_id}_block_ortho.json", "w") as f:
-                    json.dump(ortho.stats, f)
+                    json.dump(ortho.stats if gap.lam <= 0 else {"steering": ortho.stats, "gap": gap.stats}, f)
                 logger.info(f"Saved result to {save_path}")
                 del result, generated_image
             except torch.cuda.OutOfMemoryError as e:

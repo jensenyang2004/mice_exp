@@ -73,6 +73,7 @@ The same α/β split, applied to each transformer block's write (h_out − h_in)
 | `power` (σ decay) | Almost no effect on klein at 4 steps, because σ ≈ 1 until the last step |
 | **α by block** (steps 0,1, α = 0.9) | All blocks ≈ excluding singles 10–19 ≈ excluding singles 5–19. Excluding all singles gives much worse separation. Fidelity improves slightly as more late singles are excluded |
 | **β by block** (α = 0) | Steering only the double blocks keeps most of the separation and removes most of the fidelity and colour-patch damage |
+| **Local pair weights** (`--ortho_local_tau`, α = 0.9, β = 0.5) | Each token is steered only from the neighbour it is near. Visibly better image quality than global weights at the same α/β; separation unchanged (no gain, no loss) |
 | **Overall** | Much better than flow level, but **not close to MICE's separation**. Harmonization against MICE is mixed, case by case. With MICE's text binding on, disentanglement is better than the colour-point method's |
 
 ## Established facts
