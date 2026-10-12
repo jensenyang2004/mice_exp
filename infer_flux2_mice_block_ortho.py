@@ -81,15 +81,25 @@ def parse_args():
                              "every hooked block, so the effect compounds over ~25 blocks: start small")
     parser.add_argument("--ortho_beta", type=float, default=0.0,
                         help="How much to amplify the rest of every block's write (the instance's own part)")
-    parser.add_argument("--ortho_power", type=float, default=1.0, help="alpha/beta decay as sigma ** power")
+    parser.add_argument("--ortho_power", type=float, default=1.0, help="Exponent of the per-step factor")
+    parser.add_argument("--ortho_schedule", type=str, default="sigma", choices=["sigma", "budget"],
+                        help="Per-step factor on alpha/beta. sigma: sigma_i^power (~1 for steps 0-2 on klein). "
+                             "budget: (dsigma_0/dsigma_i)^power, so every step writes the same amount of edit "
+                             "into the latent (multipliers ~1, 0.56, 0.23, 0.04 at power 1)")
     parser.add_argument("--ortho_tau", type=float, default=4.0,
                         help="Proximity falloff in tokens: weight = exp(-gap / tau)")
     parser.add_argument("--ortho_steps", type=str, default="all", help="Denoising steps to act on, or \"all\"")
     parser.add_argument("--exclude_double", type=str, default="",
-                        help="Comma list of double-stream block indices to leave untouched (e.g. \"0\")")
+                        help="Double-stream block indices to leave untouched: comma list, ranges as start:end "
+                             "(end exclusive), or \"all\". e.g. \"0\", \"all\"")
     parser.add_argument("--exclude_single", type=str, default="",
-                        help="Comma list of single-stream block indices to leave untouched (e.g. \"19\"; "
-                             "negative indices count from the end)")
+                        help="Single-stream block indices to leave untouched, same syntax; negative indices "
+                             "count from the end. e.g. \"-1\", \"0:10\", \"10:20\", \"all\"")
+    for term in ("alpha", "beta"):
+        for kind in ("double", "single"):
+            parser.add_argument(f"--{term}_exclude_{kind}", type=str, default="",
+                                help=f"{kind.capitalize()}-stream blocks where only {term} is switched off "
+                                     f"(same syntax as --exclude_{kind}); applied on top of --exclude_{kind}")
 
     args = parser.parse_args()
 
@@ -105,8 +115,24 @@ def parse_args():
     args.hard_image_attribute_binding_list_double = parse_layer_range(args.hard_image_attribute_binding_list_double)
     args.hard_image_attribute_binding_list_single = parse_layer_range(args.hard_image_attribute_binding_list_single)
     args.ortho_steps = None if args.ortho_steps == "all" else str2list(args.ortho_steps)
-    args.exclude_double = str2list(args.exclude_double) if args.exclude_double else []
-    args.exclude_single = str2list(args.exclude_single) if args.exclude_single else []
+    def parse_blocks(s):
+        """"0,3:5,-1" -> [0, 3, 4, -1]; "all" -> ["all"] (resolved once the block count is known)."""
+        if not s:
+            return []
+        if s == "all":
+            return ["all"]
+        out = []
+        for item in s.split(','):
+            if ':' in item:
+                a, b = item.split(':')
+                out += list(range(int(a), int(b)))
+            else:
+                out.append(int(item))
+        return out
+
+    for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
+                "beta_exclude_double", "beta_exclude_single"):
+        setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = None if args.sample_ids is None else set(args.sample_ids.split(','))
 
     if not (0 <= args.shard_id < args.num_shards):
@@ -116,18 +142,36 @@ def parse_args():
     return args
 
 
+def fmt_blocks(blocks) -> str:
+    """Compress consecutive runs for folder names: [0..9] -> "0to9", ["all"] -> "all"."""
+    if blocks == ["all"]:
+        return "all"
+    runs = []
+    for i in blocks:
+        if runs and i == runs[-1][1] + 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    return "-".join(f"{a}" if a == b else f"{a}to{b}" for a, b in runs)
+
+
 def auto_exp_name(args) -> str:
     """Folder name from the steering settings, e.g. a10_b0_p1_t4_sall_exclude_none (alpha/beta in %)."""
-    parts = [f"a{args.ortho_alpha * 100:g}", f"b{args.ortho_beta * 100:g}", f"p{args.ortho_power:g}",
+    parts = [f"a{args.ortho_alpha * 100:g}", f"b{args.ortho_beta * 100:g}", ("B" if args.ortho_schedule == "budget" else "") + f"p{args.ortho_power:g}",
              f"t{args.ortho_tau:g}",
              "sall" if args.ortho_steps is None else "s" + "-".join(map(str, args.ortho_steps))]
     if not args.exclude_double and not args.exclude_single:
         parts.append("exclude_none")
     else:
         if args.exclude_double:
-            parts.append("exd" + "-".join(map(str, args.exclude_double)))
+            parts.append("exd" + fmt_blocks(args.exclude_double))
         if args.exclude_single:
-            parts.append("exs" + "-".join(map(str, args.exclude_single)))
+            parts.append("exs" + fmt_blocks(args.exclude_single))
+    for term, tag in (("alpha", "a"), ("beta", "b")):
+        for kind in ("double", "single"):
+            blocks = getattr(args, f"{term}_exclude_{kind}")
+            if blocks:
+                parts.append(f"{tag}ex{kind[0]}" + fmt_blocks(blocks))
     if not args.free_latent:
         parts.append("nofree")
     name = "_".join(parts)
@@ -151,7 +195,7 @@ def run_with_ortho(pipe, ortho: BlockOrtho, sample, use_masks: bool, **pipe_kwar
 
     def _pre_forward(module, args, kwargs):
         i = pipe.scheduler.step_index if pipe.scheduler.step_index is not None else pipe.scheduler.begin_index
-        ortho.begin_forward(sigma=float(pipe.scheduler.sigmas[i]), step_idx=i,
+        ortho.begin_forward(sigmas=pipe.scheduler.sigmas.tolist(), step_idx=i,
                             img_len=kwargs['hidden_states'].shape[1])
 
     pipe.prepare_latents = _prepare_latents
@@ -199,9 +243,18 @@ def main():
             module.set_processor(parallel_attn_proc)
 
     n_double, n_single = len(pipe.transformer.transformer_blocks), len(pipe.transformer.single_transformer_blocks)
+    def resolve(blocks, n):
+        return list(range(n)) if blocks == ["all"] else sorted({i % n for i in blocks})
+
+    def names(term):
+        return ({f"double_{i}" for i in resolve(getattr(args, f"{term}_exclude_double"), n_double)}
+                | {f"single_{i}" for i in resolve(getattr(args, f"{term}_exclude_single"), n_single)})
+
     ortho = BlockOrtho(alpha=args.ortho_alpha, beta=args.ortho_beta, power=args.ortho_power, tau=args.ortho_tau,
-                       steps=args.ortho_steps, exclude_double=[i % n_double for i in args.exclude_double],
-                       exclude_single=[i % n_single for i in args.exclude_single])
+                       schedule=args.ortho_schedule, steps=args.ortho_steps,
+                       exclude_double=resolve(args.exclude_double, n_double),
+                       exclude_single=resolve(args.exclude_single, n_single),
+                       alpha_exclude=names("alpha"), beta_exclude=names("beta"))
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,

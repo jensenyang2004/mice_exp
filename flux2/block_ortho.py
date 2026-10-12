@@ -12,7 +12,13 @@ tokens and centered over the frame:
     par_t    = sum_j w_kj * (d_t . g_j) g_j                              neighbor-like part of the write
     rest_t   = d_t - par_t
     D_t'     = D_t - a * par_t + b * min(1, sum_j w_kj) * rest_t
-with a = alpha * sigma^power, b = beta * sigma^power, the same for every hooked block. The
+with a = alpha * f_i, b = beta * f_i in every hooked block (a = 0 in blocks listed in alpha_exclude,
+b = 0 in blocks listed in beta_exclude), where the step factor f_i is
+    schedule "sigma":  f_i = sigma_i^power
+    schedule "budget": f_i = (dsigma_0 / dsigma_i)^power,  dsigma_i = sigma_i - sigma_{i+1}
+"budget" keeps the perturbation actually written into the latent (dsigma_i * edit) constant over
+steps: the shifted 4-step schedule moves the latent ~3%, 6%, 14%, 77% per step, so the same
+relative edit costs ~25x more in the last step than in the first. The
 directions are shared per neighbor, the amount removed is per token. The frame mean of D (which
 carries the DiT's shared/massive activations) is never touched. Text and source-image (context)
 tokens are never modified. Tokens in several masks get the mean of their edits.
@@ -33,9 +39,12 @@ class BlockOrtho:
     beta: float = 0.0
     power: float = 1.0
     tau: float = 4.0
+    schedule: str = "sigma"  # "sigma" or "budget" (see module docstring)
     steps: list | None = None  # denoising step indices to act on; None = all
     exclude_double: list = field(default_factory=list)  # double-stream block indices left untouched
     exclude_single: list = field(default_factory=list)  # single-stream block indices left untouched
+    alpha_exclude: set = field(default_factory=set)  # block names ("double_0", "single_7") with a = 0
+    beta_exclude: set = field(default_factory=set)  # block names with b = 0
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -45,11 +54,18 @@ class BlockOrtho:
         self.masks = torch.stack([m.reshape(-1) > 0.5 for m in masks_2d]).to(device)  # [K, HW]
         self.mask_w = self.masks.float()
         self.proximity = mask_proximity(self.masks, Ht, Wt, self.tau)
-        self.sigma, self.step_idx, self.img_len = None, None, None
+        self.sigma, self.step_idx, self.img_len, self.factor = None, None, None, 0.0
 
-    def begin_forward(self, sigma: float, step_idx: int, img_len: int):
-        """Called before every transformer forward. img_len = latent + context tokens of the image stream."""
-        self.sigma, self.step_idx, self.img_len = sigma, step_idx, img_len
+    def begin_forward(self, sigmas: list, step_idx: int, img_len: int):
+        """Called before every transformer forward. sigmas = full schedule incl. the final 0;
+        img_len = latent + context tokens of the image stream."""
+        self.sigma, self.step_idx, self.img_len = float(sigmas[step_idx]), step_idx, img_len
+        if self.schedule == "budget":
+            dsig = float(sigmas[step_idx]) - float(sigmas[step_idx + 1])
+            self.factor = (float(sigmas[0]) - float(sigmas[1])) / max(dsig, 1e-12)
+            self.factor = self.factor ** self.power
+        else:
+            self.factor = self.sigma ** self.power
 
     def _active(self) -> bool:
         return (self.masks.shape[0] >= 2 and self.sigma is not None and self.sigma > 0.0
@@ -57,8 +73,8 @@ class BlockOrtho:
 
     def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str) -> torch.Tensor:
         """h_in, h_out: [B, HW, D] latent tokens. Returns the edited h_out (same dtype)."""
-        a = self.alpha * self.sigma ** self.power
-        b = self.beta * self.sigma ** self.power
+        a = 0.0 if layer in self.alpha_exclude else self.alpha * self.factor
+        b = 0.0 if layer in self.beta_exclude else self.beta * self.factor
         K = self.masks.shape[0]
         hi, ho = h_in.float(), h_out.float()
         D = ho - hi
