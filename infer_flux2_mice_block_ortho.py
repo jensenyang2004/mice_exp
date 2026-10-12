@@ -88,6 +88,13 @@ def parse_args():
                              "into the latent (multipliers ~1, 0.56, 0.23, 0.04 at power 1)")
     parser.add_argument("--ortho_tau", type=float, default=4.0,
                         help="Proximity falloff in tokens: weight = exp(-gap / tau)")
+    parser.add_argument("--ortho_local_tau", type=float, default=0.0,
+                        help=">0: per-token pair weights exp(-gap_t / local_tau) from each token's own distance "
+                             "to each neighbor, so every part of an instance is only steered from the neighbor "
+                             "it touches. 0 = one weight per instance pair (old behaviour)")
+    parser.add_argument("--ortho_skip_ring", type=int, default=-1,
+                        help=">=0: don't steer a token away from neighbor j if it is within this many tokens of "
+                             "j (1 = overlapping or touching tokens, which hold both instances). -1 = off")
     parser.add_argument("--ortho_steps", type=str, default="all", help="Denoising steps to act on, or \"all\"")
     parser.add_argument("--exclude_double", type=str, default="",
                         help="Double-stream block indices to leave untouched: comma list, ranges as start:end "
@@ -158,7 +165,8 @@ def fmt_blocks(blocks) -> str:
 def auto_exp_name(args) -> str:
     """Folder name from the steering settings, e.g. a10_b0_p1_t4_sall_exclude_none (alpha/beta in %)."""
     parts = [f"a{args.ortho_alpha * 100:g}", f"b{args.ortho_beta * 100:g}", ("B" if args.ortho_schedule == "budget" else "") + f"p{args.ortho_power:g}",
-             f"t{args.ortho_tau:g}",
+             f"t{args.ortho_tau:g}" + (f"_lt{args.ortho_local_tau:g}" if args.ortho_local_tau > 0 else "")
+             + (f"_ring{args.ortho_skip_ring}" if args.ortho_skip_ring >= 0 else ""),
              "sall" if args.ortho_steps is None else "s" + "-".join(map(str, args.ortho_steps))]
     if not args.exclude_double and not args.exclude_single:
         parts.append("exclude_none")
@@ -251,7 +259,7 @@ def main():
                 | {f"single_{i}" for i in resolve(getattr(args, f"{term}_exclude_single"), n_single)})
 
     ortho = BlockOrtho(alpha=args.ortho_alpha, beta=args.ortho_beta, power=args.ortho_power, tau=args.ortho_tau,
-                       schedule=args.ortho_schedule, steps=args.ortho_steps,
+                       local_tau=args.ortho_local_tau, skip_ring=args.ortho_skip_ring, schedule=args.ortho_schedule, steps=args.ortho_steps,
                        exclude_double=resolve(args.exclude_double, n_double),
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"))

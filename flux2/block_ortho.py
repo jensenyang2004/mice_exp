@@ -9,9 +9,16 @@ increment D is edited and h_in is left alone. With h restricted to the latent (g
 tokens and centered over the frame:
     g_j      = normalize(mean_{tokens of j}(h_out - mean_frame(h_out)))   what neighbor j is now
     d_t      = D_t - mean_frame(D)                                      this block's write to token t
-    par_t    = sum_j w_kj * (d_t . g_j) g_j                              neighbor-like part of the write
+    par_t    = sum_j w_kj(t) * (d_t . g_j) g_j                           neighbor-like part of the write
     rest_t   = d_t - par_t
-    D_t'     = D_t - a * par_t + b * min(1, sum_j w_kj) * rest_t
+    D_t'     = D_t - a * par_t + b * min(1, sum_j w_kj(t)) * rest_t
+The pair weight w_kj(t) is per token. By default it is the same for every token of k:
+exp(-gap(k, j) / tau), gap = min token distance between the masks - 1. With local_tau > 0 it
+follows the token's own distance to j, so each part of k is only steered from the neighbor it
+actually touches:
+    w_kj(t)  = exp(-max(dist_j(t) - 1, 0) / local_tau),   dist_j(t) = distance from t to j's nearest token
+skip_ring >= 0 zeroes w_kj(t) where dist_j(t) <= skip_ring (1 = tokens overlapping or touching j,
+which physically contain both instances).
 with a = alpha * f_i, b = beta * f_i in every hooked block (a = 0 in blocks listed in alpha_exclude,
 b = 0 in blocks listed in beta_exclude), where the step factor f_i is
     schedule "sigma":  f_i = sigma_i^power
@@ -39,6 +46,8 @@ class BlockOrtho:
     beta: float = 0.0
     power: float = 1.0
     tau: float = 4.0
+    local_tau: float = 0.0  # >0: per-token pair weights from the token's distance to each neighbor
+    skip_ring: int = -1  # >=0: no steering from j on tokens within this distance of j
     schedule: str = "sigma"  # "sigma" or "budget" (see module docstring)
     steps: list | None = None  # denoising step indices to act on; None = all
     exclude_double: list = field(default_factory=list)  # double-stream block indices left untouched
@@ -54,7 +63,35 @@ class BlockOrtho:
         self.masks = torch.stack([m.reshape(-1) > 0.5 for m in masks_2d]).to(device)  # [K, HW]
         self.mask_w = self.masks.float()
         self.proximity = mask_proximity(self.masks, Ht, Wt, self.tau)
+        self.pair_w = self._pair_weights(Ht, Wt)
         self.sigma, self.step_idx, self.img_len, self.factor = None, None, None, 0.0
+
+    def _pair_weights(self, Ht: int, Wt: int) -> list:
+        """Per instance k: [N_k, K] weight of every token of k toward every instance (0 for k itself)."""
+        K = self.masks.shape[0]
+        need_dist = self.local_tau > 0 or self.skip_ring >= 0
+        if need_dist:
+            ys, xs = torch.meshgrid(torch.arange(Ht, device=self.masks.device),
+                                    torch.arange(Wt, device=self.masks.device), indexing="ij")
+            coords = torch.stack([ys.reshape(-1), xs.reshape(-1)], dim=-1).float()
+            dist = torch.full((K, self.HW), float("inf"), device=self.masks.device)  # [K, HW]
+            for j in range(K):
+                if self.masks[j].any():
+                    cj = coords[self.masks[j]]
+                    dist[j] = torch.cat([torch.cdist(chunk, cj).min(dim=1).values
+                                         for chunk in coords.split(1024)])
+        weights = []
+        for k in range(K):
+            idx = self.masks[k]
+            if self.local_tau > 0:
+                w = torch.exp(-(dist[:, idx].T - 1.0).clamp_min(0.0) / self.local_tau)  # [N_k, K]
+            else:
+                w = self.proximity[k][None].expand(int(idx.sum()), K).clone()
+            w[:, k] = 0.0
+            if self.skip_ring >= 0:
+                w[dist[:, idx].T <= self.skip_ring] = 0.0
+            weights.append(w)
+        return weights
 
     def begin_forward(self, sigmas: list, step_idx: int, img_len: int):
         """Called before every transformer forward. sigmas = full schedule incl. the final 0;
@@ -87,16 +124,16 @@ class BlockOrtho:
         cover = torch.zeros(self.HW, device=d.device)
         par_frac = []
         for k in range(K):
-            w = self.proximity[k]  # [K], 0 for k itself
+            w = self.pair_w[k]  # [Nk, K], 0 toward k itself
             if float(w.sum()) == 0.0:
                 par_frac.append(0.0)
                 continue
             idx = self.masks[k]
             dk = d[:, idx]  # [B, Nk, D]
             proj = torch.einsum('bnd,bjd->bnj', dk, g)  # [B, Nk, K]
-            par = torch.einsum('bnj,bjd->bnd', proj * w[None, None], g)
+            par = torch.einsum('bnj,bjd->bnd', proj * w[None], g)
             rest = dk - par
-            delta[:, idx] += -a * par + b * float(w.sum().clamp(max=1.0)) * rest
+            delta[:, idx] += -a * par + b * w.sum(dim=1, keepdim=True).clamp(max=1.0)[None] * rest
             cover[idx] += 1.0
             par_frac.append(float(par[0].norm(dim=-1).mean() / dk[0].norm(dim=-1).mean().clamp_min(1e-12)))
         delta = delta / cover.clamp_min(1.0)[None, :, None]
