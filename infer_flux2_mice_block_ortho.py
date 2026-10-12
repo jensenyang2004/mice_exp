@@ -43,7 +43,9 @@ def parse_args():
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument("--dataset_root", type=str, default="../mice_bench", help="Root directory of MICE-Bench dataset")
     parser.add_argument("--output_dir", type=str, default="results_micebench")
-    parser.add_argument("--exp_name", type=str, required=True, help="Experiment name for results subfolder")
+    parser.add_argument("--exp_name", type=str, default=None,
+                        help="Optional prefix for the results subfolder; the steering settings are always "
+                             "appended automatically (e.g. a10_b0_p1_t4_sall_exclude_none)")
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples (for debugging)")
     parser.add_argument("--sample_ids", type=str, default=None, help="Comma list of sample ids to run (default: all)")
     parser.add_argument("--overwrite", action="store_true",
@@ -113,6 +115,24 @@ def parse_args():
     return args
 
 
+def auto_exp_name(args) -> str:
+    """Folder name from the steering settings, e.g. a10_b0_p1_t4_sall_exclude_none (alpha/beta in %)."""
+    parts = [f"a{args.ortho_alpha * 100:g}", f"b{args.ortho_beta * 100:g}", f"p{args.ortho_power:g}",
+             f"t{args.ortho_tau:g}",
+             "sall" if args.ortho_steps is None else "s" + "-".join(map(str, args.ortho_steps))]
+    if not args.exclude_double and not args.exclude_single:
+        parts.append("exclude_none")
+    else:
+        if args.exclude_double:
+            parts.append("exd" + "-".join(map(str, args.exclude_double)))
+        if args.exclude_single:
+            parts.append("exs" + "-".join(map(str, args.exclude_single)))
+    if not args.free_latent:
+        parts.append("nofree")
+    name = "_".join(parts)
+    return f"{args.exp_name}_{name}" if args.exp_name else name
+
+
 def run_with_ortho(pipe, ortho: BlockOrtho, sample, use_masks: bool, **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`)."""
     orig_prepare_latents = pipe.prepare_latents
@@ -148,7 +168,7 @@ def main():
     args = parse_args()
     device = args.device or ("cuda:0" if args.multi_gpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    save_dir = Path(args.output_dir) / f"mice_flux2_klein_block_ortho_{args.exp_name}"
+    save_dir = Path(args.output_dir) / f"mice_flux2_klein_block_ortho_{auto_exp_name(args)}"
     save_dir.mkdir(parents=True, exist_ok=True)
     # Existing results are skipped, so a folder must never mix settings: refuse to reuse one made
     # with different generation args (run-control args like sample selection/device may differ).
@@ -161,7 +181,7 @@ def main():
         diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys() if old.get(k) != settings.get(k)}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
-                             f"Use a new --exp_name, or --overwrite to regenerate everything here.")
+                             f"Use an --exp_name prefix, or --overwrite to regenerate everything here.")
     with open(args_path, "w") as f:
         json.dump(settings, f, indent=2)
     logger.info(f"Results will be saved to {save_dir}")
