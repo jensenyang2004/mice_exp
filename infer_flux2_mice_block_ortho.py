@@ -110,6 +110,8 @@ def parse_args():
                         help="Source term: remove this fraction of the part of each instance token's write that "
                              "copies the source (aligned with the context write at the same position). "
                              "Instance tokens only. 0 = off (the agreement stats are logged anyway)")
+    parser.add_argument("--src_steps", type=str, default=None,
+                        help="Denoising steps for the source term, or \"all\" (default: same as --ortho_steps)")
     parser.add_argument("--attn_chunk", type=int, default=0,
                         help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
                              "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
@@ -173,6 +175,8 @@ def parse_args():
         return out
 
     args.gap_steps = None if args.gap_steps == "all" else str2list(args.gap_steps)
+    args.src_steps = (None if args.src_steps is None else
+                      list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
                 "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
@@ -222,7 +226,8 @@ def auto_exp_name(args) -> str:
     if args.ctx_alpha or args.ctx_beta:
         parts.append(f"ca{args.ctx_alpha * 100:g}_cb{args.ctx_beta * 100:g}")
     if args.src_gamma:
-        parts.append(f"src{args.src_gamma * 100:g}")
+        parts.append(f"src{args.src_gamma * 100:g}"
+                     + ("" if args.src_steps is None else "_ss" + "-".join(map(str, args.src_steps))))
     if args.gap_lambda > 0:
         parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gm{args.gap_margin}_gs"
                      + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
@@ -345,7 +350,8 @@ def main():
                        exclude_double=resolve(args.exclude_double, n_double),
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),
-                       ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma)
+                       ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
+                       src_steps=args.src_steps)
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
     gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),

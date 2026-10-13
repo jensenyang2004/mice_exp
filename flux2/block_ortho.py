@@ -57,6 +57,7 @@ class BlockOrtho:
     ctx_alpha: float = 0.0  # context steering (see module docstring); uses alpha_exclude
     ctx_beta: float = 0.0  # uses beta_exclude
     src_gamma: float = 0.0  # source term on the latent instance tokens
+    src_steps: list | None = None  # steps for the source term; None = same as `steps`
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -117,16 +118,23 @@ class BlockOrtho:
 
     def _active(self) -> bool:
         return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
-                and (self.steps is None or self.step_idx in self.steps))
+                and (self._in(self.steps) or (self.src_gamma > 0 and self._in(self._src_steps()))))
+
+    def _in(self, steps) -> bool:
+        return steps is None or self.step_idx in steps
+
+    def _src_steps(self):
+        return self.steps if self.src_steps is None else self.src_steps
 
     def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str, stream: str = "lat",
               src: tuple | None = None) -> torch.Tensor:
         """h_in, h_out: [B, HW, D] latent (stream "lat") or context ("ctx") tokens. src: (D, h_out) of
         the context tokens, only for the latent stream. Returns the edited h_out (same dtype)."""
         alpha, beta = (self.alpha, self.beta) if stream == "lat" else (self.ctx_alpha, self.ctx_beta)
-        a = 0.0 if layer in self.alpha_exclude else alpha * self.factor
-        b = 0.0 if layer in self.beta_exclude else beta * self.factor
-        gamma = self.src_gamma * self.factor if stream == "lat" else 0.0
+        steer = self._in(self.steps)
+        a = 0.0 if layer in self.alpha_exclude or not steer else alpha * self.factor
+        b = 0.0 if layer in self.beta_exclude or not steer else beta * self.factor
+        gamma = self.src_gamma * self.factor if stream == "lat" and self._in(self._src_steps()) else 0.0
         masks, mask_w, pair_w = self._tensors(h_out.device)
         K = masks.shape[0]
         hi, ho = h_in.float(), h_out.float()
