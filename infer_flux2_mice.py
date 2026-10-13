@@ -45,6 +45,9 @@ def parse_args():
     parser.add_argument("--multi_gpu", action="store_true",
                         help="Model parallel: split the single transformer's weights across all visible GPUs via accelerate "
                              "(use this if the model OOMs on one GPU; incompatible with --num_shards > 1)")
+    parser.add_argument("--cpu_offload", action="store_true",
+                        help="diffusers model CPU offload: only the module in use (text encoder / transformer / "
+                             "VAE) sits on the GPU. Same results, less memory; incompatible with --multi_gpu")
     parser.add_argument("--num_inference_steps", type=int, default=4)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--prompt_settings", type=str, default='outer_local_prompts',
@@ -92,6 +95,8 @@ def parse_args():
 
     if args.multi_gpu and args.num_shards > 1:
         parser.error("--multi_gpu (model parallel) cannot be combined with --num_shards > 1 (data parallel)")
+    if args.multi_gpu and args.cpu_offload:
+        parser.error("--cpu_offload cannot be combined with --multi_gpu")
 
     return args
 
@@ -150,6 +155,9 @@ def main():
     logger.info(f"Results will be saved to {save_dir}")
 
     pipe = load_pipeline(args, device)
+    if args.cpu_offload:
+        pipe.to("cpu")
+        pipe.enable_model_cpu_offload(device=device)
 
     attn_proc = None
     parallel_attn_proc = None
