@@ -10,6 +10,7 @@ wraps and hooks, all removed after every call:
   - transformer forward pre-hook -> tells the steering the current step / sigma / token layout
   - block forward hooks          -> edit each block's residual increment
   - optional: the MICE processor module's dispatch_attention_fn (contact gap, chunked attention)
+  - optional: transformer forward hook   -> background anchor on the predicted velocity
 """
 import gc
 import json
@@ -32,6 +33,7 @@ from flux2.pipeline_utils import create_position_mask_list, resize_mask
 from flux2.block_ortho import BlockOrtho
 from flux2.contact_gap import ContactGap
 from flux2.chunked_attention import ChunkedAttention
+from flux2.bg_anchor import BackgroundAnchor
 import flux2.attention.attention_processor_APITASM_kernel_nonlap as mice_attn_module
 
 SEED = 0
@@ -112,6 +114,15 @@ def parse_args():
                              "Instance tokens only. 0 = off (the agreement stats are logged anyway)")
     parser.add_argument("--src_steps", type=str, default=None,
                         help="Denoising steps for the source term, or \"all\" (default: same as --ortho_steps)")
+    parser.add_argument("--bg_anchor", type=float, default=0.0,
+                        help="Background anchor (flux2/bg_anchor.py): pull background tokens' predicted clean "
+                             "latent toward the source, weight strength * (1 - exp(-max(dist - margin, 0) / "
+                             "bg_tau)) from the distance to the nearest instance. 1 = far background copied "
+                             "exactly. 0 = off")
+    parser.add_argument("--bg_tau", type=float, default=4.0, help="Background anchor ramp length in tokens")
+    parser.add_argument("--bg_margin", type=float, default=2.0,
+                        help="Tokens around the edits left completely free (shape, shadow, lighting)")
+    parser.add_argument("--bg_steps", type=str, default="all", help="Denoising steps for the anchor, or \"all\"")
     parser.add_argument("--attn_chunk", type=int, default=0,
                         help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
                              "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
@@ -175,6 +186,7 @@ def parse_args():
         return out
 
     args.gap_steps = None if args.gap_steps == "all" else str2list(args.gap_steps)
+    args.bg_steps = None if args.bg_steps == "all" else str2list(args.bg_steps)
     args.src_steps = (None if args.src_steps is None else
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
@@ -235,6 +247,9 @@ def auto_exp_name(args) -> str:
             parts.append("gexd" + fmt_blocks(args.gap_exclude_double))
         if args.gap_exclude_single:
             parts.append("gexs" + fmt_blocks(args.gap_exclude_single))
+    if args.bg_anchor > 0:
+        parts.append(f"bg{args.bg_anchor * 100:g}_bt{args.bg_tau:g}_bm{args.bg_margin:g}_bs"
+                     + ("all" if args.bg_steps is None else "-".join(map(str, args.bg_steps))))
     if not args.free_latent:
         parts.append("nofree")
     if args.free_context:
@@ -243,8 +258,8 @@ def auto_exp_name(args) -> str:
     return f"{args.exp_name}_{name}" if args.exp_name else name
 
 
-def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAttention | None, sample,
-                   use_masks: bool, mem: dict, **pipe_kwargs):
+def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAttention | None,
+                   anchor: BackgroundAnchor, sample, use_masks: bool, mem: dict, **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`).
     mem receives peak GPU memory (GB): overall and inside the transformer forwards."""
     orig_prepare_latents = pipe.prepare_latents
@@ -259,6 +274,7 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
             masks = create_position_mask_list(sample['bboxes'], height, width, pipe.vae_scale_factor)
         ortho.setup(masks, device=latents.device)
         gap.setup(masks, device=latents.device)
+        anchor.setup(masks, device=latents.device)
         return latents, latent_ids
 
     def _pre_forward(module, args, kwargs):
@@ -266,6 +282,7 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         ortho.begin_forward(sigmas=pipe.scheduler.sigmas.tolist(), step_idx=i,
                             img_len=kwargs['hidden_states'].shape[1])
         gap.begin_forward(step_idx=i)
+        anchor.begin_forward(sigma=float(pipe.scheduler.sigmas[i]), step_idx=i)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             mem.setdefault("text_encoding", torch.cuda.max_memory_allocated() / 2**30)  # first step only
@@ -283,6 +300,8 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
     handles = [pipe.transformer.register_forward_pre_hook(_pre_forward, with_kwargs=True),
                pipe.transformer.register_forward_hook(_post_forward, with_kwargs=True)]
     handles += ortho.attach(pipe.transformer)
+    if anchor.strength > 0:
+        handles += anchor.attach(pipe.transformer)
     if chunked is not None:  # before the gap, so the gap wraps the chunked call
         handles += chunked.attach(mice_attn_module)
     if gap.lam > 0:
@@ -365,6 +384,7 @@ def main():
         if attn_setting_enum.value.lower() != "apitasmkernelnonlap":
             raise SystemExit("--attn_chunk needs --attention_setting apitasmkernelnonlap")
         chunked = ChunkedAttention(args.attn_chunk)
+    anchor = BackgroundAnchor(strength=args.bg_anchor, tau=args.bg_tau, margin=args.bg_margin, steps=args.bg_steps)
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
                                      num_shards=args.num_shards, shard_id=args.shard_id)
@@ -406,7 +426,7 @@ def main():
             try:
                 mem = {}
                 result = run_with_ortho(
-                    pipe, ortho, gap, chunked, sample, args.use_masks, mem,
+                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
@@ -435,7 +455,9 @@ def main():
                     generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
                 generated_image.save(save_path)
                 with open(save_dir / f"{sample_id}_block_ortho.json", "w") as f:
-                    json.dump(ortho.stats if gap.lam <= 0 else {"steering": ortho.stats, "gap": gap.stats}, f)
+                    extra = {**({"gap": gap.stats} if gap.lam > 0 else {}),
+                             **({"bg_anchor": anchor.stats} if anchor.strength > 0 else {})}
+                    json.dump({"steering": ortho.stats, **extra} if extra else ortho.stats, f)
                 logger.info(f"Saved result to {save_path}")
                 if mem:
                     logger.info("Peak GPU memory (GB): " + ", ".join(f"{k} {v:.1f}" for k, v in mem.items()))
