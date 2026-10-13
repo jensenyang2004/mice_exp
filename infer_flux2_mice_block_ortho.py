@@ -9,6 +9,7 @@ wraps and hooks, all removed after every call:
   - pipe.prepare_latents         -> grabs the token-grid size to build the instance token masks
   - transformer forward pre-hook -> tells the steering the current step / sigma / token layout
   - block forward hooks          -> edit each block's residual increment
+  - optional: the MICE processor module's dispatch_attention_fn (contact gap, chunked attention)
 """
 import gc
 import json
@@ -30,6 +31,7 @@ from flux2.attention import get_attention_processors, AttentionSetting
 from flux2.pipeline_utils import create_position_mask_list, resize_mask
 from flux2.block_ortho import BlockOrtho
 from flux2.contact_gap import ContactGap
+from flux2.chunked_attention import ChunkedAttention
 import flux2.attention.attention_processor_APITASM_kernel_nonlap as mice_attn_module
 
 SEED = 0
@@ -99,6 +101,22 @@ def parse_args():
                              "j (1 = overlapping or touching tokens, which hold both instances). -1 = off")
     parser.add_argument("--ortho_steps", type=str, default="all", help="Denoising steps to act on, or \"all\"")
 
+    parser.add_argument("--ctx_alpha", type=float, default=0.0,
+                        help="Context steering: alpha of the same split applied to the context (source-image) "
+                             "tokens' writes, instance k's context away from neighbor j's. Uses the alpha block "
+                             "sets. 0 = off")
+    parser.add_argument("--ctx_beta", type=float, default=0.0, help="Context steering beta (uses the beta block sets)")
+    parser.add_argument("--src_gamma", type=float, default=0.0,
+                        help="Source term: remove this fraction of the part of each instance token's write that "
+                             "copies the source (aligned with the context write at the same position). "
+                             "Instance tokens only. 0 = off (the agreement stats are logged anyway)")
+    parser.add_argument("--attn_chunk", type=int, default=0,
+                        help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
+                             "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
+                             "0 = off, e.g. 1024")
+    parser.add_argument("--cpu_offload", action="store_true",
+                        help="diffusers model CPU offload: only the module in use (text encoder / transformer / "
+                             "VAE) sits on the GPU. Not combinable with --multi_gpu")
     parser.add_argument("--gap_lambda", type=float, default=0.0,
                         help="Contact gap (flux2/contact_gap.py): logit bias -lambda on latent->latent attention "
                              "between neighboring instances where they meet (1 ~ x0.37 weight). 0 = off")
@@ -165,6 +183,8 @@ def parse_args():
         parser.error(f"--shard_id must be in [0, {args.num_shards})")
     if args.multi_gpu and args.num_shards > 1:
         parser.error("--multi_gpu (model parallel) cannot be combined with --num_shards > 1 (data parallel)")
+    if args.multi_gpu and args.cpu_offload:
+        parser.error("--cpu_offload cannot be combined with --multi_gpu")
     return args
 
 
@@ -199,6 +219,10 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"{term}_exclude_{kind}")
             if blocks:
                 parts.append(f"{tag}ex{kind[0]}" + fmt_blocks(blocks))
+    if args.ctx_alpha or args.ctx_beta:
+        parts.append(f"ca{args.ctx_alpha * 100:g}_cb{args.ctx_beta * 100:g}")
+    if args.src_gamma:
+        parts.append(f"src{args.src_gamma * 100:g}")
     if args.gap_lambda > 0:
         parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gm{args.gap_margin}_gs"
                      + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
@@ -208,12 +232,16 @@ def auto_exp_name(args) -> str:
             parts.append("gexs" + fmt_blocks(args.gap_exclude_single))
     if not args.free_latent:
         parts.append("nofree")
+    if args.free_context:
+        parts.append("fc")
     name = "_".join(parts)
     return f"{args.exp_name}_{name}" if args.exp_name else name
 
 
-def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, sample, use_masks: bool, **pipe_kwargs):
-    """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`)."""
+def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAttention | None, sample,
+                   use_masks: bool, mem: dict, **pipe_kwargs):
+    """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`).
+    mem receives peak GPU memory (GB): overall and inside the transformer forwards."""
     orig_prepare_latents = pipe.prepare_latents
 
     def _prepare_latents(*a, **kw):
@@ -233,17 +261,35 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, sample, use_masks: 
         ortho.begin_forward(sigmas=pipe.scheduler.sigmas.tolist(), step_idx=i,
                             img_len=kwargs['hidden_states'].shape[1])
         gap.begin_forward(step_idx=i)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            mem.setdefault("text_encoding", torch.cuda.max_memory_allocated() / 2**30)  # first step only
+            torch.cuda.reset_peak_memory_stats()
 
+    def _post_forward(module, args, kwargs, output):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            mem["transformer"] = max(mem.get("transformer", 0.0), torch.cuda.max_memory_allocated() / 2**30)
+            torch.cuda.reset_peak_memory_stats()
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     pipe.prepare_latents = _prepare_latents
-    handles = [pipe.transformer.register_forward_pre_hook(_pre_forward, with_kwargs=True)]
+    handles = [pipe.transformer.register_forward_pre_hook(_pre_forward, with_kwargs=True),
+               pipe.transformer.register_forward_hook(_post_forward, with_kwargs=True)]
     handles += ortho.attach(pipe.transformer)
+    if chunked is not None:  # before the gap, so the gap wraps the chunked call
+        handles += chunked.attach(mice_attn_module)
     if gap.lam > 0:
         handles += gap.attach(pipe.transformer, mice_attn_module)
     try:
-        return pipe(**pipe_kwargs)
+        out = pipe(**pipe_kwargs)
+        if torch.cuda.is_available():
+            mem["vae_decode"] = torch.cuda.max_memory_allocated() / 2**30
+        return out
     finally:
         pipe.prepare_latents = orig_prepare_latents
-        for h in handles:
+        for h in reversed(handles):  # the attention wraps nest: undo them in reverse
             h.remove()
 
 
@@ -255,13 +301,16 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
     # Existing results are skipped, so a folder must never mix settings: refuse to reuse one made
     # with different generation args (run-control args like sample selection/device may differ).
-    run_control = {"num_samples", "sample_ids", "device", "num_shards", "shard_id", "multi_gpu", "overwrite"}
+    run_control = {"num_samples", "sample_ids", "device", "num_shards", "shard_id", "multi_gpu", "overwrite",
+                   "attn_chunk", "cpu_offload"}
     settings = {k: v for k, v in vars(args).items() if k not in run_control}
     args_path = save_dir / "args.json"
     if args_path.exists() and not args.overwrite:
         with open(args_path) as f:
             old = {k: v for k, v in json.load(f).items() if k not in run_control}
-        diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys() if old.get(k) != settings.get(k)}
+        # a flag added after the folder was made counts as unchanged while it is off
+        diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys()
+                if old.get(k) != settings.get(k) and not (k not in old and settings.get(k) in (0, False, None, "", []))}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
                              f"Use an --exp_name prefix, or --overwrite to regenerate everything here.")
@@ -270,6 +319,9 @@ def main():
     logger.info(f"Results will be saved to {save_dir}")
 
     pipe = load_pipeline(args, device)
+    if args.cpu_offload:
+        pipe.to("cpu")
+        pipe.enable_model_cpu_offload(device=device)
 
     attn_setting_enum = AttentionSetting(args.attention_setting.lower())
     attn_proc, parallel_attn_proc = get_attention_processors(attn_setting_enum, args.sigma_scale, args.kernel_size,
@@ -292,7 +344,8 @@ def main():
                        local_tau=args.ortho_local_tau, skip_ring=args.ortho_skip_ring, schedule=args.ortho_schedule, steps=args.ortho_steps,
                        exclude_double=resolve(args.exclude_double, n_double),
                        exclude_single=resolve(args.exclude_single, n_single),
-                       alpha_exclude=names("alpha"), beta_exclude=names("beta"))
+                       alpha_exclude=names("alpha"), beta_exclude=names("beta"),
+                       ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma)
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
     gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),
@@ -301,6 +354,11 @@ def main():
         if attn_setting_enum.value.lower() != "apitasmkernelnonlap":
             raise SystemExit("--gap_lambda needs --attention_setting apitasmkernelnonlap")
         logger.info(f"Contact gap: {gap}")
+    chunked = None
+    if args.attn_chunk > 0:
+        if attn_setting_enum.value.lower() != "apitasmkernelnonlap":
+            raise SystemExit("--attn_chunk needs --attention_setting apitasmkernelnonlap")
+        chunked = ChunkedAttention(args.attn_chunk)
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
                                      num_shards=args.num_shards, shard_id=args.shard_id)
@@ -340,8 +398,9 @@ def main():
                 kwargs['instance_bboxes_xyxy_normalized'] = sample['bboxes']
 
             try:
+                mem = {}
                 result = run_with_ortho(
-                    pipe, ortho, gap, sample, args.use_masks,
+                    pipe, ortho, gap, chunked, sample, args.use_masks, mem,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
@@ -372,6 +431,8 @@ def main():
                 with open(save_dir / f"{sample_id}_block_ortho.json", "w") as f:
                     json.dump(ortho.stats if gap.lam <= 0 else {"steering": ortho.stats, "gap": gap.stats}, f)
                 logger.info(f"Saved result to {save_path}")
+                if mem:
+                    logger.info("Peak GPU memory (GB): " + ", ".join(f"{k} {v:.1f}" for k, v in mem.items()))
                 del result, generated_image
             except torch.cuda.OutOfMemoryError as e:
                 logger.error(f"CUDA OOM on sample {sample_id} ({w}x{h}), skipping: {e}")

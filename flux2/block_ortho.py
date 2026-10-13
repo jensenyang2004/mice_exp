@@ -54,6 +54,9 @@ class BlockOrtho:
     exclude_single: list = field(default_factory=list)  # single-stream block indices left untouched
     alpha_exclude: set = field(default_factory=set)  # block names ("double_0", "single_7") with a = 0
     beta_exclude: set = field(default_factory=set)  # block names with b = 0
+    ctx_alpha: float = 0.0  # context steering (see module docstring); uses alpha_exclude
+    ctx_beta: float = 0.0  # uses beta_exclude
+    src_gamma: float = 0.0  # source term on the latent instance tokens
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -64,7 +67,15 @@ class BlockOrtho:
         self.mask_w = self.masks.float()
         self.proximity = mask_proximity(self.masks, Ht, Wt, self.tau)
         self.pair_w = self._pair_weights(Ht, Wt)
+        self._by_device = {}
         self.sigma, self.step_idx, self.img_len, self.factor = None, None, None, 0.0
+
+    def _tensors(self, device):
+        """masks, mask_w, pair_w on `device` (blocks may sit on different GPUs with --multi_gpu)."""
+        if device not in self._by_device:
+            self._by_device[device] = (self.masks.to(device), self.mask_w.to(device),
+                                       [w.to(device) for w in self.pair_w])
+        return self._by_device[device]
 
     def _pair_weights(self, Ht: int, Wt: int) -> list:
         """Per instance k: [N_k, K] weight of every token of k toward every instance (0 for k itself)."""
@@ -105,30 +116,35 @@ class BlockOrtho:
             self.factor = self.sigma ** self.power
 
     def _active(self) -> bool:
-        return (self.masks.shape[0] >= 2 and self.sigma is not None and self.sigma > 0.0
+        return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
                 and (self.steps is None or self.step_idx in self.steps))
 
-    def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str) -> torch.Tensor:
-        """h_in, h_out: [B, HW, D] latent tokens. Returns the edited h_out (same dtype)."""
-        a = 0.0 if layer in self.alpha_exclude else self.alpha * self.factor
-        b = 0.0 if layer in self.beta_exclude else self.beta * self.factor
-        K = self.masks.shape[0]
+    def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str, stream: str = "lat",
+              src: tuple | None = None) -> torch.Tensor:
+        """h_in, h_out: [B, HW, D] latent (stream "lat") or context ("ctx") tokens. src: (D, h_out) of
+        the context tokens, only for the latent stream. Returns the edited h_out (same dtype)."""
+        alpha, beta = (self.alpha, self.beta) if stream == "lat" else (self.ctx_alpha, self.ctx_beta)
+        a = 0.0 if layer in self.alpha_exclude else alpha * self.factor
+        b = 0.0 if layer in self.beta_exclude else beta * self.factor
+        gamma = self.src_gamma * self.factor if stream == "lat" else 0.0
+        masks, mask_w, pair_w = self._tensors(h_out.device)
+        K = masks.shape[0]
         hi, ho = h_in.float(), h_out.float()
         D = ho - hi
         d = D - D.mean(dim=1, keepdim=True)
         c = ho - ho.mean(dim=1, keepdim=True)
-        cnt = self.mask_w.sum(dim=1).clamp_min(1.0)[None, :, None]  # [1, K, 1]
-        g = F.normalize(torch.einsum('kn,bnd->bkd', self.mask_w, c) / cnt, dim=-1)  # [B, K, D]
+        cnt = mask_w.sum(dim=1).clamp_min(1.0)[None, :, None]  # [1, K, 1]
+        g = F.normalize(torch.einsum('kn,bnd->bkd', mask_w, c) / cnt, dim=-1)  # [B, K, D]
 
         delta = torch.zeros_like(d)
         cover = torch.zeros(self.HW, device=d.device)
         par_frac = []
         for k in range(K):
-            w = self.pair_w[k]  # [Nk, K], 0 toward k itself
+            w = pair_w[k]  # [Nk, K], 0 toward k itself
             if float(w.sum()) == 0.0:
                 par_frac.append(0.0)
                 continue
-            idx = self.masks[k]
+            idx = masks[k]
             dk = d[:, idx]  # [B, Nk, D]
             proj = torch.einsum('bnd,bjd->bnj', dk, g)  # [B, Nk, K]
             par = torch.einsum('bnj,bjd->bnd', proj * w[None], g)
@@ -138,10 +154,40 @@ class BlockOrtho:
             par_frac.append(float(par[0].norm(dim=-1).mean() / dk[0].norm(dim=-1).mean().clamp_min(1e-12)))
         delta = delta / cover.clamp_min(1.0)[None, :, None]
 
-        self.stats.append(dict(step=self.step_idx, layer=layer, sigma=self.sigma, a=a, b=b, par_frac=par_frac,
-                               write_rel=float(D[0].norm(dim=-1).mean() / hi[0].norm(dim=-1).mean().clamp_min(1e-12)),
-                               edit_rel=float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))))
+        stat = dict(step=self.step_idx, layer=layer, stream=stream, sigma=self.sigma, a=a, b=b,
+                    par_frac=par_frac,
+                    write_rel=float(D[0].norm(dim=-1).mean() / hi[0].norm(dim=-1).mean().clamp_min(1e-12)))
+        if src is not None:
+            inst = masks.any(dim=0)
+            sD, sh = src[0].float(), src[1].float()
+            s_dir = F.normalize(sD - sD.mean(dim=1, keepdim=True), dim=-1)  # [B, HW, D]
+            s_state = F.normalize(sh - sh.mean(dim=1, keepdim=True), dim=-1)
+            d_dir = F.normalize(d, dim=-1)
+            cos_w, cos_h = (d_dir * s_dir).sum(-1)[0], (d_dir * s_state).sum(-1)[0]  # [HW]
+            mean_on = lambda x, m: float(x[m].mean()) if bool(m.any()) else float("nan")
+            stat.update(src_cos_bg=mean_on(cos_w, ~inst), src_cos_inst=mean_on(cos_w, inst),
+                        src_state_cos_bg=mean_on(cos_h, ~inst), src_state_cos_inst=mean_on(cos_h, inst))
+            coef = (d[:, inst] * s_dir[:, inst]).sum(-1, keepdim=True).clamp_min(0.0)  # copying part only
+            par_s = coef * s_dir[:, inst]
+            stat.update(gamma=gamma, src_frac=float(par_s[0].norm(dim=-1).mean()
+                                                    / d[0, inst].norm(dim=-1).mean().clamp_min(1e-12)))
+            if gamma > 0:
+                delta[:, inst] -= gamma * par_s
+        stat["edit_rel"] = float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))
+        self.stats.append(stat)
         return (ho + delta).to(h_out.dtype)
+
+    def _edit_stream(self, h_in, h_out, s: int, layer: str):
+        """Edits the latent tokens [s, s+HW) and, if there is a context, [s+HW, s+2HW) of a block output."""
+        HW = self.HW
+        has_ctx = h_out.shape[1] >= s + 2 * HW
+        lat, ctx = slice(s, s + HW), slice(s + HW, s + 2 * HW)
+        out = h_out.clone()
+        src = (h_out[:, ctx] - h_in[:, ctx], h_out[:, ctx]) if has_ctx else None  # unsteered context
+        out[:, lat] = self._edit(h_in[:, lat], h_out[:, lat], layer, "lat", src=src)
+        if has_ctx and (self.ctx_alpha != 0.0 or self.ctx_beta != 0.0):
+            out[:, ctx] = self._edit(h_in[:, ctx], h_out[:, ctx], layer, "ctx")
+        return out
 
     def attach(self, transformer) -> list:
         handles = []
@@ -152,9 +198,7 @@ class BlockOrtho:
                     return output
                 enc, h_out = output
                 h_in = kwargs['hidden_states']  # image stream: [latent | context]
-                h_out = h_out.clone()
-                h_out[:, :self.HW] = self._edit(h_in[:, :self.HW], h_out[:, :self.HW], f"double_{idx}")
-                return enc, h_out
+                return enc, self._edit_stream(h_in, h_out, 0, f"double_{idx}")
             return hook
 
         def single_hook(idx):
@@ -163,9 +207,7 @@ class BlockOrtho:
                     return output
                 h_in = kwargs['hidden_states']  # [text | latent | context]
                 s = h_in.shape[1] - self.img_len  # latent tokens start right after the text
-                out = output.clone()
-                out[:, s:s + self.HW] = self._edit(h_in[:, s:s + self.HW], output[:, s:s + self.HW], f"single_{idx}")
-                return out
+                return self._edit_stream(h_in, output, s, f"single_{idx}")
             return hook
 
         for i, block in enumerate(transformer.transformer_blocks):
