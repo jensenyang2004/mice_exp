@@ -123,6 +123,17 @@ def parse_args():
     parser.add_argument("--bg_margin", type=float, default=2.0,
                         help="Tokens around the edits left completely free (shape, shadow, lighting)")
     parser.add_argument("--bg_steps", type=str, default="all", help="Denoising steps for the anchor, or \"all\"")
+    parser.add_argument("--src_beta", type=float, default=0.0,
+                        help="Amplify the non-copy part of instance tokens' writes (the edit). Keeps the copy that "
+                             "is added to the stream (pose) unchanged. Same steps/blocks as --src_gamma. 0 = off")
+    parser.add_argument("--src_mode", type=str, default="token", choices=["token", "instance"],
+                        help="Source direction: per token (removes identity AND pose/layout copying) or one per "
+                             "instance, the mean of its context write (removes what the old object is, keeps "
+                             "where its parts are)")
+    for kind in ("double", "single"):
+        parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
+                            help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
+                                 f"--exclude_{kind}); applied on top of --exclude_{kind}")
     parser.add_argument("--attn_chunk", type=int, default=0,
                         help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
                              "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
@@ -190,7 +201,8 @@ def parse_args():
     args.src_steps = (None if args.src_steps is None else
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
-                "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single"):
+                "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single",
+                "src_exclude_double", "src_exclude_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = (None if args.sample_ids is None or args.sample_ids.lower() == "all"
                        else set(args.sample_ids.split(',')))
@@ -237,9 +249,14 @@ def auto_exp_name(args) -> str:
                 parts.append(f"{tag}ex{kind[0]}" + fmt_blocks(blocks))
     if args.ctx_alpha or args.ctx_beta:
         parts.append(f"ca{args.ctx_alpha * 100:g}_cb{args.ctx_beta * 100:g}")
-    if args.src_gamma:
-        parts.append(f"src{args.src_gamma * 100:g}"
+    if args.src_gamma or args.src_beta:
+        parts.append(f"src{args.src_gamma * 100:g}" + (f"_sb{args.src_beta * 100:g}" if args.src_beta else "")
+                     + ("_inst" if args.src_mode == "instance" else "")
                      + ("" if args.src_steps is None else "_ss" + "-".join(map(str, args.src_steps))))
+        for kind in ("double", "single"):
+            blocks = getattr(args, f"src_exclude_{kind}")
+            if blocks:
+                parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
     if args.gap_lambda > 0:
         parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gm{args.gap_margin}_gs"
                      + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
@@ -334,7 +351,8 @@ def main():
             old = {k: v for k, v in json.load(f).items() if k not in run_control}
         # a flag added after the folder was made counts as unchanged while it is off
         diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys()
-                if old.get(k) != settings.get(k) and not (k not in old and settings.get(k) in (0, False, None, "", []))}
+                if old.get(k) != settings.get(k)
+                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) == "token"))}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
                              f"Use an --exp_name prefix, or --overwrite to regenerate everything here.")
@@ -370,7 +388,7 @@ def main():
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),
                        ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
-                       src_steps=args.src_steps)
+                       src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta, src_exclude=names("src"))
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
     gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),

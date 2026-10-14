@@ -27,8 +27,26 @@ b = 0 in blocks listed in beta_exclude), where the step factor f_i is
 steps: the shifted 4-step schedule moves the latent ~3%, 6%, 14%, 77% per step, so the same
 relative edit costs ~25x more in the last step than in the first. The
 directions are shared per neighbor, the amount removed is per token. The frame mean of D (which
-carries the DiT's shared/massive activations) is never touched. Text and source-image (context)
-tokens are never modified. Tokens in several masks get the mean of their edits.
+carries the DiT's shared/massive activations) is never touched. Text tokens are never modified.
+Tokens in several masks get the mean of their edits.
+
+Context (source-image) tokens sit on the same token grid as the latent, go through the same blocks
+with the same modulation, and are never decoded. Two optional uses:
+  - context steering (ctx_alpha, ctx_beta): the same split applied to the context tokens' writes,
+    instance k's context away from neighbor j's context. Same pair weights, steps and block sets.
+  - source term (src_gamma): per latent instance token t, s_t = the (unsteered) context write at
+    the same position, frame-centered: what copying the source would write there. The copying
+    part of t's write, max(d_t . s^_t, 0) s^_t, is removed with strength src_gamma (counters
+    source dominance). Instance tokens only; the background still copies the source.
+    src_mode "instance" uses one direction per instance instead, s^_k = normalize(mean over k's
+    tokens of the centered context write): "what the old object is" as a whole. The per-token
+    deviations from it (which part sits where: pose, layout) are not removed.
+    src_beta amplifies the rest, d_t - copy_t, on instance tokens: D_t' = D_t - g copy_t + b_s rest_t.
+    Unlike gamma < 1, it leaves the copy that is added to the stream unchanged (pose kept) and
+    pushes the non-source part (the edit) harder.
+    Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
+    Stats log the cosine between the latent and context writes (and context state) on background
+    vs instance tokens whenever the hook is active, to check where the two are comparable.
 
 Attached with forward hooks on each block (no model code changes); `attach` returns the handles.
 """
@@ -58,6 +76,9 @@ class BlockOrtho:
     ctx_beta: float = 0.0  # uses beta_exclude
     src_gamma: float = 0.0  # source term on the latent instance tokens
     src_steps: list | None = None  # steps for the source term; None = same as `steps`
+    src_mode: str = "token"  # "token": per-token copy direction; "instance": one per instance
+    src_beta: float = 0.0  # amplify the non-copy rest of instance tokens' writes (same steps/blocks as gamma)
+    src_exclude: set = field(default_factory=set)  # block names where the source term is off
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -118,7 +139,8 @@ class BlockOrtho:
 
     def _active(self) -> bool:
         return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
-                and (self._in(self.steps) or (self.src_gamma > 0 and self._in(self._src_steps()))))
+                and (self._in(self.steps)
+                     or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))))
 
     def _in(self, steps) -> bool:
         return steps is None or self.step_idx in steps
@@ -134,7 +156,9 @@ class BlockOrtho:
         steer = self._in(self.steps)
         a = 0.0 if layer in self.alpha_exclude or not steer else alpha * self.factor
         b = 0.0 if layer in self.beta_exclude or not steer else beta * self.factor
-        gamma = self.src_gamma * self.factor if stream == "lat" and self._in(self._src_steps()) else 0.0
+        src_on = stream == "lat" and self._in(self._src_steps()) and layer not in self.src_exclude
+        gamma = self.src_gamma * self.factor if src_on else 0.0
+        src_b = self.src_beta * self.factor if src_on else 0.0
         masks, mask_w, pair_w = self._tensors(h_out.device)
         K = masks.shape[0]
         hi, ho = h_in.float(), h_out.float()
@@ -175,12 +199,19 @@ class BlockOrtho:
             mean_on = lambda x, m: float(x[m].mean()) if bool(m.any()) else float("nan")
             stat.update(src_cos_bg=mean_on(cos_w, ~inst), src_cos_inst=mean_on(cos_w, inst),
                         src_state_cos_bg=mean_on(cos_h, ~inst), src_state_cos_inst=mean_on(cos_h, inst))
-            coef = (d[:, inst] * s_dir[:, inst]).sum(-1, keepdim=True).clamp_min(0.0)  # copying part only
-            par_s = coef * s_dir[:, inst]
-            stat.update(gamma=gamma, src_frac=float(par_s[0].norm(dim=-1).mean()
+            if self.src_mode == "instance":  # one direction per instance, mean of its context write
+                sc = sD - sD.mean(dim=1, keepdim=True)
+                g_src = F.normalize(torch.einsum('kn,bnd->bkd', mask_w, sc), dim=-1)  # [B, K, D]
+                ref = torch.einsum('kn,bkd->bnd', mask_w, g_src) / mask_w.sum(0).clamp_min(1.0)[None, :, None]
+                ref = F.normalize(ref, dim=-1)  # tokens in several masks: normalized mean direction
+            else:
+                ref = s_dir
+            coef = (d[:, inst] * ref[:, inst]).sum(-1, keepdim=True).clamp_min(0.0)  # copying part only
+            par_s = coef * ref[:, inst]
+            stat.update(gamma=gamma, src_beta=src_b, src_frac=float(par_s[0].norm(dim=-1).mean()
                                                     / d[0, inst].norm(dim=-1).mean().clamp_min(1e-12)))
-            if gamma > 0:
-                delta[:, inst] -= gamma * par_s
+            if gamma != 0 or src_b != 0:
+                delta[:, inst] += -gamma * par_s + src_b * (d[:, inst] - par_s)
         stat["edit_rel"] = float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))
         self.stats.append(stat)
         return (ho + delta).to(h_out.dtype)
