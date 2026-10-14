@@ -134,6 +134,10 @@ def parse_args():
         parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
                             help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
                                  f"--exclude_{kind}); applied on top of --exclude_{kind}")
+    parser.add_argument("--strict_masks", action="store_true",
+                        help="Carve overlapping instance masks before steering / gap / anchor: each mask loses the "
+                             "tokens also claimed by any smaller instance (same rule as --strict in "
+                             "capture_query_blur_leakage.py and the 'apitasmkernelnonlapstrict' attention setting)")
     parser.add_argument("--attn_chunk", type=int, default=0,
                         help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
                              "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
@@ -271,12 +275,57 @@ def auto_exp_name(args) -> str:
         parts.append("nofree")
     if args.free_context:
         parts.append("fc")
+    if args.strict_masks:
+        parts.append("strict")
     name = "_".join(parts)
     return f"{args.exp_name}_{name}" if args.exp_name else name
 
 
+def environment(args, pipe) -> dict:
+    """What can make the same settings give slightly different images on two machines."""
+    import platform
+    import PIL
+    env = dict(host=platform.node(), python=platform.python_version(), torch=torch.__version__,
+               cuda=torch.version.cuda, cudnn=torch.backends.cudnn.version(), pillow=PIL.__version__,
+               gpus=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+               run_control={k: getattr(args, k) for k in ("device", "multi_gpu", "attn_chunk", "cpu_offload",
+                                                          "num_shards", "shard_id")},
+               sdpa_enabled=dict(flash=torch.backends.cuda.flash_sdp_enabled(),
+                                 mem_efficient=torch.backends.cuda.mem_efficient_sdp_enabled(),
+                                 math=torch.backends.cuda.math_sdp_enabled()),
+               matmul_tf32=torch.backends.cuda.matmul.allow_tf32)
+    try:
+        import diffusers
+        env["diffusers"] = diffusers.__version__
+    except Exception:
+        pass
+    try:  # the snapshot folder name is the model revision (commit hash) actually loaded
+        from huggingface_hub import snapshot_download
+        env["model_snapshot"] = snapshot_download(args.pretrained_model_name_or_path, local_files_only=True)
+    except Exception as e:
+        env["model_snapshot"] = f"{args.pretrained_model_name_or_path} (no hub snapshot: {type(e).__name__})"
+    return env
+
+
+def carve_strict(masks: list) -> list:
+    """Non-overlapping masks: mask i loses every token that a smaller instance j also claims (equal
+    areas keep both). Same rule as the MICE processor's `strict` and attention_query_blur.py."""
+    if len(masks) < 2:
+        return masks
+    areas = [float(m.sum()) for m in masks]
+    carved = []
+    for i, m in enumerate(masks):
+        new = m.clone().float()
+        for j, other in enumerate(masks):
+            if i != j and areas[j] < areas[i]:
+                new = new * (1 - other.to(new.device).float())
+        carved.append(new)
+    return carved
+
+
 def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAttention | None,
-                   anchor: BackgroundAnchor, sample, use_masks: bool, mem: dict, **pipe_kwargs):
+                   anchor: BackgroundAnchor, sample, use_masks: bool, mem: dict, strict: bool = False,
+                   **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`).
     mem receives peak GPU memory (GB): overall and inside the transformer forwards."""
     orig_prepare_latents = pipe.prepare_latents
@@ -289,6 +338,8 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
             masks = [resize_mask(m, Ht, Wt) for m in sample['masks']]
         else:
             masks = create_position_mask_list(sample['bboxes'], height, width, pipe.vae_scale_factor)
+        if strict:
+            masks = carve_strict(masks)
         ortho.setup(masks, device=latents.device)
         gap.setup(masks, device=latents.device)
         anchor.setup(masks, device=latents.device)
@@ -361,6 +412,10 @@ def main():
     logger.info(f"Results will be saved to {save_dir}")
 
     pipe = load_pipeline(args, device)
+    env = environment(args, pipe)
+    with open(save_dir / f"env_{env['host']}_shard{args.shard_id}.json", "w") as f:
+        json.dump(env, f, indent=2)
+    logger.info(f"Environment: {env}")
     if args.cpu_offload:
         pipe.to("cpu")
         pipe.enable_model_cpu_offload(device=device)
@@ -394,12 +449,12 @@ def main():
                      exclude_double=resolve(args.gap_exclude_double, n_double),
                      exclude_single=resolve(args.gap_exclude_single, n_single))
     if gap.lam > 0:
-        if attn_setting_enum.value.lower() != "apitasmkernelnonlap":
+        if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--gap_lambda needs --attention_setting apitasmkernelnonlap")
         logger.info(f"Contact gap: {gap}")
     chunked = None
     if args.attn_chunk > 0:
-        if attn_setting_enum.value.lower() != "apitasmkernelnonlap":
+        if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--attn_chunk needs --attention_setting apitasmkernelnonlap")
         chunked = ChunkedAttention(args.attn_chunk)
     anchor = BackgroundAnchor(strength=args.bg_anchor, tau=args.bg_tau, margin=args.bg_margin, steps=args.bg_steps)
@@ -444,7 +499,7 @@ def main():
             try:
                 mem = {}
                 result = run_with_ortho(
-                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem,
+                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem, args.strict_masks,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
