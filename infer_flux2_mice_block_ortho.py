@@ -34,6 +34,7 @@ from flux2.block_ortho import BlockOrtho
 from flux2.contact_gap import ContactGap
 from flux2.chunked_attention import ChunkedAttention
 from flux2.bg_anchor import BackgroundAnchor
+from flux2.attention_mass import AttentionMass
 import flux2.attention.attention_processor_APITASM_kernel_nonlap as mice_attn_module
 
 SEED = 0
@@ -134,10 +135,24 @@ def parse_args():
         parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
                             help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
                                  f"--exclude_{kind}); applied on top of --exclude_{kind}")
+    parser.add_argument("--mask_cover", type=float, default=0.0,
+                        help="Build the token-grid instance masks by coverage instead of nearest sampling: a token "
+                             "belongs to the instance if >= this fraction of its 16x16 cell is object (e.g. 0.25). "
+                             "Applies to MICE's text binding and to all steering. 0 = off (pipeline's nearest "
+                             "resize from the original mask resolution, which drops object tokens, worst on "
+                             "small objects). Pair with --strict_masks: coverage lets neighbors share boundary tokens")
     parser.add_argument("--strict_masks", action="store_true",
                         help="Carve overlapping instance masks before steering / gap / anchor: each mask loses the "
                              "tokens also claimed by any smaller instance (same rule as --strict in "
                              "capture_query_blur_leakage.py and the 'apitasmkernelnonlapstrict' attention setting)")
+    parser.add_argument("--log_attn_mass", action="store_true",
+                        help="Record, per step and block, where each instance's latent tokens attend (own text, own "
+                             "latent/context, neighbors, background, local neighbourhood); saved as "
+                             "<id>_attn_mass.json. Diagnostic only, results unchanged. Summarize with "
+                             "summarize_attn_mass.py")
+    parser.add_argument("--log_attn_steps", type=str, default="all", help="Steps to record, or \"all\"")
+    parser.add_argument("--log_attn_near", type=int, default=2,
+                        help="Radius (tokens) of the 'local' own-latent neighbourhood in the attention log")
     parser.add_argument("--attn_chunk", type=int, default=0,
                         help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
                              "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
@@ -202,6 +217,7 @@ def parse_args():
 
     args.gap_steps = None if args.gap_steps == "all" else str2list(args.gap_steps)
     args.bg_steps = None if args.bg_steps == "all" else str2list(args.bg_steps)
+    args.log_attn_steps = None if args.log_attn_steps == "all" else str2list(args.log_attn_steps)
     args.src_steps = (None if args.src_steps is None else
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
@@ -215,6 +231,8 @@ def parse_args():
         parser.error(f"--shard_id must be in [0, {args.num_shards})")
     if args.multi_gpu and args.num_shards > 1:
         parser.error("--multi_gpu (model parallel) cannot be combined with --num_shards > 1 (data parallel)")
+    if args.mask_cover > 0 and not args.use_masks:
+        parser.error("--mask_cover needs --use_masks (bboxes are already rounded outward)")
     if args.multi_gpu and args.cpu_offload:
         parser.error("--cpu_offload cannot be combined with --multi_gpu")
     return args
@@ -275,6 +293,8 @@ def auto_exp_name(args) -> str:
         parts.append("nofree")
     if args.free_context:
         parts.append("fc")
+    if args.mask_cover > 0:
+        parts.append(f"cov{args.mask_cover * 100:g}")
     if args.strict_masks:
         parts.append("strict")
     name = "_".join(parts)
@@ -307,6 +327,18 @@ def environment(args, pipe) -> dict:
     return env
 
 
+def coverage_masks(masks: list, Ht: int, Wt: int, thresh: float) -> list:
+    """Token-grid masks: token in the instance iff >= thresh of its cell is object (area interpolation
+    from the full-resolution mask). Returned at token resolution, so the pipeline's own nearest resize
+    to (Ht, Wt) leaves them unchanged."""
+    out = []
+    for m in masks:
+        cover = torch.nn.functional.interpolate(torch.as_tensor(m).float()[None, None], size=(Ht, Wt),
+                                                mode="area")[0, 0]
+        out.append((cover >= thresh).float())
+    return out
+
+
 def carve_strict(masks: list) -> list:
     """Non-overlapping masks: mask i loses every token that a smaller instance j also claims (equal
     areas keep both). Same rule as the MICE processor's `strict` and attention_query_blur.py."""
@@ -325,7 +357,7 @@ def carve_strict(masks: list) -> list:
 
 def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAttention | None,
                    anchor: BackgroundAnchor, sample, use_masks: bool, mem: dict, strict: bool = False,
-                   **pipe_kwargs):
+                   attn_log: AttentionMass | None = None, **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`).
     mem receives peak GPU memory (GB): overall and inside the transformer forwards."""
     orig_prepare_latents = pipe.prepare_latents
@@ -343,6 +375,8 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         ortho.setup(masks, device=latents.device)
         gap.setup(masks, device=latents.device)
         anchor.setup(masks, device=latents.device)
+        if attn_log is not None:
+            attn_log.setup(masks, device=latents.device)
         return latents, latent_ids
 
     def _pre_forward(module, args, kwargs):
@@ -351,6 +385,8 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
                             img_len=kwargs['hidden_states'].shape[1])
         gap.begin_forward(step_idx=i)
         anchor.begin_forward(sigma=float(pipe.scheduler.sigmas[i]), step_idx=i)
+        if attn_log is not None:
+            attn_log.begin_forward(step_idx=i)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             mem.setdefault("text_encoding", torch.cuda.max_memory_allocated() / 2**30)  # first step only
@@ -374,6 +410,8 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         handles += chunked.attach(mice_attn_module)
     if gap.lam > 0:
         handles += gap.attach(pipe.transformer, mice_attn_module)
+    if attn_log is not None:  # outermost: sees the final mask
+        handles += attn_log.attach(pipe.transformer, mice_attn_module)
     try:
         out = pipe(**pipe_kwargs)
         if torch.cuda.is_available():
@@ -394,7 +432,7 @@ def main():
     # Existing results are skipped, so a folder must never mix settings: refuse to reuse one made
     # with different generation args (run-control args like sample selection/device may differ).
     run_control = {"num_samples", "sample_ids", "device", "num_shards", "shard_id", "multi_gpu", "overwrite",
-                   "attn_chunk", "cpu_offload"}
+                   "attn_chunk", "cpu_offload", "log_attn_mass", "log_attn_steps", "log_attn_near"}
     settings = {k: v for k, v in vars(args).items() if k not in run_control}
     args_path = save_dir / "args.json"
     if args_path.exists() and not args.overwrite:
@@ -457,6 +495,11 @@ def main():
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--attn_chunk needs --attention_setting apitasmkernelnonlap")
         chunked = ChunkedAttention(args.attn_chunk)
+    attn_log = None
+    if args.log_attn_mass:
+        if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
+            raise SystemExit("--log_attn_mass needs --attention_setting apitasmkernelnonlap")
+        attn_log = AttentionMass(steps=args.log_attn_steps, near=args.log_attn_near)
     anchor = BackgroundAnchor(strength=args.bg_anchor, tau=args.bg_tau, margin=args.bg_margin, steps=args.bg_steps)
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
@@ -491,6 +534,8 @@ def main():
             logger.info(f"Processing sample {sample_id}...")
 
             kwargs = {}
+            if args.use_masks and args.mask_cover > 0:
+                sample = dict(sample, masks=coverage_masks(sample['masks'], h // 16, w // 16, args.mask_cover))
             if args.use_masks:
                 kwargs['instance_masks_yx'] = sample['masks']
             else:
@@ -499,7 +544,7 @@ def main():
             try:
                 mem = {}
                 result = run_with_ortho(
-                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem, args.strict_masks,
+                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem, args.strict_masks, attn_log,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
@@ -532,6 +577,9 @@ def main():
                              **({"bg_anchor": anchor.stats} if anchor.strength > 0 else {})}
                     json.dump({"steering": ortho.stats, **extra} if extra else ortho.stats, f)
                 logger.info(f"Saved result to {save_path}")
+                if attn_log is not None:
+                    with open(save_dir / f"{sample_id}_attn_mass.json", "w") as f:
+                        json.dump(attn_log.records, f)
                 if mem:
                     logger.info("Peak GPU memory (GB): " + ", ".join(f"{k} {v:.1f}" for k, v in mem.items()))
                 del result, generated_image

@@ -1,0 +1,368 @@
+<title>Multi-Object Edit Study</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+/* Layout: one trial per screen. Source + instructions strip, then the two edits large, then the two questions. */
+:root {
+  --bg: #f3f4f6; --panel: #ffffff; --fg: #1b2230; --muted: #5d6676; --line: #d9dde4;
+  --accent: #1f5f73; --accent-fg: #ffffff; --chosen: #e3eff3; --warn: #8a4b0f;
+  --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12161d; --panel: #1b212b; --fg: #e6e9ee; --muted: #9aa3b2; --line: #2e3644;
+  --accent: #6fb3c8; --accent-fg: #0d1a20; --chosen: #1f3640; --warn: #e0a868; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12161d; --panel: #1b212b; --fg: #e6e9ee; --muted: #9aa3b2; --line: #2e3644;
+  --accent: #6fb3c8; --accent-fg: #0d1a20; --chosen: #1f3640; --warn: #e0a868; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 16px; line-height: 1.5; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 16px; padding-block: 20px 48px; display: grid; gap: 18px; }
+header.top { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+h1 { font-size: 1.35rem; margin: 0; text-wrap: balance; }
+h2 { font-size: 1.1rem; margin: 0; text-wrap: balance; }
+.label { font-family: var(--mono); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.muted { color: var(--muted); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; display: grid; gap: 12px; }
+.prose { max-width: 65ch; display: grid; gap: 10px; }
+.prose p, .prose ul { margin: 0; }
+button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); padding: 8px 16px; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button:focus-visible, .cand:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.tabs { display: flex; gap: 6px; }
+.tabs button[aria-pressed="true"] { background: var(--chosen); border-color: var(--accent); }
+.progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.progress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+.ctx { display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.ctx img { width: 100%; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; }
+.edits { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; font-size: .95rem; max-height: 9.5em; overflow-y: auto; }
+.edits li { min-width: 0; }
+.edits .arrow { color: var(--muted); padding-inline: 6px; }
+.pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.cand { display: grid; gap: 6px; }
+.cand img { width: 100%; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; background: var(--line); }
+.cand .tag { font-family: var(--mono); font-weight: 500; font-size: .95rem; }
+.qs { display: grid; gap: 10px; }
+.q { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.q .text { flex: 1 1 280px; min-width: 0; }
+.q .choices { display: flex; gap: 8px; }
+.q .choices button { min-width: 92px; font-family: var(--mono); }
+.q .choices button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.nav { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: center; }
+.keys { font-size: .85rem; }
+kbd { font-family: var(--mono); font-size: .8rem; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; background: var(--panel); }
+.notice { border-left: 3px solid var(--warn); padding-left: 10px; color: var(--warn); }
+.zoom { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: grid; place-items: center; padding: 16px; z-index: 10; cursor: zoom-out; }
+.zoom img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.stat .big { font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--line); }
+.bar .ours { background: var(--accent); }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: .92rem; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-weight: 600; color: var(--muted); }
+@media (max-width: 640px) {
+  .ctx { grid-template-columns: minmax(0, 1fr); }
+  .ctx img { max-width: 260px; }
+  .pair { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) { .progress > div { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="label">Blind pairwise comparison</div>
+      <h1>Multi-Object Edit Study</h1>
+    </div>
+    <div class="tabs" id="tabs" hidden>
+      <button id="tab-study" aria-pressed="true">Study</button>
+      <button id="tab-results" aria-pressed="false">Results</button>
+    </div>
+  </header>
+
+  <section id="intro" class="panel">
+    <div class="prose">
+      <h2>What you will do</h2>
+      <p>Each screen shows an original photo, the list of objects that were replaced in it, and two edited versions, <b>A</b> and <b>B</b>, made by two different methods. The order and sides are random.</p>
+      <ul>
+        <li><b>Natural:</b> which edit fits the scene more naturally? Think lighting, shadows, scale, perspective, focus, and whether objects look pasted in or blended into each other.</li>
+        <li><b>Instruction:</b> which edit better carries out the listed replacements, with every object becoming its own target?</li>
+      </ul>
+      <p>Pick one for each question, even when they are close. Click any image to see it full size. There are <span id="n-trials">55</span> screens, about 10 to 15 minutes. You can stop and come back; your answers are kept.</p>
+    </div>
+    <p class="notice" id="no-save" hidden></p>
+    <div><button class="primary" id="start" disabled>Loading…</button></div>
+  </section>
+
+  <section id="trial" class="panel" hidden>
+    <div class="nav">
+      <span class="label" id="counter">Screen 1 of 55</span>
+      <span class="label" id="saved"></span>
+    </div>
+    <div class="progress"><div id="bar"></div></div>
+    <div class="ctx">
+      <div class="cand">
+        <span class="label">Original</span>
+        <img id="img-src" alt="Original photo">
+      </div>
+      <div class="cand">
+        <span class="label">Replacements (<span id="n-edits"></span>)</span>
+        <ul class="edits" id="edits"></ul>
+      </div>
+    </div>
+    <div class="pair">
+      <div class="cand"><span class="tag">A</span><img id="img-a" alt="Edit A"></div>
+      <div class="cand"><span class="tag">B</span><img id="img-b" alt="Edit B"></div>
+    </div>
+    <div class="qs">
+      <div class="q">
+        <span class="text"><b>Natural:</b> which edit fits the scene more naturally?</span>
+        <span class="choices" data-q="natural"><button data-v="A" aria-pressed="false">A <kbd>1</kbd></button><button data-v="B" aria-pressed="false">B <kbd>2</kbd></button></span>
+      </div>
+      <div class="q">
+        <span class="text"><b>Instruction:</b> which edit better carries out the replacements?</span>
+        <span class="choices" data-q="follow"><button data-v="A" aria-pressed="false">A <kbd>3</kbd></button><button data-v="B" aria-pressed="false">B <kbd>4</kbd></button></span>
+      </div>
+    </div>
+    <div class="nav">
+      <button id="back">Back</button>
+      <span class="keys muted">Keys: <kbd>1</kbd>/<kbd>2</kbd> natural, <kbd>3</kbd>/<kbd>4</kbd> instruction, <kbd>Enter</kbd> next</span>
+      <button class="primary" id="next" disabled>Next</button>
+    </div>
+  </section>
+
+  <section id="done" class="panel" hidden>
+    <div class="prose">
+      <h2>All done, thank you</h2>
+      <p id="done-text">Your answers are saved. You can close this page.</p>
+    </div>
+    <div><button id="review">Review my answers</button></div>
+  </section>
+
+  <section id="results" hidden>
+    <div class="panel">
+      <div class="nav"><h2>Results</h2><span class="label" id="res-meta"></span></div>
+      <p class="muted" id="res-empty">No answers yet. Results appear here as raters finish screens.</p>
+      <div class="stats" id="res-stats"></div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>Raters</h2>
+      <div class="scroll"><table id="res-raters"></table></div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>Pairs</h2>
+      <p class="muted">Share of raters preferring ours, per pair. Lowest first, so the cases where MICE wins are on top.</p>
+      <div class="scroll"><table id="res-pairs"></table></div>
+    </div>
+  </section>
+</div>
+<div class="zoom" id="zoom" hidden><img id="zoom-img" alt="Full size"></div>
+
+<script id="pairs-data" type="application/json">[{"id": "p01", "sample": "18", "ours": "x", "edits": [["truck", "vintage horse-drawn carriage"], ["car", "checkered taxi"], ["car", "a vibrant yellow car"], ["car", "classic open-top convertible"], ["car", "a vibrant red car"], ["car", "a vibrant blue car"], ["car", "a vibrant pink car"]]}, {"id": "p02", "sample": "20", "ours": "y", "edits": [["spoon", "wooden fork"], ["sandwich", "piece of roasted chicken"], ["bottle", "glass oil dispenser"], ["sandwich", "portion of potato wedges"], ["sandwich", "corn cob"], ["sandwich", "dinner roll"]]}, {"id": "p03", "sample": "24", "ours": "x", "edits": [["tv", "a vibrant aquarium with colorful fish"], ["cat", "a playful golden retriever puppy"], ["cat", "a large plush teddy bear"], ["dining table", "a leather upholstered ottoman"], ["laptop", "a framed family photograph"], ["book", "a television remote control"]]}, {"id": "p04", "sample": "25", "ours": "y", "edits": [["fork", "silver spoon"], ["carrot", "ripe banana"], ["carrot", "ripe banana"], ["carrot", "ripe banana"], ["cake", "chocolate lava cake"]]}, {"id": "p05", "sample": "35", "ours": "y", "edits": [["bottle", "pepper grinder"], ["bottle", "salt shaker"], ["cup", "ceramic coffee mug"], ["bowl", "small plate of fruit"], ["napkin holder", "blue vase"]]}, {"id": "p06", "sample": "37", "ours": "x", "edits": [["teddy bear", "sleek ceramic cat figurine"], ["teddy bear", "small porcelain dog statue"], ["teddy bear", "miniature glass elephant"], ["teddy bear", "small wooden owl carving"], ["book", "leather-bound Moby Dick book spine"], ["book", "vintage Great Gatsby book spine"], ["book", "classic War and Peace book spine"], ["book", "Crime and Punishment book spine"], ["book", "The Odyssey book spine"]]}, {"id": "p07", "sample": "53", "ours": "y", "edits": [["bottle", "balsamic vinegar bottle"], ["fork", "table spoon"], ["wineglass", "glass of white wine"], ["wineglass", "glass of white wine"], ["wineglass", "glass of red wine"], ["salad", "lasagna"], ["wine bottle", "champagne bottle"]]}, {"id": "p08", "sample": "57", "ours": "y", "edits": [["tv", "framed mirror"], ["couch", "velvet sectional sofa"], ["couch", "vintage leather armchair"], ["couch", "upholstered ottoman"], ["chair", "designer wooden stool"], ["chair", "designer wooden stool"], ["vase", "antique clock"], ["couch", "vintage leather armchair"]]}, {"id": "p09", "sample": "66", "ours": "y", "edits": [["boat", "vintage wooden canoe"], ["handbag", "hanging basket of flowers"], ["handbag", "ornate paper lantern"], ["handbag", "a blue open fan"], ["handbag", "decorative silk banner"], ["handbag", "a green open fan"], ["handbag", "bundle of lemongrass"], ["handbag", "a pink open fan"]]}, {"id": "p10", "sample": "74", "ours": "y", "edits": [["doughnut", "sesame bagel"], ["doughnut", "poppy seed bagel"], ["doughnut", "plain bagel"], ["doughnut", "everything bagel"], ["doughnut", "onion bagel"], ["doughnut", "garlic bagel"], ["doughnut", "cinnamon raisin bagel"], ["doughnut", "blueberry bagel"], ["doughnut", "chocolate chip bagel"], ["doughnut", "pumpernickel bagel"], ["doughnut", "egg bagel"], ["doughnut", "salt bagel"], ["doughnut", "whole wheat bagel"], ["doughnut", "sourdough bagel"], ["doughnut", "asiago bagel"], ["doughnut", "jalape\u00f1o cheddar bagel"], ["doughnut", "rosemary sea salt bagel"], ["doughnut", "sun-dried tomato bagel"], ["doughnut", "spinach bagel"], ["doughnut", "rye bagel"], ["doughnut", "french toast bagel"], ["doughnut", "honey wheat bagel"], ["doughnut", "multigrain bagel"], ["doughnut", "pumpkin spice bagel"], ["doughnut", "apple cinnamon bagel"], ["doughnut", "cranberry bagel"], ["doughnut", "olive bagel"], ["doughnut", "pesto bagel"], ["doughnut", "cheese bagel"], ["doughnut", "oat bagel"]]}, {"id": "p11", "sample": "79", "ours": "y", "edits": [["giraffe", "an alpaca"], ["giraffe", "an ostrich"], ["giraffe", "a camel"], ["giraffe", "a llama"], ["giraffe", "a gazelle"]]}, {"id": "p12", "sample": "81", "ours": "y", "edits": [["cup", "a cup of cappuccino"], ["fork", "stainless steel spoon"], ["fork", "bamboo chopstick"], ["knife", "cake server"], ["pizza", "belgian waffle"], ["spoon", "cinnamon stick"], ["cup", "jar of maple syrup"]]}, {"id": "p13", "sample": "82", "ours": "x", "edits": [["chair", "vintage wooden armchair"], ["laptop", "open sketchbook with architectural drawings"], ["laptop", "classic typewriter"], ["laptop", "large leather-bound journal"], ["keyboard", "row of assorted colorful succulents"]]}, {"id": "p14", "sample": "86", "ours": "y", "edits": [["potted plant", "a decorative fruit basket"], ["bottle", "a glass carafe of orange juice"], ["bottle", "a ceramic vase"], ["bowl", "a wooden salad bowl"], ["bowl", "a blue porcelain tureen"], ["microwave", "a toaster oven"], ["tv", "a digital picture frame"]]}, {"id": "p15", "sample": "92", "ours": "y", "edits": [["teddy bear", "a fluffy penguin in a hockey jersey"], ["teddy bear", "a polar teddy bear wearing a winter scarf"], ["teddy bear", "an arctic fox toy with a little winter hat"], ["teddy bear", "a snowy owl"], ["teddy bear", "a small walrus figurine"]]}, {"id": "p16", "sample": "93", "ours": "x", "edits": [["bus", "futuristic maglev train"], ["bus", "sleek electric shuttle"], ["bus", "high-speed tram"], ["bus", "heavy-duty logistics truck"], ["bus", "hydrogen-powered transit bus"], ["bus", "retro-style trolley car"], ["bus", "premium travel coach"], ["bus", "yellow school bus"], ["car", "autonomous electric sedan"], ["car", "luxury electric SUV"], ["car", "military-grade armored vehicle"], ["car", "white compact hatchback"], ["car", "metallic smart car"], ["bus", "classic red double-decker bus"], ["bus", "modern commuter coach"], ["car", "low-profile sports car"], ["car", "silver electric passenger van"], ["car", "gray hybrid crossover"], ["car", "dark blue hatchback"], ["car", "bright red convertible"], ["car", "white luxury station wagon"], ["car", "commercial cargo van"]]}, {"id": "p17", "sample": "106", "ours": "y", "edits": [["cup", "glazed donut"], ["cup", "slice of lemon"], ["cup", "strawberry"], ["cup", "cupcake"], ["cup", "macaron"], ["cup", "chocolate chip cookie"], ["cup", "mini fruit tart"], ["cup", "chocolate truffle"], ["cup", "sugar cube"], ["cup", "marshmallow"], ["cup", "cinnamon roll"], ["cup", "croissant"]]}, {"id": "p18", "sample": "115", "ours": "x", "edits": [["zebra", "an okapi"], ["zebra", "an antelope"], ["zebra", "a gazelle"], ["zebra", "a wildebeest"], ["giraffe", "an ostrich"]]}, {"id": "p19", "sample": "124", "ours": "y", "edits": [["chair", "a vintage wooden chair"], ["knife", "a silver butter knife"], ["bowl", "a decorative bowl of fresh fruit"], ["bowl", "a porcelain bowl of strawberries"], ["potted plant", "a terracotta pot of blooming lavender"]]}, {"id": "p20", "sample": "126", "ours": "x", "edits": [["sheep", "baby goat"], ["sheep", "brown alpaca"], ["sheep", "white goat"], ["sheep", "fawn"], ["sheep", "shaggy dog"], ["sheep", "pony"], ["sheep", "spotted pig"], ["sheep", "horned ram"], ["sheep", "black sheep"], ["sheep", "mini pony"]]}, {"id": "p21", "sample": "128", "ours": "y", "edits": [["doughnut", "a chocolate tart"], ["doughnut", "a fudge brownie"], ["doughnut", "a cinnamon bun"], ["doughnut", "a sesame bagel"], ["doughnut", "a fruit tart"], ["doughnut", "a butter croissant"]]}, {"id": "p22", "sample": "134", "ours": "x", "edits": [["umbrella", "a pink umbrella"], ["umbrella", "a red umbrella"], ["umbrella", "a blue umbrella"], ["umbrella", "a purple umbrella"], ["umbrella", "an orange umbrella"], ["umbrella", "a yellow umbrella"], ["umbrella", "a green umbrella"], ["umbrella", "a light-blue umbrella"], ["umbrella", "a blue umbrella"]]}, {"id": "p23", "sample": "135", "ours": "y", "edits": [["pizza", "a large tray of vegetable lasagna"], ["pizza", "a small plate of tomato bruschetta"], ["pizza", "slices of spinach and feta quiche"], ["pizza", "a platter of gourmet sandwiches"], ["pizza", "a rectangular slice of fruit tart"], ["pizza", "a bowl of fresh Caesar salad"], ["pizza", "a whole chocolate fudge cake"], ["pizza", "a basket of warm dinner rolls"]]}, {"id": "p24", "sample": "137", "ours": "y", "edits": [["cat", "a squirrel monkey"], ["banana", "a cluster of yellow starfruits"], ["banana", "a cluster of yellow starfruits"], ["banana", "a cluster of yellow starfruits"], ["banana", "a cluster of yellow starfruits"], ["banana", "a cluster of yellow starfruits"]]}, {"id": "p25", "sample": "142", "ours": "y", "edits": [["pillow", "red silk cushion"], ["pillow", "cream linen cushion"], ["pillow", "yellow sunflower pillow"], ["pillow", "light grey cushion"], ["pillow", "dark blue leather cushion"], ["remote control", "sleek black smartphone"], ["curtain", "strand of warm white fairy lights"], ["curtain", "hanging macrame planter"], ["coaster", "vintage postcard"], ["coaster", "small notebook"], ["coaster", "glass magnifying glass"]]}, {"id": "p26", "sample": "149", "ours": "x", "edits": [["coat", "thick wool blanket"], ["suitcase", "large wooden treasure chest"], ["suitcase", "small cardboard box"], ["suitcase", "vintage steamer trunk"], ["suitcase", "colorful laundry basket"], ["suitcase", "stack of books"]]}, {"id": "p27", "sample": "151", "ours": "x", "edits": [["doughnut", "chocolate croissant"], ["doughnut", "blueberry muffin"], ["doughnut", "cinnamon roll"], ["doughnut", "apple danish"], ["tray", "wooden board"], ["tray", "ceramic platter"]]}, {"id": "p28", "sample": "157", "ours": "x", "edits": [["sheep", "white goat"], ["sheep", "border collie"], ["sheep", "brown calf"], ["sheep", "white llama"], ["sheep", "sleeping pig"], ["sheep", "resting donkey"]]}, {"id": "p29", "sample": "163", "ours": "x", "edits": [["flower arrangement", "a bowl of fresh lemons"], ["fork", "a gold-finished fork"], ["candle", "a glass jar with fairy lights"], ["napkin", "a beige fringed linen napkin"], ["candle holder", "a black metal geometric stand"], ["spoon", "a wooden rice paddle"], ["spoon", "a gold-finished dessert spoon"], ["edible corn", "a grilled asparagus spear"], ["edible corn", "a roasted baby potato"], ["edible corn", "a piece of focaccia bread"], ["edible corn", "a grilled zucchini slice"], ["edible corn", "a roasted parsnip"]]}, {"id": "p30", "sample": "165", "ours": "x", "edits": [["ham", "grilled halloumi slice"], ["ham", "smoked salmon fillet"], ["ham", "crispy bacon strip"], ["ham", "saut\u00e9ed portobello mushroom"], ["tray", "rustic wooden serving board"], ["tomato", "fresh avocado slice"], ["tomato", "crisp cucumber slice"]]}, {"id": "p31", "sample": "168", "ours": "y", "edits": [["mattress", "modern black platform bed"], ["blanket", "colorful silk scarf"], ["blanket", "thick navy blue comforter"], ["dog", "fluffy white cat"], ["television set", "framed landscape painting"]]}, {"id": "p32", "sample": "175", "ours": "x", "edits": [["carrot", "a parsnip"], ["garlic", "a macadamia nut"], ["garlic", "a macadamia nut"], ["garlic", "a macadamia nut"], ["celery", "a long baguette"]]}, {"id": "p33", "sample": "190", "ours": "y", "edits": [["book", "a small notepad"], ["book", "a stack of postcards"], ["book", "a travel guide"], ["book", "a map"], ["book", "a laptop"], ["book", "a tablet"], ["book", "a thin diary"], ["book", "a sketchbook"], ["book", "a photo album"], ["suitcase", "a vintage trunk"]]}, {"id": "p34", "sample": "196", "ours": "y", "edits": [["pillow", "emerald green silk pillow"], ["pillow", "golden yellow velvet pillow"], ["pillow", "white textured sham"], ["lamp", "black matte minimalist lamp"], ["blanket", "neutral grey cashmere throw"]]}, {"id": "p35", "sample": "205", "ours": "x", "edits": [["carrot", "glazed parsnip"], ["carrot", "honeyed parsnip"], ["fork", "antique spoon"], ["place mat", "slate board"], ["brussels sprouts", "cherry tomato"], ["brussels sprouts", "cherry tomato"], ["brussels sprouts", "cherry tomato"], ["brussels sprouts", "cherry tomato"], ["brussels sprouts", "cherry tomato"], ["potato", "golden beet"], ["potato", "golden beet"], ["onion", "grilled artichoke heart"], ["steak (food)", "bacon slice"], ["steak (food)", "bacon slice"]]}, {"id": "p36", "sample": "212", "ours": "x", "edits": [["blanket", "a navy blue comforter"], ["blanket", "a white knitted throw"], ["teddy bear", "a white Persian cat"], ["teddy bear", "a small gray kitten"], ["teddy bear", "a large ginger cat"], ["pillow", "a yellow velvet cushion"], ["pillow", "a white linen pillow"]]}, {"id": "p37", "sample": "216", "ours": "y", "edits": [["fireplug", "tall birdhouse"], ["fireplug", "garden gnome"], ["fireplug", "decorative rock"], ["fireplug", "blue mailbox"], ["fireplug", "stone garden pillar"], ["fireplug", "vintage water pump"], ["fireplug", "ornate stone fountain"], ["fireplug", "rustic wooden stump"], ["fireplug", "cherub statue"]]}, {"id": "p38", "sample": "219", "ours": "x", "edits": [["elephant", "a grazing zebra"], ["elephant", "a small warthog"], ["elephant", "a sitting giraffe"], ["elephant", "a curious meerkat"], ["elephant", "a resting cape buffalo"], ["elephant", "a wading hippopotamus"], ["elephant", "a sturdy rhinoceros"], ["elephant", "a prowling lioness"], ["elephant", "a spotted hyena"]]}, {"id": "p39", "sample": "225", "ours": "x", "edits": [["blanket", "a luxurious navy blue silk duvet"], ["towel", "a plush white sheepskin rug"], ["pillow", "a navy blue silk pillow"], ["pillow", "a large grey cable-knit throw pillow"], ["pillow", "a mustard yellow velvet pillow"], ["pillow", "a charcoal grey linen pillow"], ["pillow", "a mustard yellow velvet pillow"], ["pillow", "a charcoal grey linen pillow"]]}, {"id": "p40", "sample": "229", "ours": "x", "edits": [["whipped cream", "a scoop of vanilla ice cream"], ["whipped cream", "a dollop of chocolate custard"], ["place mat", "a blue linen napkin"], ["crape", "a fluffy pancake"], ["crape", "a golden brown waffle"], ["knife", "a silver spoon"]]}, {"id": "p41", "sample": "236", "ours": "y", "edits": [["apple", "pomegranate"], ["apple", "pear"], ["basket", "silver basket"], ["basket", "wire mesh basket"], ["orange (fruit)", "apple"], ["orange (fruit)", "lemon"], ["orange (fruit)", "avocado"]]}, {"id": "p42", "sample": "239", "ours": "x", "edits": [["cake", "purple frosted cake"], ["cake", "red velvet cake"], ["cake", "carrot cake"], ["cake", "spotted frosted cake"], ["cake", "striped frosted cake"], ["cake", "green frosted cake"], ["cake", "rainbow frosted cake"], ["cake", "lavander frosted cake"], ["cake", "red frosted cake"], ["cake", "orange frosted cake"], ["cake", "chocolate frosted cake"], ["cake", "blue frosted cake"], ["cake", "yellow frosted cake"], ["cake", "pink frosted cake"]]}, {"id": "p43", "sample": "241", "ours": "y", "edits": [["pillow", "textured knit cushion"], ["pillow", "velvet lumbar pillow"], ["table", "wooden dining table"], ["table", "rustic storage trunk"], ["painting", "framed vintage map"], ["painting", "minimalist wall clock"], ["fireplace", "modern black stone fireplace"], ["television set", "large framed landscape mirror"]]}, {"id": "p44", "sample": "249", "ours": "x", "edits": [["book", "a sleek tablet"], ["pillow", "a bright yellow velvet rectangular cushion"], ["pillow", "a navy blue patterned square cushion"], ["pillow", "a deep teal silk square cushion"], ["pillow", "a cream-colored chunky knit throw pillow"], ["vase", "a small metallic gold geometric sculpture"], ["vase", "a minimalist black ceramic mini bust"], ["lamp", "a modern matte black arched floor lamp"], ["thermostat", "a small square digital picture frame"], ["coffee table", "a minimalist low-profile black metal coffee table"], ["sofa", "a contemporary dark charcoal gray upholstered sofa"], ["bowl", "a stack of three small decorative hardback books"], ["bowl", "a small potted green succulent plant"], ["bowl", "a scented candle in a frosted glass jar"], ["bowl", "a circular gray stone drink coaster"]]}, {"id": "p45", "sample": "253", "ours": "x", "edits": [["plate", "rustic wooden serving board"], ["sandwich", "gourmet cheeseburger with fries"], ["cup", "glass of red wine"], ["cup", "mojito with mint leaves"], ["bowl", "small dish of creamy coleslaw"]]}, {"id": "p46", "sample": "258", "ours": "y", "edits": [["turtle", "miniature plastic dinosaur"], ["blanket", "patchwork quilt"], ["teddy bear", "stuffed elephant"], ["teddy bear", "plush rabbit"], ["teddy bear", "stuffed lion cub"]]}, {"id": "p47", "sample": "262", "ours": "x", "edits": [["flower arrangement", "a sunflower"], ["tomato", "a ripe orange"], ["tomato", "a ripe orange"], ["tomato", "a ripe orange"], ["tomato", "a ripe orange"], ["tomato", "a ripe orange"], ["bowl", "a rustic wooden bowl"]]}, {"id": "p48", "sample": "266", "ours": "x", "edits": [["apple", "pear slice"], ["apple", "mango slice"], ["apple", "melon slice"], ["apple", "orange segment"], ["apple", "peach slice"], ["apple", "kiwi slice"], ["banana", "bunch of purple grapes"], ["sandwich", "slice of salmon fillet"]]}, {"id": "p49", "sample": "273", "ours": "x", "edits": [["place mat", "cork mat"], ["place mat", "cork mat"], ["glass (drink container)", "crystal goblet"], ["knife", "brushed metal fork"], ["knife", "brushed metal fork"], ["pizza", "portion of lasagna"], ["pizza", "portion of lasagna"], ["pizza", "portion of lasagna"], ["pizza", "portion of lasagna"]]}, {"id": "p50", "sample": "274", "ours": "x", "edits": [["heater", "decorative wooden radiator cover"], ["kettle", "vintage-style espresso machine"], ["paper towel", "vase of fresh basil"], ["mug", "glass of orange juice"], ["mug", "a blueberry muffin"]]}]</script>
+<script>
+(() => {
+  const PAIRS = JSON.parse(document.getElementById("pairs-data").textContent);
+  const REPEATS = 5;
+  const $ = (id) => document.getElementById(id);
+  const state = { uid: null, db: null, user: null, ref: null, answers: {}, trials: [], i: 0, saving: Promise.resolve(), canWrite: true };
+
+  // ---- seeded shuffle so each rater gets a stable order and sides ----
+  function hash(s) { let h = 2166136261; for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
+  function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  function buildTrials(seedStr) {
+    const r = rng(hash(seedStr));
+    const order = PAIRS.map((p) => p.id);
+    for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+    const trials = order.map((id) => ({ key: id, pair: id, oursLeft: r() < 0.5 }));
+    // repeats: 5 pairs from the first half, shown again in the last part with sides swapped
+    const reps = trials.slice(0, 25).filter((_, k) => k % 5 === 2).slice(0, REPEATS);
+    reps.forEach((t, k) => {
+      const at = trials.length - (REPEATS - k) * 4;
+      trials.splice(Math.max(at, 30), 0, { key: t.pair + "r", pair: t.pair, oursLeft: !t.oursLeft, repeat: true });
+    });
+    return trials;
+  }
+  const pairById = Object.fromEntries(PAIRS.map((p) => [p.id, p]));
+  const imgOf = (p, who) => `img/${p.id}_${who === "ours" ? p.ours : (p.ours === "x" ? "y" : "x")}.jpg`;
+
+  // ---- storage: votes/<uid> in db; localStorage fallback (not counted) ----
+  function localKey() { return "edit-study-local"; }
+  function loadLocal() { try { return JSON.parse(localStorage.getItem(localKey()) || "{}"); } catch { return {}; } }
+  function saveLocal() { try { localStorage.setItem(localKey(), JSON.stringify(state.answers)); } catch {} }
+  function persist() {
+    saveLocal();
+    if (!state.ref || !state.canWrite) return;
+    const body = { answers: state.answers, total: state.trials.length,
+                   done: Object.keys(state.answers).length >= state.trials.length, updated: Date.now() };
+    state.saving = state.saving.then(() => state.ref.set(body)).then(
+      () => { $("saved").textContent = "Saved"; },
+      (e) => {
+        if (e && e.code === "invalid_argument") { state.canWrite = false; showNoSave("You can view this study but your answers can't be saved. Ask the owner for Contributor access."); }
+        $("saved").textContent = "Not saved";
+      });
+  }
+  function showNoSave(msg) { $("no-save").textContent = msg; $("no-save").hidden = false; }
+
+  // ---- trial rendering ----
+  function show(section) { for (const id of ["intro", "trial", "done", "results"]) $(id).hidden = id !== section; }
+  function render() {
+    const t = state.trials[state.i], p = pairById[t.pair];
+    const left = t.oursLeft ? "ours" : "mice", right = t.oursLeft ? "mice" : "ours";
+    $("counter").textContent = `Screen ${state.i + 1} of ${state.trials.length}`;
+    $("bar").style.width = `${100 * Object.keys(state.answers).length / state.trials.length}%`;
+    $("img-src").src = `img/${p.id}_s.jpg`;
+    $("img-a").src = imgOf(p, left);
+    $("img-b").src = imgOf(p, right);
+    $("n-edits").textContent = p.edits.length;
+    const ul = $("edits"); ul.replaceChildren();
+    for (const [a, b] of p.edits) {
+      const li = document.createElement("li");
+      const s1 = document.createElement("span"); s1.textContent = a;
+      const ar = document.createElement("span"); ar.className = "arrow"; ar.textContent = "→";
+      const s2 = document.createElement("b"); s2.textContent = b;
+      li.append(s1, ar, s2); ul.append(li);
+    }
+    const ans = state.answers[t.key] || {};
+    for (const q of ["natural", "follow"]) {
+      const picked = ans[q] ? (ans[q] === left ? "A" : "B") : null;
+      document.querySelectorAll(`.choices[data-q="${q}"] button`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === picked)));
+    }
+    $("back").disabled = state.i === 0;
+    $("next").disabled = !(ans.natural && ans.follow);
+    $("next").textContent = state.i === state.trials.length - 1 ? "Finish" : "Next";
+    // preload the next screen
+    const n = state.trials[state.i + 1];
+    if (n) { const q = pairById[n.pair]; for (const s of [`img/${q.id}_s.jpg`, `img/${q.id}_x.jpg`, `img/${q.id}_y.jpg`]) { const im = new Image(); im.src = s; } }
+    state.shownAt = performance.now();
+  }
+  function choose(q, v) {
+    const t = state.trials[state.i];
+    const method = (v === "A") === t.oursLeft ? "ours" : "mice";
+    const prev = state.answers[t.key] || { pair: t.pair, oursLeft: t.oursLeft, repeat: !!t.repeat, ms: 0 };
+    state.answers[t.key] = { ...prev, [q]: method, ms: prev.ms + Math.round(performance.now() - state.shownAt) };
+    state.shownAt = performance.now();
+    render();
+    if (state.answers[t.key].natural && state.answers[t.key].follow) persist();
+  }
+  function next() {
+    const t = state.trials[state.i], a = state.answers[t.key];
+    if (!a || !a.natural || !a.follow) return;
+    if (state.i < state.trials.length - 1) { state.i++; render(); window.scrollTo({ top: 0 }); }
+    else finish();
+  }
+  function finish() {
+    persist();
+    $("done-text").textContent = state.ref && state.canWrite ? "Your answers are saved. You can close this page." : "Your answers are kept in this browser only and are not counted in the study.";
+    show("done");
+  }
+  function firstOpen() { const k = state.trials.findIndex((t) => { const a = state.answers[t.key]; return !(a && a.natural && a.follow); }); return k; }
+
+  document.querySelectorAll(".choices").forEach((el) => el.addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) choose(el.dataset.q, b.dataset.v); }));
+  $("next").onclick = next;
+  $("back").onclick = () => { if (state.i > 0) { state.i--; render(); } };
+  $("start").onclick = () => { const k = firstOpen(); if (k < 0) { show("done"); return; } state.i = k; show("trial"); render(); };
+  $("review").onclick = () => { state.i = 0; show("trial"); render(); };
+  document.addEventListener("keydown", (e) => {
+    if ($("trial").hidden || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (!$("zoom").hidden) { if (e.key === "Escape") $("zoom").hidden = true; return; }
+    const map = { "1": ["natural", "A"], "2": ["natural", "B"], "3": ["follow", "A"], "4": ["follow", "B"] };
+    if (map[e.key]) { e.preventDefault(); choose(...map[e.key]); }
+    else if (e.key === "Enter") { e.preventDefault(); next(); }
+    else if (e.key === "ArrowLeft") { $("back").click(); }
+  });
+  for (const id of ["img-src", "img-a", "img-b"]) $(id).addEventListener("click", () => { $("zoom-img").src = $(id).src; $("zoom").hidden = false; });
+  $("zoom").addEventListener("click", () => { $("zoom").hidden = true; });
+
+  // ---- results (owner) ----
+  function logFact(n) { let s = 0; for (let k = 2; k <= n; k++) s += Math.log(k); return s; }
+  function binomP(k, n) { // exact two-sided, p = 0.5
+    if (n === 0) return 1;
+    const lf = [0]; for (let i = 1; i <= n; i++) lf[i] = lf[i - 1] + Math.log(i);
+    const pmf = (j) => Math.exp(lf[n] - lf[j] - lf[n - j] - n * Math.LN2);
+    const pk = pmf(k); let p = 0;
+    for (let j = 0; j <= n; j++) { const v = pmf(j); if (v <= pk * (1 + 1e-9)) p += v; }
+    return Math.min(1, p);
+  }
+  const pct = (x) => `${(100 * x).toFixed(1)}%`;
+  const fmtP = (p) => p < 0.001 ? "p < 0.001" : `p = ${p.toFixed(3)}`;
+  function cell(tr, text, tag = "td") { const c = document.createElement(tag); c.textContent = text; tr.append(c); }
+  function renderResults(docs) {
+    const raters = docs.map((d) => ({ id: d.id, ...(d.data() || {}) })).filter((r) => r.answers && Object.keys(r.answers).length);
+    $("res-empty").hidden = raters.length > 0;
+    const counts = { natural: [0, 0], follow: [0, 0] }; // [ours, n]
+    const perPair = {};
+    const rows = [];
+    for (const r of raters) {
+      const a = Object.entries(r.answers);
+      const main = a.filter(([k, v]) => !v.repeat && v.natural && v.follow);
+      let agree = 0, reps = 0;
+      for (const [k, v] of a) if (v.repeat && r.answers[v.pair]) { reps++; if (r.answers[v.pair].natural === v.natural) agree++; }
+      const mine = { natural: 0, follow: 0 };
+      for (const [, v] of main) {
+        for (const q of ["natural", "follow"]) { counts[q][1]++; if (v[q] === "ours") { counts[q][0]++; mine[q]++; } }
+        const pp = perPair[v.pair] ||= { natural: [0, 0], follow: [0, 0] };
+        for (const q of ["natural", "follow"]) { pp[q][1]++; if (v[q] === "ours") pp[q][0]++; }
+      }
+      const med = main.map(([, v]) => v.ms).sort((x, y) => x - y)[Math.floor(main.length / 2)] || 0;
+      rows.push({ id: r.id, n: main.length, nat: main.length ? mine.natural / main.length : 0, fol: main.length ? mine.follow / main.length : 0,
+                  cons: reps ? `${agree}/${reps}` : "–", med: (med / 1000).toFixed(1) + " s", done: !!r.done });
+    }
+    $("res-meta").textContent = `${raters.length} rater${raters.length === 1 ? "" : "s"} · ${counts.natural[1]} judgments`;
+    const stats = $("res-stats"); stats.replaceChildren();
+    for (const [q, label] of [["natural", "Natural (harmonization)"], ["follow", "Instruction (fidelity)"]]) {
+      const [k, n] = counts[q]; if (!n) continue;
+      const box = document.createElement("div"); box.className = "stat";
+      box.innerHTML = `<div class="label"></div><div class="big"></div><div class="bar"><div class="ours"></div></div><div class="muted"></div>`;
+      box.children[0].textContent = label;
+      box.children[1].textContent = `Ours ${pct(k / n)}`;
+      box.children[2].firstChild.style.width = pct(k / n);
+      box.children[3].textContent = `${k} of ${n} vs MICE · two-sided binomial ${fmtP(binomP(k, n))}`;
+      stats.append(box);
+    }
+    const t = $("res-raters"); t.replaceChildren();
+    const h = document.createElement("tr"); for (const c of ["Rater", "Screens", "Ours: natural", "Ours: instruction", "Repeat agreement", "Median time", "Finished"]) cell(h, c, "th"); t.append(h);
+    state.user?.profiles?.(rows.map((r) => r.id)).then((ps) => {
+      [...t.querySelectorAll("tr")].slice(1).forEach((tr, k) => { const id = rows[k].id; tr.firstChild.textContent = (ps && ps[id] && ps[id].name) || `Rater ${k + 1}`; });
+    }).catch(() => {});
+    rows.forEach((r, k) => { const tr = document.createElement("tr"); cell(tr, `Rater ${k + 1}`); cell(tr, r.n); cell(tr, pct(r.nat)); cell(tr, pct(r.fol)); cell(tr, r.cons); cell(tr, r.med); cell(tr, r.done ? "yes" : "no"); t.append(tr); });
+    const tp = $("res-pairs"); tp.replaceChildren();
+    const hp = document.createElement("tr"); for (const c of ["Pair", "Bench sample", "Ours: natural", "Ours: instruction", "Raters"]) cell(hp, c, "th"); tp.append(hp);
+    Object.entries(perPair).sort((a, b) => a[1].natural[0] / a[1].natural[1] - b[1].natural[0] / b[1].natural[1]).forEach(([id, v]) => {
+      const tr = document.createElement("tr"); cell(tr, id); cell(tr, pairById[id].sample); cell(tr, pct(v.natural[0] / v.natural[1])); cell(tr, pct(v.follow[0] / v.follow[1])); cell(tr, v.natural[1]); tp.append(tr);
+    });
+  }
+  let unsubResults = null;
+  function openResults() {
+    $("tab-study").setAttribute("aria-pressed", "false"); $("tab-results").setAttribute("aria-pressed", "true"); show("results");
+    if (!unsubResults && state.db) unsubResults = state.db.collection("votes").onSnapshot((s) => renderResults(s.docs), () => { $("res-empty").textContent = "Results could not be loaded."; });
+  }
+  $("tab-results").onclick = openResults;
+  $("tab-study").onclick = () => { $("tab-study").setAttribute("aria-pressed", "true"); $("tab-results").setAttribute("aria-pressed", "false"); const k = firstOpen(); if (k < 0) show("done"); else show("intro"); };
+
+  // ---- boot: render locally first, then light up storage ----
+  state.trials = buildTrials("local");
+  state.answers = loadLocal();
+  $("n-trials").textContent = state.trials.length;
+  show("intro");
+  const ready = () => { $("start").disabled = false; $("start").textContent = Object.keys(state.answers).length ? "Continue" : "Start"; };
+  (async () => {
+    const [db, user] = await Promise.all([window.claude?.use?.("db") ?? null, window.claude?.use?.("user") ?? null]);
+    state.user = user;
+    const uid = user ? await user.id() : null;
+    if (!db || !uid) { showNoSave("Your answers can't be saved from this view (sign in to claude.ai to take part). You can still try the study; answers stay in this browser only."); ready(); return; }
+    state.db = db; state.uid = uid;
+    state.trials = buildTrials(uid);
+    if (!$("trial").hidden) show("intro"); // never switch the screen order under a running session
+    state.ref = db.doc("votes/" + uid);
+    try {
+      const snap = await state.ref.get();
+      state.answers = (snap.exists && snap.data().answers) ? { ...snap.data().answers } : {};
+    } catch { state.answers = {}; }
+    if (user.can && (await user.can("data.write")) === false) { state.canWrite = false; showNoSave("You can view this study but your answers can't be saved. Ask the owner for Contributor access."); }
+    if (user.isOwner && (await user.isOwner())) $("tabs").hidden = false;
+    ready();
+  })().catch(() => { showNoSave("Saving is unavailable right now; answers stay in this browser only."); ready(); });
+})();
+</script>
