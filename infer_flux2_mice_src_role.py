@@ -132,6 +132,12 @@ def parse_args():
     parser.add_argument("--bg_margin", type=float, default=2.0,
                         help="Tokens around the edits left completely free (shape, shadow, lighting)")
     parser.add_argument("--bg_steps", type=str, default="all", help="Denoising steps for the anchor, or \"all\"")
+    parser.add_argument("--src_push", type=float, default=0.0,
+                        help="Continue the anchor's field below zero inside the instances (flux2/bg_anchor.py): "
+                             "extrapolate their predicted clean latent away from the source, x0 += push * (x0 - "
+                             "z_src), ramping from 0 at the mask edge. 0 = off")
+    parser.add_argument("--src_push_tau", type=float, default=2.0, help="Push ramp from the mask edge inward, tokens")
+    parser.add_argument("--src_push_steps", type=str, default="all", help="Steps for the push, or \"all\"")
     parser.add_argument("--src_beta", type=float, default=0.0,
                         help="Amplify the non-copy part of instance tokens' writes (the edit). Keeps the copy that "
                              "is added to the stream (pose) unchanged. Same steps/blocks as --src_gamma. 0 = off")
@@ -251,6 +257,7 @@ def parse_args():
         return out
 
     args.bg_steps = None if args.bg_steps == "all" else str2list(args.bg_steps)
+    args.src_push_steps = None if args.src_push_steps == "all" else str2list(args.src_push_steps)
     args.log_attn_steps = None if args.log_attn_steps == "all" else str2list(args.log_attn_steps)
     args.cohere_steps = None if args.cohere_steps == "all" else str2list(args.cohere_steps)
     args.src_steps = (None if args.src_steps is None else
@@ -335,6 +342,9 @@ def auto_exp_name(args) -> str:
     if args.bg_anchor > 0:
         parts.append(f"bg{args.bg_anchor * 100:g}_bt{args.bg_tau:g}_bm{args.bg_margin:g}_bs"
                      + ("all" if args.bg_steps is None else "-".join(map(str, args.bg_steps))))
+    if args.src_push > 0:
+        parts.append(f"push{args.src_push * 100:g}_pt{args.src_push_tau:g}"
+                     + ("" if args.src_push_steps is None else "_ps" + "-".join(map(str, args.src_push_steps))))
     if not args.free_latent:
         parts.append("nofree")
     if args.free_context:
@@ -488,7 +498,7 @@ def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
     handles = [pipe.transformer.register_forward_pre_hook(_pre_forward, with_kwargs=True),
                pipe.transformer.register_forward_hook(_post_forward, with_kwargs=True)]
     handles += ortho.attach(pipe.transformer)
-    if anchor.strength > 0:
+    if anchor.strength > 0 or anchor.push > 0:
         handles += anchor.attach(pipe.transformer)
     # Each wrap calls the one attached before it; none of these edit the mask.
     if chunked is not None:
@@ -601,7 +611,8 @@ def main():
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--log_attn_mass needs --attention_setting apitasmkernelnonlap")
         attn_log = AttentionMass(steps=args.log_attn_steps, near=args.log_attn_near, maps=args.log_attn_maps)
-    anchor = BackgroundAnchor(strength=args.bg_anchor, tau=args.bg_tau, margin=args.bg_margin, steps=args.bg_steps)
+    anchor = BackgroundAnchor(strength=args.bg_anchor, tau=args.bg_tau, margin=args.bg_margin, steps=args.bg_steps,
+                              push=args.src_push, push_tau=args.src_push_tau, push_steps=args.src_push_steps)
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
                                      num_shards=args.num_shards, shard_id=args.shard_id)
@@ -674,7 +685,7 @@ def main():
                     generated_image = generated_image.resize((orig_w, orig_h), resample=Image.LANCZOS)
                 generated_image.save(save_path)
                 with open(save_dir / f"{sample_id}_block_ortho.json", "w") as f:
-                    extra = {**({"bg_anchor": anchor.stats} if anchor.strength > 0 else {}),
+                    extra = {**({"bg_anchor": anchor.stats} if anchor.strength > 0 or anchor.push > 0 else {}),
                              **({"src_role": ortho.src_ctrl.stats} if ortho.src_ctrl is not None else {})}
                     json.dump({"steering": ortho.stats, **extra} if extra else ortho.stats, f)
                 logger.info(f"Saved result to {save_path}")
