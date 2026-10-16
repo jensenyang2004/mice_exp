@@ -12,9 +12,15 @@ Computed exactly from the attention probabilities of the instance query rows onl
 the extra memory is chunk x N x heads), with the same mask the model uses (text binding, gap and
 all): mass per group = probabilities @ one-hot group indicators.
 
-Attached by wrapping the MICE processor module's `dispatch_attention_fn` (outermost, after the
-chunking and the gap, so it sees the final mask). Records per (step, block): for each instance, the
+Attached by wrapping the MICE processor module's `dispatch_attention_fn`, inside the gap's wrap
+(attached before it) so it receives the mask the gap has already edited. Records per (step, block): for each instance, the
 mean over its tokens and heads of every group, and the max over heads of lat_nb and ctx_own.
+
+maps=True also keeps per-token maps over the whole latent grid (every latent query, instance or
+background), per (step, block), mean over heads: `text` (mass on all text it can see: an instance
+token's own local prompt, a background token's global prompt), `ctx` (mass on all context keys) and
+`ctx_near` (mass on context keys within `near` tokens of the query's own position: reading the source
+right where it is). Stored fp16 on CPU in `maps` {(step, layer): [3, HW]}; see save_maps().
 """
 from dataclasses import dataclass, field
 
@@ -29,6 +35,7 @@ class AttentionMass:
     steps: list | None = None  # denoising steps to record; None = all
     near: int = 2
     chunk: int = 512
+    maps: bool = False
     records: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -38,6 +45,7 @@ class AttentionMass:
         ys, xs = torch.meshgrid(torch.arange(Ht, device=device), torch.arange(Wt, device=device), indexing="ij")
         self.coords = torch.stack([ys.reshape(-1), xs.reshape(-1)], dim=-1)  # [HW, 2]
         self.records = []
+        self.map_records = {}
         self.step_idx, self.layer = None, None
 
     def begin_forward(self, step_idx: int):
@@ -103,6 +111,38 @@ class AttentionMass:
                 lat_nb_maxhead=float(lat_nb_heads.max()), ctx_own_maxhead=float(per_head[:, 4 + 2 * k].max()),
                 per_neighbor_lat={str(j): float(mean[3 + 2 * j]) for j in nb}))
         self.records.append(rec)
+        if self.maps:
+            self._measure_maps(query, k_t, attn_mask, s0, coords)
+
+    @torch.no_grad()
+    def _measure_maps(self, query, k_t, attn_mask, s0, coords):
+        B, N, H, D = query.shape
+        HW = self.HW
+        out = torch.zeros(3, HW, device=query.device, dtype=torch.float32)
+        for c in torch.arange(HW, device=query.device).split(self.chunk):
+            q = query[:, s0 + c].transpose(1, 2).float()
+            logits = (q @ k_t.transpose(-1, -2)) / (D ** 0.5)
+            if attn_mask is not None:
+                logits = logits + attn_mask[..., s0 + c, :].float()
+            p = logits.softmax(-1)[0].mean(0)  # [n, N], mean over heads
+            out[0, c] = p[:, :s0].sum(-1)
+            pc = p[:, s0 + HW:]
+            out[1, c] = pc.sum(-1)
+            band = ((coords[c][:, None, :] - coords[None, :, :]).abs().amax(-1) <= self.near).float()
+            out[2, c] = (pc * band).sum(-1)
+            del logits, p
+        self.map_records[(self.step_idx, f"{self.layer[0]}_{self.layer[1]}")] = out.half().cpu()
+
+    def save_maps(self, path):
+        """npz: text / ctx / ctx_near [steps, layers, Ht, Wt], steps, layers (in call order), masks [K, Ht, Wt]."""
+        import numpy as np
+        steps = sorted({s for s, _ in self.map_records})
+        layers = list(dict.fromkeys(l for _, l in self.map_records))
+        arr = np.full((3, len(steps), len(layers), self.Ht, self.Wt), np.nan, dtype=np.float16)
+        for (s, l), m in self.map_records.items():
+            arr[:, steps.index(s), layers.index(l)] = m.numpy().reshape(3, self.Ht, self.Wt)
+        np.savez_compressed(path, text=arr[0], ctx=arr[1], ctx_near=arr[2], steps=np.array(steps),
+                            layers=np.array(layers), masks=self.masks.cpu().numpy().reshape(-1, self.Ht, self.Wt))
 
     def attach(self, transformer, attn_module):
         orig = attn_module.dispatch_attention_fn

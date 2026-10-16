@@ -49,6 +49,9 @@ with the same modulation, and are never decoded. Two optional uses:
     per-token fine detail (texture, grain) of the copy stays.
     src_norm_preserve: after the source edit, each instance token's (centered) write is rescaled to its
     original length, so gamma/beta change only its direction and add no energy.
+    src_gate (flux2/src_attn_gate.py): in the blocks it gates, gamma and beta are multiplied per token by
+    w_t in [0, 1], how much token t reads its own instance's source in that block (or that amount
+    spread evenly, "uniform"). Other blocks keep the plain strength.
     Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
     Stats log the cosine between the latent and context writes (and context state) on background
     vs instance tokens whenever the hook is active, to check where the two are comparable.
@@ -86,6 +89,7 @@ class BlockOrtho:
     src_smooth: int = 0  # >0: act only on the copy part averaged over a (2r+1)^2 token window within the instance
     src_norm_preserve: bool = False  # rescale each instance token's write back to its length after gamma/beta
     src_exclude: set = field(default_factory=set)  # block names where the source term is off
+    src_gate: object = None  # SrcAttnGate: per-token gamma/beta multiplier in the blocks it gates
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -149,6 +153,13 @@ class BlockOrtho:
         return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
                 and (self._in(self.steps)
                      or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))))
+
+    def src_on(self, layer: str) -> bool:
+        """Whether the source term acts in this block at the current step."""
+        kind, idx = layer.split("_")
+        hooked = int(idx) not in (self.exclude_double if kind == "double" else self.exclude_single)
+        return (hooked and self._active() and (self.src_gamma > 0 or self.src_beta != 0)
+                and self._in(self._src_steps()) and layer not in self.src_exclude)
 
     def _in(self, steps) -> bool:
         return steps is None or self.step_idx in steps
@@ -221,7 +232,13 @@ class BlockOrtho:
             stat.update(gamma=gamma, src_beta=src_b, src_frac=float(par_s[0].norm(dim=-1).mean()
                                                     / d[0, inst].norm(dim=-1).mean().clamp_min(1e-12)))
             if gamma != 0 or src_b != 0:
-                d_src = -gamma * par_s + src_b * (d[:, inst] - par_s)
+                gw = self.src_gate.weight(layer, d.device) if self.src_gate is not None else None
+                if gw is not None:  # per-token strength from the attention gate
+                    gw = gw[inst][None, :, None]
+                    stat.update(gate_mean=float(gw.mean()))
+                    d_src = -gamma * gw * par_s + src_b * gw * (d[:, inst] - par_s)
+                else:
+                    d_src = -gamma * par_s + src_b * (d[:, inst] - par_s)
                 if self.src_norm_preserve:
                     old = d[:, inst]
                     new = old + d_src

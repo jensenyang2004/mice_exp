@@ -35,6 +35,7 @@ from flux2.contact_gap import ContactGap
 from flux2.chunked_attention import ChunkedAttention
 from flux2.bg_anchor import BackgroundAnchor
 from flux2.attention_mass import AttentionMass
+from flux2.src_attn_gate import SrcAttnGate
 import flux2.attention.attention_processor_APITASM_kernel_nonlap as mice_attn_module
 
 SEED = 0
@@ -139,6 +140,18 @@ def parse_args():
                              "instance, the mean of its context write (removes what the old object is, keeps "
                              "where its parts are)")
     for kind in ("double", "single"):
+        parser.add_argument(f"--src_gate_{kind}", type=str, default="",
+                            help=f"{kind.capitalize()}-stream blocks where the source term's strength follows, per "
+                                 f"token, how much that token reads its own instance's source in the block "
+                                 f"(flux2/src_attn_gate.py); other blocks keep the plain strength. Same syntax "
+                                 f"as --exclude_{kind}, e.g. 0:5 or all")
+    parser.add_argument("--src_gate_mode", type=str, default="attn", choices=["attn", "uniform"],
+                        help="attn: per-token weight from the attention. uniform: the same total amount spread "
+                             "evenly over the instance (control: does where matter, or only how much)")
+    parser.add_argument("--src_gate_q", type=float, default=0.95,
+                        help="Tokens at or above this quantile of source attention within the instance get the "
+                             "full strength")
+    for kind in ("double", "single"):
         parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
                             help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
                                  f"--exclude_{kind}); applied on top of --exclude_{kind}")
@@ -160,6 +173,10 @@ def parse_args():
     parser.add_argument("--log_attn_steps", type=str, default="all", help="Steps to record, or \"all\"")
     parser.add_argument("--log_attn_near", type=int, default=2,
                         help="Radius (tokens) of the 'local' own-latent neighbourhood in the attention log")
+    parser.add_argument("--log_attn_maps", action="store_true",
+                        help="With --log_attn_mass: also save per-token maps over the whole grid (text / context / "
+                             "local-context mass per step and block) as <id>_attn_maps.npz. Plot with "
+                             "plot_attn_maps.py. Roughly doubles the logging cost")
     parser.add_argument("--attn_chunk", type=int, default=0,
                         help="Run masked attention in query chunks of this many tokens (exact, cuts the peak "
                              "memory of the dense MICE mask; also fixes the mask device with --multi_gpu). "
@@ -229,7 +246,7 @@ def parse_args():
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
                 "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single",
-                "src_exclude_double", "src_exclude_single"):
+                "src_exclude_double", "src_exclude_single", "src_gate_double", "src_gate_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = (None if args.sample_ids is None or args.sample_ids.lower() == "all"
                        else set(args.sample_ids.split(',')))
@@ -287,6 +304,13 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"src_exclude_{kind}")
             if blocks:
                 parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
+        for kind in ("double", "single"):
+            blocks = getattr(args, f"src_gate_{kind}")
+            if blocks:
+                parts.append(f"sg{kind[0]}" + fmt_blocks(blocks))
+        if args.src_gate_double or args.src_gate_single:
+            parts.append(("sgu" if args.src_gate_mode == "uniform" else "sga")
+                         + ("" if args.src_gate_q == 0.95 else f"_q{args.src_gate_q * 100:g}"))
     if args.gap_lambda > 0:
         parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gm{args.gap_margin}_gs"
                      + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
@@ -322,11 +346,14 @@ def environment(args, pipe) -> dict:
                                  mem_efficient=torch.backends.cuda.mem_efficient_sdp_enabled(),
                                  math=torch.backends.cuda.math_sdp_enabled()),
                matmul_tf32=torch.backends.cuda.matmul.allow_tf32)
-    try:
-        import diffusers
-        env["diffusers"] = diffusers.__version__
-    except Exception:
-        pass
+    for lib in ("diffusers", "transformers", "accelerate", "tokenizers"):
+        try:
+            env[lib] = __import__(lib).__version__
+        except Exception:
+            pass
+    env["text_encoder_attn"] = getattr(getattr(pipe.text_encoder, "config", None), "_attn_implementation", None)
+    env["gpu_capability"] = [list(torch.cuda.get_device_capability(i)) for i in range(torch.cuda.device_count())]
+    env["matmul_bf16_reduced"] = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     try:  # the snapshot folder name is the model revision (commit hash) actually loaded
         from huggingface_hub import snapshot_download
         env["model_snapshot"] = snapshot_download(args.pretrained_model_name_or_path, local_files_only=True)
@@ -363,11 +390,34 @@ def carve_strict(masks: list) -> list:
     return carved
 
 
+def _sha1(arr) -> str:
+    import hashlib
+    return hashlib.sha1(np.ascontiguousarray(arr).tobytes()).hexdigest()[:12]
+
+
+def _tensor_fp(t: torch.Tensor) -> dict:
+    t = t.detach().float()
+    return dict(shape=list(t.shape), mean=float(t.mean()), abs=float(t.abs().mean()), std=float(t.std()),
+                nan=int(torch.isnan(t).sum()))
+
+
+def _regions_fp(t: torch.Tensor, ortho: BlockOrtho) -> dict:
+    """Mean |x| of the latent part of a [B, N, C] sequence over each instance's tokens and the background."""
+    m = ortho.masks.to(t.device)  # [K, HW]
+    x = t[0, :m.shape[1]].detach().float().abs().mean(-1)  # [HW]
+    inst = m.any(0)
+    return dict(inst=[float(x[mk].mean()) if bool(mk.any()) else None for mk in m],
+                bg=float(x[~inst].mean()) if bool((~inst).any()) else None)
+
+
 def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAttention | None,
                    anchor: BackgroundAnchor, sample, use_masks: bool, mem: dict, strict: bool = False,
-                   attn_log: AttentionMass | None = None, **pipe_kwargs):
+                   attn_log: AttentionMass | None = None, fp: dict | None = None, **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`).
-    mem receives peak GPU memory (GB): overall and inside the transformer forwards."""
+    mem receives peak GPU memory (GB): overall and inside the transformer forwards.
+    fp receives a fingerprint of the inputs and of every step (see fingerprint_inputs/_step), to find
+    where two machines' runs of the same settings part ways (compare_runs.py)."""
+    fp = {} if fp is None else fp
     orig_prepare_latents = pipe.prepare_latents
 
     def _prepare_latents(*a, **kw):
@@ -380,11 +430,16 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
             masks = create_position_mask_list(sample['bboxes'], height, width, pipe.vae_scale_factor)
         if strict:
             masks = carve_strict(masks)
+        fp["masks"] = [dict(tokens=int((m > 0.5).sum()), sha1=_sha1((m > 0.5).cpu().numpy()))
+                       for m in masks]
+        fp["noise"] = _tensor_fp(latents)
         ortho.setup(masks, device=latents.device)
         gap.setup(masks, device=latents.device)
         anchor.setup(masks, device=latents.device)
         if attn_log is not None:
             attn_log.setup(masks, device=latents.device)
+        if ortho.src_gate is not None:
+            ortho.src_gate.setup(masks, device=latents.device)
         return latents, latent_ids
 
     def _pre_forward(module, args, kwargs):
@@ -395,12 +450,21 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         anchor.begin_forward(sigma=float(pipe.scheduler.sigmas[i]), step_idx=i)
         if attn_log is not None:
             attn_log.begin_forward(step_idx=i)
+        if ortho.src_gate is not None:
+            ortho.src_gate.begin_forward(step_idx=i)
+        if i == 0 and "text" not in fp:
+            enc, seg = kwargs["encoder_hidden_states"], 200
+            fp["text"] = [_tensor_fp(enc[:, j:j + seg]) for j in range(0, enc.shape[1], seg)]
+            fp["input_latent_context"] = _tensor_fp(kwargs["hidden_states"])
+        fp.setdefault("steps", []).append(dict(step=i, input=_regions_fp(kwargs["hidden_states"], ortho)))
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             mem.setdefault("text_encoding", torch.cuda.max_memory_allocated() / 2**30)  # first step only
             torch.cuda.reset_peak_memory_stats()
 
     def _post_forward(module, args, kwargs, output):
+        v = output[0] if isinstance(output, (tuple, list)) else getattr(output, "sample", output)
+        fp["steps"][-1]["velocity"] = _regions_fp(v, ortho)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             mem["transformer"] = max(mem.get("transformer", 0.0), torch.cuda.max_memory_allocated() / 2**30)
@@ -414,12 +478,16 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
     handles += ortho.attach(pipe.transformer)
     if anchor.strength > 0:
         handles += anchor.attach(pipe.transformer)
-    if chunked is not None:  # before the gap, so the gap wraps the chunked call
+    # Each wrap calls the one attached before it, so the gap must be attached LAST (outermost): it
+    # edits the mask and passes it down, and the gate / logger inside it then see the final mask.
+    if chunked is not None:  # innermost
         handles += chunked.attach(mice_attn_module)
+    if attn_log is not None:
+        handles += attn_log.attach(pipe.transformer, mice_attn_module)
+    if ortho.src_gate is not None:
+        handles += ortho.src_gate.attach(pipe.transformer, mice_attn_module, ortho.src_on)
     if gap.lam > 0:
         handles += gap.attach(pipe.transformer, mice_attn_module)
-    if attn_log is not None:  # outermost: sees the final mask
-        handles += attn_log.attach(pipe.transformer, mice_attn_module)
     try:
         out = pipe(**pipe_kwargs)
         if torch.cuda.is_available():
@@ -440,7 +508,8 @@ def main():
     # Existing results are skipped, so a folder must never mix settings: refuse to reuse one made
     # with different generation args (run-control args like sample selection/device may differ).
     run_control = {"num_samples", "sample_ids", "device", "num_shards", "shard_id", "multi_gpu", "overwrite",
-                   "attn_chunk", "cpu_offload", "log_attn_mass", "log_attn_steps", "log_attn_near"}
+                   "attn_chunk", "cpu_offload", "log_attn_mass", "log_attn_steps", "log_attn_near",
+                   "log_attn_maps"}
     settings = {k: v for k, v in vars(args).items() if k not in run_control}
     args_path = save_dir / "args.json"
     if args_path.exists() and not args.overwrite:
@@ -491,6 +560,14 @@ def main():
                        ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
                        src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta,
                        src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"))
+    src_gate = None
+    if args.src_gate_double or args.src_gate_single:
+        if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
+            raise SystemExit("--src_gate_* needs --attention_setting apitasmkernelnonlap")
+        src_gate = SrcAttnGate(blocks={f"double_{i}" for i in resolve(args.src_gate_double, n_double)}
+                                      | {f"single_{i}" for i in resolve(args.src_gate_single, n_single)}, mode=args.src_gate_mode, quantile=args.src_gate_q)
+        ortho.src_gate = src_gate
+        logger.info(f"Source-term attention gate in {sorted(src_gate.blocks)} ({args.src_gate_mode})")
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
     gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),
@@ -508,7 +585,7 @@ def main():
     if args.log_attn_mass:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--log_attn_mass needs --attention_setting apitasmkernelnonlap")
-        attn_log = AttentionMass(steps=args.log_attn_steps, near=args.log_attn_near)
+        attn_log = AttentionMass(steps=args.log_attn_steps, near=args.log_attn_near, maps=args.log_attn_maps)
     anchor = BackgroundAnchor(strength=args.bg_anchor, tau=args.bg_tau, margin=args.bg_margin, steps=args.bg_steps)
 
     dataloader = get_mice_dataloader(root_dir=args.dataset_root, batch_size=1, shuffle=False, target_size=1024,
@@ -551,9 +628,9 @@ def main():
                 kwargs['instance_bboxes_xyxy_normalized'] = sample['bboxes']
 
             try:
-                mem = {}
+                mem, fp = {}, {}
                 result = run_with_ortho(
-                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem, args.strict_masks, attn_log,
+                    pipe, ortho, gap, chunked, anchor, sample, args.use_masks, mem, args.strict_masks, attn_log, fp,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
@@ -586,9 +663,13 @@ def main():
                              **({"bg_anchor": anchor.stats} if anchor.strength > 0 else {})}
                     json.dump({"steering": ortho.stats, **extra} if extra else ortho.stats, f)
                 logger.info(f"Saved result to {save_path}")
+                with open(save_dir / f"{sample_id}_fingerprint.json", "w") as f:
+                    json.dump(fp, f)
                 if attn_log is not None:
                     with open(save_dir / f"{sample_id}_attn_mass.json", "w") as f:
                         json.dump(attn_log.records, f)
+                    if attn_log.maps:
+                        attn_log.save_maps(save_dir / f"{sample_id}_attn_maps.npz")
                 if mem:
                     logger.info("Peak GPU memory (GB): " + ", ".join(f"{k} {v:.1f}" for k, v in mem.items()))
                 del result, generated_image
