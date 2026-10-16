@@ -151,9 +151,11 @@ def parse_args():
                              "building blocks (like the first double block), linear in between")
     parser.add_argument("--src_gamma_lo", type=float, default=0.0, help="--src_role: gamma in building blocks")
     parser.add_argument("--src_beta_lo", type=float, default=0.0, help="--src_role: beta in building blocks")
-    parser.add_argument("--role_score", type=str, default="logodds", choices=["logodds", "linear"],
-                        help="--src_role: editing score. logodds: change in log-odds of the self share from the "
-                             "first double block (independent of object size); linear: raw self share")
+    parser.add_argument("--role_score", type=str, default="logodds", choices=["logodds", "linear", "src_text"],
+                        help="--src_role: block score. logodds: change in log-odds of the self share from the "
+                             "first double block (independent of object size); linear: raw self share; "
+                             "src_text: own source / (own source + own prompt) attention, no anchor, full "
+                             "strength once the source ties with the instruction")
     parser.add_argument("--role_lift", type=float, default=1.0,
                         help="--src_role logodds: log-odds increase over the first double block that counts as "
                              "fully editing (1 = own tokens preferred 2.7x more than there)")
@@ -292,8 +294,8 @@ def auto_exp_name(args) -> str:
     if args.src_role:  # strengths as building-to-editing ranges, e.g. src100-150_sb0-60_role_lift100
         parts.append(f"src{args.src_gamma_lo * 100:g}-{args.src_gamma * 100:g}"
                      f"_sb{args.src_beta_lo * 100:g}-{args.src_beta * 100:g}"
-                     + (f"_role_lift{args.role_lift * 100:g}" if args.role_score == "logodds"
-                        else f"_role_lin{args.role_full * 100:g}")
+                     + {"logodds": f"_role_lift{args.role_lift * 100:g}", "linear": f"_role_lin{args.role_full * 100:g}",
+                        "src_text": "_role_srctext"}[args.role_score]
                      + ("_inst" if args.src_mode == "instance" else "")
                      + (f"_sm{args.src_smooth}" if args.src_smooth else "") + ("_np" if args.src_norm_preserve else "")
                      + ("" if args.src_steps is None else "_ss" + "-".join(map(str, args.src_steps))))

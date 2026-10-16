@@ -17,12 +17,18 @@ score "logodds" (default):
   than in the anchor block. lift = 1 means s = 1 at e^1 = 2.7x the anchor's per-token preference.
 score "linear":
     s_kl     = clamp((e_kl - a_k) / (full - a_k), 0, 1)    0 = like the anchor, 1 = self share >= full
+score "src_text" (no anchor, no ranking: each block is judged on its own):
+    c_kl     = ctx_own / (ctx_own + text)     the source's share of the contest between k's own source
+                                              tokens and k's own prompt; both are in the same softmax, so
+                                              the ratio does not depend on any other key group
+    s_kl     = min(1, c_kl / 0.5)             a tie (source as strong as the instruction) or a source win
+                                              = full strength; the instruction dominating = toward lo
     gamma_kl = gamma_lo + s_kl (gamma_hi - gamma_lo)
     beta_kl  = beta_lo  + s_kl (beta_hi  - beta_lo)
 So building blocks get the low pair (less in total, more of it as gamma than beta) and editing blocks
 the high pair. BlockOrtho still multiplies both by its step factor.
 
-Computed in a wrap of the MICE module's dispatch_attention_fn, in double_0 (anchor) and in every block
+Computed in a wrap of the MICE module's dispatch_attention_fn, in double_0 (anchor, not for "src_text") and in every block
 where the source term acts, exactly from the same mask the model uses (chunked over query rows).
 """
 from dataclasses import dataclass, field
@@ -37,7 +43,7 @@ class BlockRole:
     beta_lo: float = 0.0
     beta_hi: float = 0.0
     full: float = 1.0  # "linear": self share that counts as fully editing (s = 1)
-    score: str = "logodds"  # "logodds" (size-independent) or "linear"
+    score: str = "logodds"  # "logodds" (size-independent), "linear" or "src_text" (source vs own prompt)
     lift: float = 1.0  # "logodds": log-odds increase over the anchor that counts as fully editing
     chunk: int = 512
     anchor_layer: str = "double_0"
@@ -61,7 +67,8 @@ class BlockRole:
 
     @torch.no_grad()
     def _self_share(self, query, key, attn_mask) -> torch.Tensor:
-        """[K] self / (self + outside) per instance (nan for empty masks)."""
+        """[K] per instance (nan for empty masks): self / (self + outside image), or for "src_text"
+        own source / (own source + text)."""
         B, N, H, D = query.shape
         HW = self.HW
         s0 = N - 2 * HW
@@ -73,10 +80,15 @@ class BlockRole:
             rows = masks[k].nonzero().squeeze(1)
             if len(rows) == 0:
                 continue
-            ind = torch.zeros(N, 2, device=dev)  # [self, image]
-            ind[s0:s0 + HW, 0] = masks[k].float()
-            ind[s0 + HW:, 0] = masks[k].float()
-            ind[s0:, 1] = 1.0
+            ind = torch.zeros(N, 2, device=dev)  # [numerator, denominator]
+            if self.score == "src_text":  # the instance sees only its own prompt among the text keys
+                ind[s0 + HW:, 0] = masks[k].float()
+                ind[s0 + HW:, 1] = masks[k].float()
+                ind[:s0, 1] = 1.0
+            else:  # [self, image]
+                ind[s0:s0 + HW, 0] = masks[k].float()
+                ind[s0 + HW:, 0] = masks[k].float()
+                ind[s0:, 1] = 1.0
             tot = torch.zeros(2, device=dev)
             for c in rows.split(self.chunk):
                 q = query[:, s0 + c].transpose(1, 2).float()  # [B, H, n, D]
@@ -89,7 +101,9 @@ class BlockRole:
         return e
 
     def _set(self, layer, e):
-        if self.score == "logodds":
+        if self.score == "src_text":
+            s = (e / 0.5).clamp(0.0, 1.0)
+        elif self.score == "logodds":
             logit = lambda p: torch.logit(p.clamp(1e-4, 1 - 1e-4))
             s = ((logit(e) - logit(self.anchor)) / self.lift).clamp(0.0, 1.0)
         else:
@@ -106,7 +120,8 @@ class BlockRole:
         g_t[torch.isinf(g_t)] = 0.0
         b_t[torch.isinf(b_t)] = 0.0
         self.current[layer] = (g_t, b_t)
-        self.stats.append(dict(step=self.step_idx, layer=layer, e=e.tolist(), anchor=self.anchor.tolist(),
+        self.stats.append(dict(step=self.step_idx, layer=layer, e=e.tolist(),
+                               anchor=None if self.anchor is None else self.anchor.tolist(),
                                s=s.tolist(), gamma=g.tolist(), beta=b.tolist()))
 
     def attach(self, transformer, attn_module, src_on, step_on):
@@ -115,8 +130,9 @@ class BlockRole:
 
         def patched(query, key, value, attn_mask=None, **kw):
             if self.layer is not None and step_on():
-                is_anchor = self.layer == self.anchor_layer
-                if is_anchor or (src_on(self.layer) and self.anchor is not None):
+                is_anchor = self.layer == self.anchor_layer and self.score != "src_text"
+                ready = self.anchor is not None or self.score == "src_text"
+                if is_anchor or (src_on(self.layer) and ready):
                     e = self._self_share(query, key, attn_mask)
                     if is_anchor:
                         self.anchor = e
