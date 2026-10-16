@@ -53,6 +53,15 @@ with the same modulation, and are never decoded. Two optional uses:
     instance's own direction g_k (what k is now, the same vector the neighbor steering uses for k), the
     amount each token writes, p_t = d_t . g_k, is pulled toward the instance mean:
         D_t' += cohere * (mean_{t' in k} p_t' - p_t) g_k
+    cohere_tau > 0 replaces the instance mean with a distance-weighted mean over the instance's tokens,
+    weights exp(-dist(t, t') / cohere_tau) in tokens: each token is pulled toward its own surroundings in
+    the object, so smooth variation across a large object stays and only abrupt breaks are evened out.
+    cohere_ctx: g_k is first made orthogonal to where k's source (context) tokens are moving in this
+    block, s_k = normalize(mean over k's tokens of the frame-centered context write):
+        g_k <- normalize(g_k - (g_k . s_k) s_k)
+    so the cohesion does not even out how much each part copies the source object (it would spread the
+    copy from the parts that still follow the source onto the parts already edited). Stats log
+    coh_ctx_cos = cos(g_k, s_k) per instance.
     Only that one direction is evened out; everything orthogonal to g_k (what differs between parts:
     face vs legs, texture, pose) is left alone. Applied after the neighbor and source edits, on the
     latent stream, in cohere_steps (None = all) and every hooked block.
@@ -100,6 +109,8 @@ class BlockOrtho:
     src_ctrl: object = None  # BlockRole: per-block, per-instance gamma/beta in place of src_gamma/src_beta
     cohere: float = 0.0  # even out each instance's write along its own direction (see docstring)
     cohere_steps: list | None = None  # steps for the cohesion; None = all
+    cohere_tau: float = 0.0  # >0: distance-weighted local mean instead of the whole-instance mean
+    cohere_ctx: bool = False  # make the cohesion direction orthogonal to the instance's context write
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -112,6 +123,7 @@ class BlockOrtho:
         self.proximity = mask_proximity(self.masks, Ht, Wt, self.tau)
         self.pair_w = self._pair_weights(Ht, Wt)
         self._by_device = {}
+        self._coh_w = {}
         self.sigma, self.step_idx, self.img_len, self.factor = None, None, None, 0.0
 
     def _tensors(self, device):
@@ -261,6 +273,11 @@ class BlockOrtho:
             split, p_cv = [], []
             coh = self.cohere * self.factor if self.cohere > 0 and self._in(self.cohere_steps) else 0.0
             dn = d + delta
+            s_dir = None
+            if self.cohere_ctx and src is not None:  # where each instance's source tokens are moving
+                sc = src[0].float() - src[0].float().mean(dim=1, keepdim=True)
+                s_dir = F.normalize(torch.einsum('kn,bnd->bkd', mask_w, sc) / cnt, dim=-1)  # [B, K, D]
+            ctx_cos = []
             for k in range(K):
                 idx = masks[k]
                 if not bool(idx.any()):
@@ -268,14 +285,38 @@ class BlockOrtho:
                     continue
                 gk = g[:, k:k + 1]  # [B, 1, D]
                 split.append(float(((c[0, idx] * gk[0]).sum(-1) < 0).float().mean()))
+                if s_dir is not None:
+                    sk = s_dir[:, k:k + 1]
+                    cos = (gk * sk).sum(-1, keepdim=True)  # [B, 1, 1]
+                    ctx_cos.append(float(cos[0, 0, 0]))
+                    resid = gk - cos * sk
+                    # g_k (almost) along the source: nothing object-specific left to even out
+                    gk = F.normalize(resid, dim=-1) if float(resid[0].norm()) > 0.1 else torch.zeros_like(gk)
                 p = (dn[:, idx] * gk).sum(-1, keepdim=True)  # [B, Nk, 1]
                 p_cv.append(float(p[0].std() / p[0].mean().abs().clamp_min(1e-12)) if p.shape[1] > 1 else 0.0)
                 if coh > 0:
-                    delta[:, idx] += coh * (p.mean(dim=1, keepdim=True) - p) * gk
-            stat.update(split=split, p_cv=p_cv, cohere=coh)
+                    if self.cohere_tau > 0:
+                        Wk = self._cohere_weights(k, idx.device)  # [Nk, Nk], rows sum to 1
+                        target = torch.einsum('nm,bmo->bno', Wk, p)
+                    else:
+                        target = p.mean(dim=1, keepdim=True)
+                    delta[:, idx] += coh * (target - p) * gk
+            stat.update(split=split, p_cv=p_cv, cohere=coh, **({"coh_ctx_cos": ctx_cos} if ctx_cos else {}))
         stat["edit_rel"] = float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))
         self.stats.append(stat)
         return (ho + delta).to(h_out.dtype)
+
+    def _cohere_weights(self, k: int, device):
+        """Row-normalized exp(-dist / cohere_tau) between the tokens of instance k (cached per device)."""
+        cache = self.__dict__.setdefault("_coh_w", {})
+        if (k, device) not in cache:
+            idx = self.masks[k]
+            ys, xs = torch.meshgrid(torch.arange(self.Ht, device=idx.device),
+                                    torch.arange(self.Wt, device=idx.device), indexing="ij")
+            pts = torch.stack([ys.reshape(-1), xs.reshape(-1)], dim=-1).float()[idx]
+            W = torch.exp(-torch.cdist(pts, pts) / self.cohere_tau)
+            cache[(k, device)] = (W / W.sum(dim=1, keepdim=True)).to(device)
+        return cache[(k, device)]
 
     def _smooth_in_instances(self, par_s, inst, masks):
         """par_s: [B, n_inst, D] on the tokens of `inst`. Box average over a (2r+1)^2 token window,

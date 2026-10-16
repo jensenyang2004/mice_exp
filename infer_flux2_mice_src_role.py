@@ -152,6 +152,13 @@ def parse_args():
                              "split into pieces; the rest of the write (part detail) is untouched. 0 = off "
                              "(the split / p_cv stats are logged either way)")
     parser.add_argument("--cohere_steps", type=str, default="all", help="Steps for the cohesion, or \"all\"")
+    parser.add_argument("--cohere_ctx", action="store_true",
+                        help="Make the cohesion direction orthogonal to where the instance's source (context) "
+                             "tokens are moving in the block, so the cohesion never evens out how much each part "
+                             "copies the source")
+    parser.add_argument("--cohere_tau", type=float, default=0.0,
+                        help="Cohesion target: 0 = the whole instance's mean; >0 = distance-weighted mean over "
+                             "the instance, exp(-dist / tau) in tokens (16 px), so nearby parts count most")
     parser.add_argument("--src_role", action="store_true",
                         help="Per-block source-term strength from the block's role (flux2/block_role.py): "
                              "--src_gamma/--src_beta in editing blocks, --src_gamma_lo/--src_beta_lo in "
@@ -321,7 +328,9 @@ def auto_exp_name(args) -> str:
             if blocks:
                 parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
     if args.cohere > 0:
-        parts.append(f"coh{args.cohere * 100:g}" + ("" if args.cohere_steps is None
+        parts.append(f"coh{args.cohere * 100:g}" + (f"_ct{args.cohere_tau:g}" if args.cohere_tau > 0 else "")
+                     + ("_cx" if args.cohere_ctx else "")
+                     + ("" if args.cohere_steps is None
                                                      else "_cs" + "-".join(map(str, args.cohere_steps))))
     if args.bg_anchor > 0:
         parts.append(f"bg{args.bg_anchor * 100:g}_bt{args.bg_tau:g}_bm{args.bg_margin:g}_bs"
@@ -569,7 +578,8 @@ def main():
                        ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
                        src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta,
                        src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"),
-                       cohere=args.cohere, cohere_steps=args.cohere_steps)
+                       cohere=args.cohere, cohere_steps=args.cohere_steps,
+                       cohere_tau=args.cohere_tau, cohere_ctx=args.cohere_ctx)
     if args.src_role:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--src_role needs --attention_setting apitasmkernelnonlap")
