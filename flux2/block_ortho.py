@@ -49,9 +49,8 @@ with the same modulation, and are never decoded. Two optional uses:
     per-token fine detail (texture, grain) of the copy stays.
     src_norm_preserve: after the source edit, each instance token's (centered) write is rescaled to its
     original length, so gamma/beta change only its direction and add no energy.
-    src_gate (flux2/src_attn_gate.py): in the blocks it gates, gamma and beta are multiplied per token by
-    w_t in [0, 1], how much token t reads its own instance's source in that block (or that amount
-    spread evenly, "uniform"). Other blocks keep the plain strength.
+    src_ctrl (flux2/block_role.py): when set, it gives gamma and beta per block and per instance (as
+    per-token [HW] tensors) in place of src_gamma / src_beta; the step factor still applies.
     Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
     Stats log the cosine between the latent and context writes (and context state) on background
     vs instance tokens whenever the hook is active, to check where the two are comparable.
@@ -89,7 +88,7 @@ class BlockOrtho:
     src_smooth: int = 0  # >0: act only on the copy part averaged over a (2r+1)^2 token window within the instance
     src_norm_preserve: bool = False  # rescale each instance token's write back to its length after gamma/beta
     src_exclude: set = field(default_factory=set)  # block names where the source term is off
-    src_gate: object = None  # SrcAttnGate: per-token gamma/beta multiplier in the blocks it gates
+    src_ctrl: object = None  # BlockRole: per-block, per-instance gamma/beta in place of src_gamma/src_beta
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -232,11 +231,12 @@ class BlockOrtho:
             stat.update(gamma=gamma, src_beta=src_b, src_frac=float(par_s[0].norm(dim=-1).mean()
                                                     / d[0, inst].norm(dim=-1).mean().clamp_min(1e-12)))
             if gamma != 0 or src_b != 0:
-                gw = self.src_gate.weight(layer, d.device) if self.src_gate is not None else None
-                if gw is not None:  # per-token strength from the attention gate
-                    gw = gw[inst][None, :, None]
-                    stat.update(gate_mean=float(gw.mean()))
-                    d_src = -gamma * gw * par_s + src_b * gw * (d[:, inst] - par_s)
+                ctrl = self.src_ctrl.strengths(layer, d.device) if self.src_ctrl is not None else None
+                if ctrl is not None:  # per-block, per-instance strengths
+                    g_t = ctrl[0][inst][None, :, None] * self.factor
+                    b_t = ctrl[1][inst][None, :, None] * self.factor
+                    stat.update(gamma=float(g_t.mean()), src_beta=float(b_t.mean()))
+                    d_src = -g_t * par_s + b_t * (d[:, inst] - par_s)
                 else:
                     d_src = -gamma * par_s + src_b * (d[:, inst] - par_s)
                 if self.src_norm_preserve:

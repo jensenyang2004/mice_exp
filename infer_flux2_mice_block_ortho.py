@@ -35,7 +35,6 @@ from flux2.contact_gap import ContactGap
 from flux2.chunked_attention import ChunkedAttention
 from flux2.bg_anchor import BackgroundAnchor
 from flux2.attention_mass import AttentionMass
-from flux2.src_attn_gate import SrcAttnGate
 import flux2.attention.attention_processor_APITASM_kernel_nonlap as mice_attn_module
 
 SEED = 0
@@ -140,22 +139,6 @@ def parse_args():
                              "instance, the mean of its context write (removes what the old object is, keeps "
                              "where its parts are)")
     for kind in ("double", "single"):
-        parser.add_argument(f"--src_gate_{kind}", type=str, default="",
-                            help=f"{kind.capitalize()}-stream blocks where the source term's strength follows, per "
-                                 f"token, how much that token reads its own instance's source in the block "
-                                 f"(flux2/src_attn_gate.py); other blocks keep the plain strength. Same syntax "
-                                 f"as --exclude_{kind}, e.g. 0:5 or all")
-    parser.add_argument("--src_gate_mode", type=str, default="attn", choices=["attn", "uniform", "edge"],
-                        help="attn: per-token weight from the attention. uniform: the same total amount spread "
-                             "evenly over the instance (control: does where matter, or only how much). edge: full "
-                             "strength in the object's core, fading linearly to 0 at its edge over --src_gate_edge")
-    parser.add_argument("--src_gate_edge", type=float, default=4.0,
-                        help="edge mode: ramp length in tokens (16 px each); capped per object at its deepest "
-                             "token so thin objects keep a full-strength core")
-    parser.add_argument("--src_gate_q", type=float, default=0.95,
-                        help="Tokens at or above this quantile of source attention within the instance get the "
-                             "full strength")
-    for kind in ("double", "single"):
         parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
                             help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
                                  f"--exclude_{kind}); applied on top of --exclude_{kind}")
@@ -250,7 +233,7 @@ def parse_args():
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
                 "beta_exclude_double", "beta_exclude_single", "gap_exclude_double", "gap_exclude_single",
-                "src_exclude_double", "src_exclude_single", "src_gate_double", "src_gate_single"):
+                "src_exclude_double", "src_exclude_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = (None if args.sample_ids is None or args.sample_ids.lower() == "all"
                        else set(args.sample_ids.split(',')))
@@ -308,16 +291,6 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"src_exclude_{kind}")
             if blocks:
                 parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
-        for kind in ("double", "single"):
-            blocks = getattr(args, f"src_gate_{kind}")
-            if blocks:
-                parts.append(f"sg{kind[0]}" + fmt_blocks(blocks))
-        if args.src_gate_double or args.src_gate_single:
-            if args.src_gate_mode == "edge":
-                parts.append(f"sge{args.src_gate_edge:g}")
-            else:
-                parts.append(("sgu" if args.src_gate_mode == "uniform" else "sga")
-                             + ("" if args.src_gate_q == 0.95 else f"_q{args.src_gate_q * 100:g}"))
     if args.gap_lambda > 0:
         parts.append(f"gap{args.gap_lambda * 100:g}_gt{args.gap_tau:g}_gm{args.gap_margin}_gs"
                      + ("all" if args.gap_steps is None else "-".join(map(str, args.gap_steps))))
@@ -445,8 +418,6 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         anchor.setup(masks, device=latents.device)
         if attn_log is not None:
             attn_log.setup(masks, device=latents.device)
-        if ortho.src_gate is not None:
-            ortho.src_gate.setup(masks, device=latents.device)
         return latents, latent_ids
 
     def _pre_forward(module, args, kwargs):
@@ -457,8 +428,6 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         anchor.begin_forward(sigma=float(pipe.scheduler.sigmas[i]), step_idx=i)
         if attn_log is not None:
             attn_log.begin_forward(step_idx=i)
-        if ortho.src_gate is not None:
-            ortho.src_gate.begin_forward(step_idx=i)
         if i == 0 and "text" not in fp:
             enc, seg = kwargs["encoder_hidden_states"], 200
             fp["text"] = [_tensor_fp(enc[:, j:j + seg]) for j in range(0, enc.shape[1], seg)]
@@ -491,8 +460,6 @@ def run_with_ortho(pipe, ortho: BlockOrtho, gap: ContactGap, chunked: ChunkedAtt
         handles += chunked.attach(mice_attn_module)
     if attn_log is not None:
         handles += attn_log.attach(pipe.transformer, mice_attn_module)
-    if ortho.src_gate is not None:
-        handles += ortho.src_gate.attach(pipe.transformer, mice_attn_module, ortho.src_on)
     if gap.lam > 0:
         handles += gap.attach(pipe.transformer, mice_attn_module)
     try:
@@ -567,16 +534,6 @@ def main():
                        ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
                        src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta,
                        src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"))
-    src_gate = None
-    if args.src_gate_double or args.src_gate_single:
-        if args.src_gate_mode != "edge" and not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
-            raise SystemExit("--src_gate_mode attn/uniform needs --attention_setting apitasmkernelnonlap")
-        src_gate = SrcAttnGate(blocks={f"double_{i}" for i in resolve(args.src_gate_double, n_double)}
-                                      | {f"single_{i}" for i in resolve(args.src_gate_single, n_single)}, mode=args.src_gate_mode, quantile=args.src_gate_q,
-                               edge=args.src_gate_edge)
-        ortho.src_gate = src_gate
-        logger.info(f"Source-term attention gate in {sorted(src_gate.blocks)} ({args.src_gate_mode})")
-    logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
     gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),
                      exclude_single=resolve(args.gap_exclude_single, n_single))
