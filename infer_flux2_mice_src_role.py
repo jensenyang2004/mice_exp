@@ -59,8 +59,9 @@ def parse_args():
     parser.add_argument("--dataset_root", type=str, default="../mice_bench", help="Root directory of MICE-Bench dataset")
     parser.add_argument("--output_dir", type=str, default="results_micebench")
     parser.add_argument("--exp_name", type=str, default=None,
-                        help="Optional prefix for the results subfolder; the steering settings are always "
-                             "appended automatically (e.g. a10_b0_p1_t4_sall_exclude_none)")
+                        help="Results subfolder name (after mice_flux2_klein_src_role_). Default: the start time "
+                             "YYYYMMDD_HHMM. Give a fixed name to resume a run or to run its shards on several "
+                             "machines. Settings: args.json; the long settings tag: tags.txt")
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples (for debugging)")
     parser.add_argument("--sample_ids", type=str, default=None, help="Comma list of sample ids to run, or \"all\" (default: all)")
     parser.add_argument("--overwrite", action="store_true",
@@ -145,6 +146,12 @@ def parse_args():
                         help="Source direction: per token (removes identity AND pose/layout copying) or one per "
                              "instance, the mean of its context write (removes what the old object is, keeps "
                              "where its parts are)")
+    parser.add_argument("--cohere", type=float, default=0.0,
+                        help="Instance cohesion (flux2/block_ortho.py): pull how much each instance token writes "
+                             "along its instance's own direction toward the instance mean, so the object does not "
+                             "split into pieces; the rest of the write (part detail) is untouched. 0 = off "
+                             "(the split / p_cv stats are logged either way)")
+    parser.add_argument("--cohere_steps", type=str, default="all", help="Steps for the cohesion, or \"all\"")
     parser.add_argument("--src_role", action="store_true",
                         help="Per-block source-term strength from the block's role (flux2/block_role.py): "
                              "--src_gamma/--src_beta in editing blocks, --src_gamma_lo/--src_beta_lo in "
@@ -238,6 +245,7 @@ def parse_args():
 
     args.bg_steps = None if args.bg_steps == "all" else str2list(args.bg_steps)
     args.log_attn_steps = None if args.log_attn_steps == "all" else str2list(args.log_attn_steps)
+    args.cohere_steps = None if args.cohere_steps == "all" else str2list(args.cohere_steps)
     args.src_steps = (None if args.src_steps is None else
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
@@ -312,6 +320,9 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"src_exclude_{kind}")
             if blocks:
                 parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
+    if args.cohere > 0:
+        parts.append(f"coh{args.cohere * 100:g}" + ("" if args.cohere_steps is None
+                                                     else "_cs" + "-".join(map(str, args.cohere_steps))))
     if args.bg_anchor > 0:
         parts.append(f"bg{args.bg_anchor * 100:g}_bt{args.bg_tau:g}_bm{args.bg_margin:g}_bs"
                      + ("all" if args.bg_steps is None else "-".join(map(str, args.bg_steps))))
@@ -493,7 +504,13 @@ def main():
     args = parse_args()
     device = args.device or ("cuda:0" if args.multi_gpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    save_dir = Path(args.output_dir) / f"mice_flux2_klein_src_role_{auto_exp_name(args)}"
+    # Folder = start time (YYYYMMDD_HHMM); the settings are in args.json (and the long tag in tags.txt).
+    # --exp_name gives a fixed folder instead: use it to resume a run or to run its shards on several machines.
+    tags = auto_exp_name(argparse.Namespace(**{**vars(args), "exp_name": None}))
+    if args.exp_name is None:
+        from datetime import datetime
+        args.exp_name = datetime.now().strftime("%Y%m%d_%H%M")
+    save_dir = Path(args.output_dir) / f"mice_flux2_klein_src_role_{args.exp_name}"
     save_dir.mkdir(parents=True, exist_ok=True)
     # Existing results are skipped, so a folder must never mix settings: refuse to reuse one made
     # with different generation args (run-control args like sample selection/device may differ).
@@ -511,9 +528,11 @@ def main():
                 and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) == "token"))}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
-                             f"Use an --exp_name prefix, or --overwrite to regenerate everything here.")
+                             f"Use another --exp_name, or --overwrite to regenerate everything here.")
     with open(args_path, "w") as f:
         json.dump(settings, f, indent=2)
+    with open(save_dir / "tags.txt", "w") as f:
+        f.write(tags + "\n")
     logger.info(f"Results will be saved to {save_dir}")
 
     pipe = load_pipeline(args, device)
@@ -549,7 +568,8 @@ def main():
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),
                        ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
                        src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta,
-                       src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"))
+                       src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"),
+                       cohere=args.cohere, cohere_steps=args.cohere_steps)
     if args.src_role:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--src_role needs --attention_setting apitasmkernelnonlap")

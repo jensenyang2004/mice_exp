@@ -49,6 +49,15 @@ with the same modulation, and are never decoded. Two optional uses:
     per-token fine detail (texture, grain) of the copy stays.
     src_norm_preserve: after the source edit, each instance token's (centered) write is rescaled to its
     original length, so gamma/beta change only its direction and add no energy.
+    cohesion (cohere > 0): keeps each instance one object instead of several pieces. Along the
+    instance's own direction g_k (what k is now, the same vector the neighbor steering uses for k), the
+    amount each token writes, p_t = d_t . g_k, is pulled toward the instance mean:
+        D_t' += cohere * (mean_{t' in k} p_t' - p_t) g_k
+    Only that one direction is evened out; everything orthogonal to g_k (what differs between parts:
+    face vs legs, texture, pose) is left alone. Applied after the neighbor and source edits, on the
+    latent stream, in cohere_steps (None = all) and every hooked block.
+    Stats log split = fraction of k's tokens whose state points away from g_k (cos < 0), and
+    p_cv = std / |mean| of p_t (how uneven the instance's own write is) before the cohesion.
     src_ctrl (flux2/block_role.py): when set, it gives gamma and beta per block and per instance (as
     per-token [HW] tensors) in place of src_gamma / src_beta; the step factor still applies.
     Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
@@ -89,6 +98,8 @@ class BlockOrtho:
     src_norm_preserve: bool = False  # rescale each instance token's write back to its length after gamma/beta
     src_exclude: set = field(default_factory=set)  # block names where the source term is off
     src_ctrl: object = None  # BlockRole: per-block, per-instance gamma/beta in place of src_gamma/src_beta
+    cohere: float = 0.0  # even out each instance's write along its own direction (see docstring)
+    cohere_steps: list | None = None  # steps for the cohesion; None = all
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -151,7 +162,8 @@ class BlockOrtho:
     def _active(self) -> bool:
         return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
                 and (self._in(self.steps)
-                     or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))))
+                     or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))
+                     or (self.cohere > 0 and self._in(self.cohere_steps))))
 
     def src_on(self, layer: str) -> bool:
         """Whether the source term acts in this block at the current step."""
@@ -245,6 +257,22 @@ class BlockOrtho:
                     new = new * (old.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
                     d_src = new - old
                 delta[:, inst] += d_src
+        if stream == "lat":
+            split, p_cv = [], []
+            coh = self.cohere * self.factor if self.cohere > 0 and self._in(self.cohere_steps) else 0.0
+            dn = d + delta
+            for k in range(K):
+                idx = masks[k]
+                if not bool(idx.any()):
+                    split.append(float("nan")); p_cv.append(float("nan"))
+                    continue
+                gk = g[:, k:k + 1]  # [B, 1, D]
+                split.append(float(((c[0, idx] * gk[0]).sum(-1) < 0).float().mean()))
+                p = (dn[:, idx] * gk).sum(-1, keepdim=True)  # [B, Nk, 1]
+                p_cv.append(float(p[0].std() / p[0].mean().abs().clamp_min(1e-12)) if p.shape[1] > 1 else 0.0)
+                if coh > 0:
+                    delta[:, idx] += coh * (p.mean(dim=1, keepdim=True) - p) * gk
+            stat.update(split=split, p_cv=p_cv, cohere=coh)
         stat["edit_rel"] = float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))
         self.stats.append(stat)
         return (ho + delta).to(h_out.dtype)
