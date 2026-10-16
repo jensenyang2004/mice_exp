@@ -6,6 +6,8 @@ position (cosine) on background vs instance tokens, and the copying fraction the
 split / p_cv (when logged): fraction of an instance's tokens whose state points away from the instance's
 own direction, and how uneven the instance's write along that direction is (std / |mean|); high values
 mean the object is breaking into pieces in that block.
+sem_in / sem_bg / sem_con (single blocks): mean cos between the latent writes and the instruction direction
+u = write(target word) - write(source word) on instance / background tokens, and |u| / |write(target)|.
 
     python summarize_block_ortho.py results_micebench/mice_flux2_klein_block_ortho_<name> [--step 0] [--stream ctx]
 """
@@ -43,7 +45,7 @@ def main():
             for f in ("src_cos_bg", "src_cos_inst", "src_frac"):
                 if f in s and s[f] == s[f]:  # skip missing / nan
                     rows[key][f].append(s[f])
-            for f in ("split", "p_cv"):
+            for f in ("split", "p_cv", "sem_cos_inst", "sem_cos_bg", "sem_contrast"):
                 rows[key][f] += [x for x in s.get(f, []) if x == x]
 
     def order(key):
@@ -53,12 +55,13 @@ def main():
 
     mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
     print(f"{len(files)} samples\n{'step':>4} {'layer':>10} {'par_frac':>9} {'edit/write':>11} {'write/stream':>13}"
-          f" {'srccos_bg':>10} {'srccos_in':>10} {'src_frac':>9} {'split':>7} {'p_cv':>7}")
+          f" {'srccos_bg':>10} {'srccos_in':>10} {'src_frac':>9} {'split':>7} {'p_cv':>7} {'sem_in':>7} {'sem_bg':>7} {'sem_con':>7}")
     for key in sorted(rows, key=order):
         r = rows[key]
         print(f"{key[0]:>4} {key[1]:>10} {mean(r['par_frac']):>9.3f} {mean(r['edit_rel']):>11.3f} "
               f"{mean(r['write_rel']):>13.3f} {mean(r['src_cos_bg']):>10.3f} {mean(r['src_cos_inst']):>10.3f}"
-              f" {mean(r['src_frac']):>9.3f} {mean(r['split']):>7.3f} {mean(r['p_cv']):>7.2f}")
+              f" {mean(r['src_frac']):>9.3f} {mean(r['split']):>7.3f} {mean(r['p_cv']):>7.2f}"
+              f" {mean(r['sem_cos_inst']):>7.3f} {mean(r['sem_cos_bg']):>7.3f} {mean(r['sem_contrast']):>7.2f}")
 
 
 if __name__ == "__main__":

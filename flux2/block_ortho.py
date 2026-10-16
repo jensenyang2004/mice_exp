@@ -67,6 +67,18 @@ with the same modulation, and are never decoded. Two optional uses:
     latent stream, in cohere_steps (None = all) and every hooked block.
     Stats log split = fraction of k's tokens whose state points away from g_k (cos < 0), and
     p_cv = std / |mean| of p_t (how uneven the instance's own write is) before the cohesion.
+    instruction term (single blocks only; sem_tokens set per sample, flux2/sem_tokens.py): in the single
+    blocks text and image tokens share the weights and the residual stream, so the block's writes into
+    the instance's own prompt words are vectors in the same space as its image writes. Per instance k:
+        u_k = normalize(mean_{target-word tokens} D_text - mean_{source-word tokens} D_text)
+    "how this block treats the target word differently from the source word"; what both words share
+    (being a word of this instruction, reading the same instance's image tokens) cancels. Then, on k's
+    latent tokens, with p_t = d_t . u_k:
+        D_t' += -sem_gamma * min(p_t, 0) u_k + sem_lambda * |d_t| u_k
+    (remove the source-word side, push toward the target word relative to the token's own write).
+    Steps: sem_steps (None = all); blocks: single blocks minus sem_exclude. Stats (logged whenever the
+    word positions are known, also with both strengths 0): sem_cos_inst / sem_cos_bg = mean cos(d_t, u_k)
+    on k's tokens / on the background, and sem_contrast = |D_tgt - D_src| / |D_tgt|.
     src_ctrl (flux2/block_role.py): when set, it gives gamma and beta per block and per instance (as
     per-token [HW] tensors) in place of src_gamma / src_beta; the step factor still applies.
     Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
@@ -111,6 +123,11 @@ class BlockOrtho:
     cohere_steps: list | None = None  # steps for the cohesion; None = all
     cohere_tau: float = 0.0  # >0: distance-weighted local mean instead of the whole-instance mean
     cohere_ctx: bool = False  # make the cohesion direction orthogonal to the instance's context write
+    sem_lambda: float = 0.0  # instruction term: push toward the target word (single blocks)
+    sem_gamma: float = 0.0  # instruction term: remove the source-word side
+    sem_steps: list | None = None  # steps for the instruction term; None = all
+    sem_exclude: set = field(default_factory=set)  # single block names without the instruction term
+    sem_tokens: list | None = None  # per instance (src positions, tgt positions) in the text sequence, or None
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -175,7 +192,8 @@ class BlockOrtho:
         return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
                 and (self._in(self.steps)
                      or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))
-                     or (self.cohere > 0 and self._in(self.cohere_steps))))
+                     or (self.cohere > 0 and self._in(self.cohere_steps))
+                     or ((self.sem_lambda > 0 or self.sem_gamma > 0) and self._in(self.sem_steps))))
 
     def src_on(self, layer: str) -> bool:
         """Whether the source term acts in this block at the current step."""
@@ -191,7 +209,7 @@ class BlockOrtho:
         return self.steps if self.src_steps is None else self.src_steps
 
     def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str, stream: str = "lat",
-              src: tuple | None = None) -> torch.Tensor:
+              src: tuple | None = None, sem: torch.Tensor | None = None) -> torch.Tensor:
         """h_in, h_out: [B, HW, D] latent (stream "lat") or context ("ctx") tokens. src: (D, h_out) of
         the context tokens, only for the latent stream. Returns the edited h_out (same dtype)."""
         alpha, beta = (self.alpha, self.beta) if stream == "lat" else (self.ctx_alpha, self.ctx_beta)
@@ -269,6 +287,27 @@ class BlockOrtho:
                     new = new * (old.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
                     d_src = new - old
                 delta[:, inst] += d_src
+        if stream == "lat" and sem is not None:  # instruction term, sem: [B, K, D] (zero rows = no words)
+            on = self._in(self.sem_steps) and layer not in self.sem_exclude
+            gs, ls = (self.sem_gamma * self.factor, self.sem_lambda * self.factor) if on else (0.0, 0.0)
+            dn = d + delta
+            inst = masks.any(dim=0)
+            cos_in, cos_bg = [], []
+            for k in range(K):
+                uk = sem[:, k:k + 1]  # [B, 1, D]
+                idx = masks[k]
+                if not bool(idx.any()) or float(uk.norm()) == 0.0:
+                    cos_in.append(float("nan")); cos_bg.append(float("nan"))
+                    continue
+                cos_all = (F.normalize(dn[0], dim=-1) * uk[0]).sum(-1)  # [HW]
+                cos_in.append(float(cos_all[idx].mean()))
+                cos_bg.append(float(cos_all[~inst].mean()) if bool((~inst).any()) else float("nan"))
+                if gs != 0.0 or ls != 0.0:
+                    dk = dn[:, idx]
+                    p = (dk * uk).sum(-1, keepdim=True)
+                    delta[:, idx] += (-gs * p.clamp(max=0.0) + ls * dk.norm(dim=-1, keepdim=True)) * uk
+            stat.update(sem_cos_inst=cos_in, sem_cos_bg=cos_bg, sem_gamma=gs, sem_lambda=ls,
+                        sem_contrast=self._sem_contrast)
         if stream == "lat":
             split, p_cv = [], []
             coh = self.cohere * self.factor if self.cohere > 0 and self._in(self.cohere_steps) else 0.0
@@ -341,6 +380,27 @@ class BlockOrtho:
         out = out / cnt.clamp_min(1.0)[None, :, None]
         return out[:, inst]
 
+    def _sem_directions(self, h_in, h_out, s: int):
+        """[B, K, D] unit u_k from the text tokens' writes (zero rows where the words are unknown), or None."""
+        if not self.sem_tokens or s <= 0:
+            return None
+        K = self.masks.shape[0]
+        if len(self.sem_tokens) != K:
+            return None
+        Dt = (h_out[:, :s] - h_in[:, :s]).float()
+        U = torch.zeros(Dt.shape[0], K, Dt.shape[-1], device=Dt.device)
+        self._sem_contrast = []
+        for k, pos in enumerate(self.sem_tokens):
+            if pos is None or max(pos[0] + pos[1]) >= s:
+                self._sem_contrast.append(float("nan"))
+                continue
+            d_src = Dt[:, pos[0]].mean(dim=1)
+            d_tgt = Dt[:, pos[1]].mean(dim=1)
+            diff = d_tgt - d_src
+            self._sem_contrast.append(float(diff[0].norm() / d_tgt[0].norm().clamp_min(1e-12)))
+            U[:, k] = F.normalize(diff, dim=-1)
+        return U
+
     def _edit_stream(self, h_in, h_out, s: int, layer: str):
         """Edits the latent tokens [s, s+HW) and, if there is a context, [s+HW, s+2HW) of a block output."""
         HW = self.HW
@@ -348,7 +408,8 @@ class BlockOrtho:
         lat, ctx = slice(s, s + HW), slice(s + HW, s + 2 * HW)
         out = h_out.clone()
         src = (h_out[:, ctx] - h_in[:, ctx], h_out[:, ctx]) if has_ctx else None  # unsteered context
-        out[:, lat] = self._edit(h_in[:, lat], h_out[:, lat], layer, "lat", src=src)
+        sem = self._sem_directions(h_in, h_out, s) if layer.startswith("single") else None
+        out[:, lat] = self._edit(h_in[:, lat], h_out[:, lat], layer, "lat", src=src, sem=sem)
         if has_ctx and (self.ctx_alpha != 0.0 or self.ctx_beta != 0.0):
             out[:, ctx] = self._edit(h_in[:, ctx], h_out[:, ctx], layer, "ctx")
         return out

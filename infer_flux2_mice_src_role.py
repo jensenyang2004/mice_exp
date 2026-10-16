@@ -39,6 +39,7 @@ from flux2.attention import get_attention_processors, AttentionSetting
 from flux2.pipeline_utils import create_position_mask_list, resize_mask
 from flux2.block_ortho import BlockOrtho
 from flux2.block_role import BlockRole
+from flux2.sem_tokens import word_positions
 from flux2.chunked_attention import ChunkedAttention
 from flux2.bg_anchor import BackgroundAnchor
 from flux2.attention_mass import AttentionMass
@@ -152,6 +153,17 @@ def parse_args():
                         help="Source direction: per token (removes identity AND pose/layout copying) or one per "
                              "instance, the mean of its context write (removes what the old object is, keeps "
                              "where its parts are)")
+    parser.add_argument("--sem_lambda", type=float, default=0.0,
+                        help="Instruction term, single blocks only (flux2/block_ortho.py): push each instance "
+                             "token's write toward u = (block's write to the target word) - (its write to the "
+                             "source word), relative to the token's own write. 0 = off (its cosines are logged "
+                             "either way)")
+    parser.add_argument("--sem_gamma", type=float, default=0.0,
+                        help="Instruction term: remove the part of each instance token's write pointing to the "
+                             "source-word side (negative projection on u)")
+    parser.add_argument("--sem_steps", type=str, default="all", help="Steps for the instruction term, or \"all\"")
+    parser.add_argument("--sem_exclude_single", type=str, default="",
+                        help="Single blocks without the instruction term (same syntax as --exclude_single)")
     parser.add_argument("--cohere", type=float, default=0.0,
                         help="Instance cohesion (flux2/block_ortho.py): pull how much each instance token writes "
                              "along its instance's own direction toward the instance mean, so the object does not "
@@ -260,11 +272,12 @@ def parse_args():
     args.src_push_steps = None if args.src_push_steps == "all" else str2list(args.src_push_steps)
     args.log_attn_steps = None if args.log_attn_steps == "all" else str2list(args.log_attn_steps)
     args.cohere_steps = None if args.cohere_steps == "all" else str2list(args.cohere_steps)
+    args.sem_steps = None if args.sem_steps == "all" else str2list(args.sem_steps)
     args.src_steps = (None if args.src_steps is None else
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
                 "beta_exclude_double", "beta_exclude_single", 
-                "src_exclude_double", "src_exclude_single"):
+                "src_exclude_double", "src_exclude_single", "sem_exclude_single"):
         setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = (None if args.sample_ids is None or args.sample_ids.lower() == "all"
                        else set(args.sample_ids.split(',')))
@@ -334,6 +347,10 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"src_exclude_{kind}")
             if blocks:
                 parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
+    if args.sem_lambda > 0 or args.sem_gamma > 0:
+        parts.append(f"sem{args.sem_lambda * 100:g}" + (f"_sg{args.sem_gamma * 100:g}" if args.sem_gamma else "")
+                     + ("" if args.sem_steps is None else "_ss" + "-".join(map(str, args.sem_steps)))
+                     + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else ""))
     if args.cohere > 0:
         parts.append(f"coh{args.cohere * 100:g}" + (f"_ct{args.cohere_tau:g}" if args.cohere_tau > 0 else "")
                      + ("_cx" if args.cohere_ctx else "")
@@ -508,6 +525,13 @@ def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
                                          lambda: ortho._in(ortho._src_steps()))
     if attn_log is not None:
         handles += attn_log.attach(pipe.transformer, mice_attn_module)
+    # source / target word positions of each local prompt, for the instruction term (and its stats)
+    try:
+        ortho.sem_tokens = word_positions(pipe.tokenizer, sample["prompt"], sample["sources"], sample["targets"])
+        fp["sem_tokens"] = ortho.sem_tokens
+    except Exception as e:
+        logger.warning(f"Instruction term: word positions not found ({e}); off for this sample")
+        ortho.sem_tokens = None
     try:
         out = pipe(**pipe_kwargs)
         if torch.cuda.is_available():
@@ -589,7 +613,9 @@ def main():
                        src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta,
                        src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"),
                        cohere=args.cohere, cohere_steps=args.cohere_steps,
-                       cohere_tau=args.cohere_tau, cohere_ctx=args.cohere_ctx)
+                       cohere_tau=args.cohere_tau, cohere_ctx=args.cohere_ctx,
+                       sem_lambda=args.sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
+                       sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)})
     if args.src_role:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--src_role needs --attention_setting apitasmkernelnonlap")
