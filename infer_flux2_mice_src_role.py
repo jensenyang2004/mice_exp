@@ -217,6 +217,11 @@ def parse_args():
     parser.add_argument("--log_attn_steps", type=str, default="all", help="Steps to record, or \"all\"")
     parser.add_argument("--log_attn_near", type=int, default=2,
                         help="Radius (tokens) of the 'local' own-latent neighbourhood in the attention log")
+    parser.add_argument("--cpu_noise", action="store_true",
+                        help="Draw the initial noise with a CPU generator (then moved to the GPU). With the default "
+                             "GPU generator the same seed gives different noise on different GPU models / torch "
+                             "versions, so machines cannot be compared; the CPU stream is the same everywhere. "
+                             "Changes the noise vs. runs without it")
     parser.add_argument("--diagnose", action="store_true",
                         help="Per-instance diagnostics (flux2/diagnose.py) into <id>_diag.json and the log: MICE "
                              "processor state left over from the previous sample, the text binding in the "
@@ -723,7 +728,7 @@ def main():
                     hard_image_attribute_binding_list_double=args.hard_image_attribute_binding_list_double,
                     hard_image_attribute_binding_list_single=args.hard_image_attribute_binding_list_single,
                     bring_area_to_1024_squared=args.bring_area_to_1024_squared,
-                    generator=torch.Generator(device=device).manual_seed(SEED),
+                    generator=torch.Generator(device="cpu" if args.cpu_noise else device).manual_seed(SEED),
                     hard_masking_steps=args.masking_steps,
                     relaxed_timesteps=args.relaxed_timesteps,
                     attention_kwargs={"smooth_P_L": args.smooth_P_L},

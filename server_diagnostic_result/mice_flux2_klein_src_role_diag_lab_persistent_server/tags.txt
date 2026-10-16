@@ -1,0 +1,1 @@
+a90_b50_p1_t4_lt2_ring0_s0-1_exs5to19_bexsall_ca50_cb50_src80_sb150_np_ss0-1-2-3_sem0_sg120_coh120_bg50_bt4_bm2_bsall_fc_strict

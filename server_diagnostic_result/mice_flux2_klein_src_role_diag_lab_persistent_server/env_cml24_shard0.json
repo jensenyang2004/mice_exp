@@ -1,0 +1,43 @@
+{
+  "host": "cml24",
+  "python": "3.12.14",
+  "torch": "2.5.1+cu121",
+  "cuda": "12.1",
+  "cudnn": 90100,
+  "pillow": "12.3.0",
+  "gpus": [
+    "Quadro RTX 8000",
+    "Quadro RTX 8000"
+  ],
+  "run_control": {
+    "device": null,
+    "multi_gpu": false,
+    "attn_chunk": 0,
+    "cpu_offload": false,
+    "num_shards": 1,
+    "shard_id": 0
+  },
+  "sdpa_enabled": {
+    "flash": true,
+    "mem_efficient": true,
+    "math": true
+  },
+  "matmul_tf32": false,
+  "diffusers": "0.40.0",
+  "transformers": "5.16.1",
+  "accelerate": "1.14.0",
+  "tokenizers": "0.23.1",
+  "text_encoder_attn": "sdpa",
+  "gpu_capability": [
+    [
+      7,
+      5
+    ],
+    [
+      7,
+      5
+    ]
+  ],
+  "matmul_bf16_reduced": true,
+  "model_snapshot": "/tmp2/b11705032/flux2/models/FLUX.2-klein-4B (no hub snapshot: HFValidationError)"
+}

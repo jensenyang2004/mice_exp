@@ -1,0 +1,37 @@
+{
+  "host": "aab94c8ff5a7",
+  "python": "3.12.3",
+  "torch": "2.11.0+cu128",
+  "cuda": "12.8",
+  "cudnn": 91900,
+  "pillow": "12.3.0",
+  "gpus": [
+    "NVIDIA A100-SXM4-80GB"
+  ],
+  "run_control": {
+    "device": null,
+    "multi_gpu": false,
+    "attn_chunk": 0,
+    "cpu_offload": false,
+    "num_shards": 1,
+    "shard_id": 0
+  },
+  "sdpa_enabled": {
+    "flash": true,
+    "mem_efficient": true,
+    "math": true
+  },
+  "matmul_tf32": false,
+  "diffusers": "0.41.0",
+  "transformers": "5.20.0",
+  "tokenizers": "0.23.3",
+  "text_encoder_attn": "sdpa",
+  "gpu_capability": [
+    [
+      8,
+      0
+    ]
+  ],
+  "matmul_bf16_reduced": true,
+  "model_snapshot": "black-forest-labs/FLUX.2-klein-4B (no hub snapshot: IncompleteSnapshotError)"
+}
