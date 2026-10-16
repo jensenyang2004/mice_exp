@@ -8,6 +8,14 @@ For instance k in block l at the current step, over k's latent query tokens (mea
     out_kl   = attention mass on every other image token (neighbors' and background latent + context)
     e_kl     = self_kl / (self_kl + out_kl)           text is left out: inside vs outside the object only
 The first double block is the anchor (most building), per instance and step: a_k = e_k,double_0.
+score "logodds" (default):
+    s_kl     = clamp((logit(e_kl) - logit(a_k)) / lift, 0, 1)
+  e is biased by the object's size: a small object simply has fewer own tokens than outside ones, so
+  its self share is low in every block. With w_self, w_out the attention per own / outside token,
+  e / (1 - e) = (N_self w_self) / (N_out w_out): the token counts are a constant factor of the odds,
+  so the log-odds change from the anchor depends only on how much more each own token is preferred
+  than in the anchor block. lift = 1 means s = 1 at e^1 = 2.7x the anchor's per-token preference.
+score "linear":
     s_kl     = clamp((e_kl - a_k) / (full - a_k), 0, 1)    0 = like the anchor, 1 = self share >= full
     gamma_kl = gamma_lo + s_kl (gamma_hi - gamma_lo)
     beta_kl  = beta_lo  + s_kl (beta_hi  - beta_lo)
@@ -28,7 +36,9 @@ class BlockRole:
     gamma_hi: float = 1.0
     beta_lo: float = 0.0
     beta_hi: float = 0.0
-    full: float = 1.0  # self share that counts as fully editing (s = 1)
+    full: float = 1.0  # "linear": self share that counts as fully editing (s = 1)
+    score: str = "logodds"  # "logodds" (size-independent) or "linear"
+    lift: float = 1.0  # "logodds": log-odds increase over the anchor that counts as fully editing
     chunk: int = 512
     anchor_layer: str = "double_0"
     stats: list = field(default_factory=list)
@@ -79,7 +89,11 @@ class BlockRole:
         return e
 
     def _set(self, layer, e):
-        s = ((e - self.anchor) / (self.full - self.anchor).clamp_min(1e-6)).clamp(0.0, 1.0)
+        if self.score == "logodds":
+            logit = lambda p: torch.logit(p.clamp(1e-4, 1 - 1e-4))
+            s = ((logit(e) - logit(self.anchor)) / self.lift).clamp(0.0, 1.0)
+        else:
+            s = ((e - self.anchor) / (self.full - self.anchor).clamp_min(1e-6)).clamp(0.0, 1.0)
         s = torch.nan_to_num(s, nan=0.0)
         g = self.gamma_lo + s * (self.gamma_hi - self.gamma_lo)
         b = self.beta_lo + s * (self.beta_hi - self.beta_lo)

@@ -151,9 +151,15 @@ def parse_args():
                              "building blocks (like the first double block), linear in between")
     parser.add_argument("--src_gamma_lo", type=float, default=0.0, help="--src_role: gamma in building blocks")
     parser.add_argument("--src_beta_lo", type=float, default=0.0, help="--src_role: beta in building blocks")
+    parser.add_argument("--role_score", type=str, default="logodds", choices=["logodds", "linear"],
+                        help="--src_role: editing score. logodds: change in log-odds of the self share from the "
+                             "first double block (independent of object size); linear: raw self share")
+    parser.add_argument("--role_lift", type=float, default=1.0,
+                        help="--src_role logodds: log-odds increase over the first double block that counts as "
+                             "fully editing (1 = own tokens preferred 2.7x more than there)")
     parser.add_argument("--role_full", type=float, default=1.0,
-                        help="--src_role: self share (own tokens / all image tokens attended) at which a block "
-                             "counts as fully editing")
+                        help="--src_role linear: self share (own tokens / all image tokens attended) at which a "
+                             "block counts as fully editing")
     for kind in ("double", "single"):
         parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
                             help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
@@ -283,7 +289,19 @@ def auto_exp_name(args) -> str:
                 parts.append(f"{tag}ex{kind[0]}" + fmt_blocks(blocks))
     if args.ctx_alpha or args.ctx_beta:
         parts.append(f"ca{args.ctx_alpha * 100:g}_cb{args.ctx_beta * 100:g}")
-    if args.src_gamma or args.src_beta:
+    if args.src_role:  # strengths as building-to-editing ranges, e.g. src100-150_sb0-60_role_lift100
+        parts.append(f"src{args.src_gamma_lo * 100:g}-{args.src_gamma * 100:g}"
+                     f"_sb{args.src_beta_lo * 100:g}-{args.src_beta * 100:g}"
+                     + (f"_role_lift{args.role_lift * 100:g}" if args.role_score == "logodds"
+                        else f"_role_lin{args.role_full * 100:g}")
+                     + ("_inst" if args.src_mode == "instance" else "")
+                     + (f"_sm{args.src_smooth}" if args.src_smooth else "") + ("_np" if args.src_norm_preserve else "")
+                     + ("" if args.src_steps is None else "_ss" + "-".join(map(str, args.src_steps))))
+        for kind in ("double", "single"):
+            blocks = getattr(args, f"src_exclude_{kind}")
+            if blocks:
+                parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
+    elif args.src_gamma or args.src_beta:
         parts.append(f"src{args.src_gamma * 100:g}" + (f"_sb{args.src_beta * 100:g}" if args.src_beta else "")
                      + ("_inst" if args.src_mode == "instance" else "")
                      + (f"_sm{args.src_smooth}" if args.src_smooth else "") + ("_np" if args.src_norm_preserve else "")
@@ -292,9 +310,6 @@ def auto_exp_name(args) -> str:
             blocks = getattr(args, f"src_exclude_{kind}")
             if blocks:
                 parts.append(f"srcex{kind[0]}" + fmt_blocks(blocks))
-        if args.src_role:
-            parts.append(f"role_lo{args.src_gamma_lo * 100:g}-{args.src_beta_lo * 100:g}"
-                         + ("" if args.role_full == 1.0 else f"_full{args.role_full * 100:g}"))
     if args.bg_anchor > 0:
         parts.append(f"bg{args.bg_anchor * 100:g}_bt{args.bg_tau:g}_bm{args.bg_margin:g}_bs"
                      + ("all" if args.bg_steps is None else "-".join(map(str, args.bg_steps))))
@@ -537,12 +552,13 @@ def main():
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--src_role needs --attention_setting apitasmkernelnonlap")
         ortho.src_ctrl = BlockRole(gamma_lo=args.src_gamma_lo, gamma_hi=args.src_gamma, beta_lo=args.src_beta_lo,
-                                   beta_hi=args.src_beta, full=args.role_full)
+                                   beta_hi=args.src_beta, full=args.role_full, score=args.role_score,
+                                   lift=args.role_lift)
         # the source term is active whenever either end of the range is non-zero
         ortho.src_gamma = max(args.src_gamma, args.src_gamma_lo)
         ortho.src_beta = args.src_beta if args.src_beta else args.src_beta_lo
         logger.info(f"Source term per block role: gamma {args.src_gamma_lo} -> {args.src_gamma}, "
-                    f"beta {args.src_beta_lo} -> {args.src_beta} (full at self share {args.role_full})")
+                    f"beta {args.src_beta_lo} -> {args.src_beta} ({args.role_score} score)")
     chunked = None
     if args.attn_chunk > 0:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
