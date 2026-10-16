@@ -127,6 +127,13 @@ def parse_args():
     parser.add_argument("--src_beta", type=float, default=0.0,
                         help="Amplify the non-copy part of instance tokens' writes (the edit). Keeps the copy that "
                              "is added to the stream (pose) unchanged. Same steps/blocks as --src_gamma. 0 = off")
+    parser.add_argument("--src_smooth", type=int, default=0,
+                        help="Act only on the coarse copy: average it over a (2r+1)^2 token window within each "
+                             "instance first, so the old appearance is removed but per-token fine detail (texture, "
+                             "grain) of the source stays. 0 = off; try 1-2")
+    parser.add_argument("--src_norm_preserve", action="store_true",
+                        help="Rescale each instance token's write to its original length after gamma/beta: they "
+                             "change only its direction and add no energy")
     parser.add_argument("--src_mode", type=str, default="token", choices=["token", "instance"],
                         help="Source direction: per token (removes identity AND pose/layout copying) or one per "
                              "instance, the mean of its context write (removes what the old object is, keeps "
@@ -274,6 +281,7 @@ def auto_exp_name(args) -> str:
     if args.src_gamma or args.src_beta:
         parts.append(f"src{args.src_gamma * 100:g}" + (f"_sb{args.src_beta * 100:g}" if args.src_beta else "")
                      + ("_inst" if args.src_mode == "instance" else "")
+                     + (f"_sm{args.src_smooth}" if args.src_smooth else "") + ("_np" if args.src_norm_preserve else "")
                      + ("" if args.src_steps is None else "_ss" + "-".join(map(str, args.src_steps))))
         for kind in ("double", "single"):
             blocks = getattr(args, f"src_exclude_{kind}")
@@ -481,7 +489,8 @@ def main():
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),
                        ctx_alpha=args.ctx_alpha, ctx_beta=args.ctx_beta, src_gamma=args.src_gamma,
-                       src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta, src_exclude=names("src"))
+                       src_steps=args.src_steps, src_mode=args.src_mode, src_beta=args.src_beta,
+                       src_smooth=args.src_smooth, src_norm_preserve=args.src_norm_preserve, src_exclude=names("src"))
     logger.info(f"In-model neighbor-orthogonal steering ({n_double} double + {n_single} single blocks): {ortho}")
     gap = ContactGap(lam=args.gap_lambda, tau=args.gap_tau, margin=args.gap_margin, steps=args.gap_steps,
                      exclude_double=resolve(args.gap_exclude_double, n_double),

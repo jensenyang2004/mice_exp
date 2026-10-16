@@ -44,6 +44,11 @@ with the same modulation, and are never decoded. Two optional uses:
     src_beta amplifies the rest, d_t - copy_t, on instance tokens: D_t' = D_t - g copy_t + b_s rest_t.
     Unlike gamma < 1, it leaves the copy that is added to the stream unchanged (pose kept) and
     pushes the non-source part (the edit) harder.
+    src_smooth r > 0: the copy part is first averaged over a (2r+1)^2 token window within each instance,
+    and only that coarse part is removed / excluded from the rest: the old appearance goes, the
+    per-token fine detail (texture, grain) of the copy stays.
+    src_norm_preserve: after the source edit, each instance token's (centered) write is rescaled to its
+    original length, so gamma/beta change only its direction and add no energy.
     Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
     Stats log the cosine between the latent and context writes (and context state) on background
     vs instance tokens whenever the hook is active, to check where the two are comparable.
@@ -78,6 +83,8 @@ class BlockOrtho:
     src_steps: list | None = None  # steps for the source term; None = same as `steps`
     src_mode: str = "token"  # "token": per-token copy direction; "instance": one per instance
     src_beta: float = 0.0  # amplify the non-copy rest of instance tokens' writes (same steps/blocks as gamma)
+    src_smooth: int = 0  # >0: act only on the copy part averaged over a (2r+1)^2 token window within the instance
+    src_norm_preserve: bool = False  # rescale each instance token's write back to its length after gamma/beta
     src_exclude: set = field(default_factory=set)  # block names where the source term is off
     stats: list = field(default_factory=list)
 
@@ -85,6 +92,7 @@ class BlockOrtho:
         self.stats = []
         Ht, Wt = masks_2d[0].shape
         self.HW = Ht * Wt
+        self.Ht, self.Wt = Ht, Wt
         self.masks = torch.stack([m.reshape(-1) > 0.5 for m in masks_2d]).to(device)  # [K, HW]
         self.mask_w = self.masks.float()
         self.proximity = mask_proximity(self.masks, Ht, Wt, self.tau)
@@ -208,13 +216,44 @@ class BlockOrtho:
                 ref = s_dir
             coef = (d[:, inst] * ref[:, inst]).sum(-1, keepdim=True).clamp_min(0.0)  # copying part only
             par_s = coef * ref[:, inst]
+            if self.src_smooth > 0:
+                par_s = self._smooth_in_instances(par_s, inst, masks)
             stat.update(gamma=gamma, src_beta=src_b, src_frac=float(par_s[0].norm(dim=-1).mean()
                                                     / d[0, inst].norm(dim=-1).mean().clamp_min(1e-12)))
             if gamma != 0 or src_b != 0:
-                delta[:, inst] += -gamma * par_s + src_b * (d[:, inst] - par_s)
+                d_src = -gamma * par_s + src_b * (d[:, inst] - par_s)
+                if self.src_norm_preserve:
+                    old = d[:, inst]
+                    new = old + d_src
+                    new = new * (old.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+                    d_src = new - old
+                delta[:, inst] += d_src
         stat["edit_rel"] = float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))
         self.stats.append(stat)
         return (ho + delta).to(h_out.dtype)
+
+    def _smooth_in_instances(self, par_s, inst, masks):
+        """par_s: [B, n_inst, D] on the tokens of `inst`. Box average over a (2r+1)^2 token window,
+        within each instance separately (never across instances or into the background)."""
+        B, _, Dm = par_s.shape
+        r = self.src_smooth
+        full = torch.zeros(B, self.HW, Dm, device=par_s.device, dtype=par_s.dtype)
+        full[:, inst] = par_s
+        out = torch.zeros_like(full)
+        cnt = torch.zeros(self.HW, device=par_s.device)
+        for k in range(masks.shape[0]):
+            w = masks[k].float()
+            if not bool(w.any()):
+                continue
+            grid = (full * w[None, :, None]).transpose(1, 2).reshape(B, Dm, self.Ht, self.Wt)
+            wg = w.reshape(1, 1, self.Ht, self.Wt)
+            num = F.avg_pool2d(grid, 2 * r + 1, stride=1, padding=r, count_include_pad=True)
+            den = F.avg_pool2d(wg, 2 * r + 1, stride=1, padding=r, count_include_pad=True).clamp_min(1e-12)
+            avg = (num / den).reshape(B, Dm, self.HW).transpose(1, 2)
+            out += avg * w[None, :, None]
+            cnt += w
+        out = out / cnt.clamp_min(1.0)[None, :, None]
+        return out[:, inst]
 
     def _edit_stream(self, h_in, h_out, s: int, layer: str):
         """Edits the latent tokens [s, s+HW) and, if there is a context, [s+HW, s+2HW) of a block output."""
