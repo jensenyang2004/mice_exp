@@ -208,8 +208,8 @@ def parse_args():
     args.hard_image_attribute_binding_list_single = parse_layer_range(args.hard_image_attribute_binding_list_single)
     args.ortho_steps = None if args.ortho_steps == "all" else str2list(args.ortho_steps)
     def parse_blocks(s):
-        """"0,3:5,-1" -> [0, 3, 4, -1]; "all" -> ["all"] (resolved once the block count is known)."""
-        if not s:
+        """"0,3:5,-1" -> [0, 3, 4, -1]; "all" -> ["all"] (resolved once the block count is known); "none" -> []."""
+        if not s or s.lower() == "none":
             return []
         if s == "all":
             return ["all"]
