@@ -39,7 +39,8 @@ from flux2.attention import get_attention_processors, AttentionSetting
 from flux2.pipeline_utils import create_position_mask_list, resize_mask
 from flux2.block_ortho import BlockOrtho
 from flux2.block_role import BlockRole
-from flux2.sem_tokens import word_positions
+from flux2.sem_tokens import word_positions, _template
+from flux2.diagnose import Diagnose
 from flux2.chunked_attention import ChunkedAttention
 from flux2.bg_anchor import BackgroundAnchor
 from flux2.attention_mass import AttentionMass
@@ -216,6 +217,11 @@ def parse_args():
     parser.add_argument("--log_attn_steps", type=str, default="all", help="Steps to record, or \"all\"")
     parser.add_argument("--log_attn_near", type=int, default=2,
                         help="Radius (tokens) of the 'local' own-latent neighbourhood in the attention log")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Per-instance diagnostics (flux2/diagnose.py) into <id>_diag.json and the log: MICE "
+                             "processor state left over from the previous sample, the text binding in the "
+                             "attention mask actually used, text attention mass, prompt embeddings, and how far "
+                             "each instance's prediction moves from the source per step. Results unchanged")
     parser.add_argument("--log_attn_maps", action="store_true",
                         help="With --log_attn_mass: also save per-token maps over the whole grid (text / context / "
                              "local-context mass per step and block) as <id>_attn_maps.npz. Plot with "
@@ -453,7 +459,8 @@ def _regions_fp(t: torch.Tensor, ortho: BlockOrtho) -> dict:
 
 def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
                    anchor: BackgroundAnchor, sample, use_masks: bool, mem: dict, strict: bool = False,
-                   attn_log: AttentionMass | None = None, fp: dict | None = None, **pipe_kwargs):
+                   attn_log: AttentionMass | None = None, fp: dict | None = None, diag: Diagnose | None = None,
+                   **pipe_kwargs):
     """Runs one pipe() call with the steering attached via wraps/hooks (removed in `finally`).
     mem receives peak GPU memory (GB): overall and inside the transformer forwards.
     fp receives a fingerprint of the inputs and of every step (see fingerprint_inputs/_step), to find
@@ -480,6 +487,10 @@ def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
         anchor.setup(masks, device=latents.device)
         if attn_log is not None:
             attn_log.setup(masks, device=latents.device)
+        if diag is not None:
+            n_real = [len(pipe.tokenizer(_template(pipe.tokenizer, p_), add_special_tokens=False)["input_ids"])
+                      for p_ in sample["prompt"].split("$BREAKFLAG$")[1:]]
+            diag.setup(masks, device=latents.device, n_real_tokens=n_real)
         return latents, latent_ids
 
     def _pre_forward(module, args, kwargs):
@@ -491,6 +502,10 @@ def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
         anchor.begin_forward(sigma=float(pipe.scheduler.sigmas[i]), step_idx=i)
         if attn_log is not None:
             attn_log.begin_forward(step_idx=i)
+        if diag is not None:
+            diag.begin_forward(step_idx=i, sigma=float(pipe.scheduler.sigmas[i]))
+            if i == 0:
+                diag.text_embed(kwargs["encoder_hidden_states"])
         if i == 0 and "text" not in fp:
             enc, seg = kwargs["encoder_hidden_states"], 200
             fp["text"] = [_tensor_fp(enc[:, j:j + seg]) for j in range(0, enc.shape[1], seg)]
@@ -504,6 +519,8 @@ def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
     def _post_forward(module, args, kwargs, output):
         v = output[0] if isinstance(output, (tuple, list)) else getattr(output, "sample", output)
         fp["steps"][-1]["velocity"] = _regions_fp(v, ortho)
+        if diag is not None:
+            diag.progress(kwargs["hidden_states"], v)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             mem["transformer"] = max(mem.get("transformer", 0.0), torch.cuda.max_memory_allocated() / 2**30)
@@ -525,6 +542,17 @@ def run_with_ortho(pipe, ortho: BlockOrtho, chunked: ChunkedAttention | None,
                                          lambda: ortho._in(ortho._src_steps()))
     if attn_log is not None:
         handles += attn_log.attach(pipe.transformer, mice_attn_module)
+    if diag is not None:
+        handles += diag.attach(pipe.transformer, mice_attn_module)
+    # The MICE processors keep their step counter and text-binding masks at class level and reset them
+    # only when a sample finishes normally; a sample that failed halfway would leave a stale mask and step
+    # count for this one. Record (with --diagnose) and reset them before every sample.
+    if diag is not None:
+        diag.processor_state(mice_attn_module)
+    else:
+        for name in ("Flux2APITASMAttnProcessorKernelNonLap", "Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap"):
+            if hasattr(mice_attn_module, name):
+                getattr(mice_attn_module, name).clear_cached_masks()
     # source / target word positions of each local prompt, for the instruction term (and its stats)
     try:
         ortho.sem_tokens = word_positions(pipe.tokenizer, sample["prompt"], sample["sources"], sample["targets"])
@@ -559,7 +587,7 @@ def main():
     # with different generation args (run-control args like sample selection/device may differ).
     run_control = {"num_samples", "sample_ids", "device", "num_shards", "shard_id", "multi_gpu", "overwrite",
                    "attn_chunk", "cpu_offload", "log_attn_mass", "log_attn_steps", "log_attn_near",
-                   "log_attn_maps"}
+                   "log_attn_maps", "diagnose"}
     settings = {k: v for k, v in vars(args).items() if k not in run_control}
     args_path = save_dir / "args.json"
     if args_path.exists() and not args.overwrite:
@@ -681,8 +709,9 @@ def main():
 
             try:
                 mem, fp = {}, {}
+                diag = Diagnose() if args.diagnose else None
                 result = run_with_ortho(
-                    pipe, ortho, chunked, anchor, sample, args.use_masks, mem, args.strict_masks, attn_log, fp,
+                    pipe, ortho, chunked, anchor, sample, args.use_masks, mem, args.strict_masks, attn_log, fp, diag,
                     image=image,
                     prompt=sample['prompt'],
                     height=h,
@@ -717,6 +746,11 @@ def main():
                 logger.info(f"Saved result to {save_path}")
                 with open(save_dir / f"{sample_id}_fingerprint.json", "w") as f:
                     json.dump(fp, f)
+                if diag is not None:
+                    with open(save_dir / f"{sample_id}_diag.json", "w") as f:
+                        json.dump(diag.record, f)
+                    for line in diag.summary_lines():
+                        logger.info(f"[diag {sample_id}] {line}")
                 if attn_log is not None:
                     with open(save_dir / f"{sample_id}_attn_mass.json", "w") as f:
                         json.dump(attn_log.records, f)

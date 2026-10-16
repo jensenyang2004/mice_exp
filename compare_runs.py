@@ -110,6 +110,14 @@ def main():
                     break
             else:
                 print(f"  blocks: all {min(len(sa), len(sb))} block records within tol")
+        da, db = A / f"{sid}_diag.json", B / f"{sid}_diag.json"
+        if da.exists() and db.exists():  # --diagnose on both machines
+            ga, gb = json.load(open(da)), json.load(open(db))
+            for part in ("processor_state_at_start", "instance_tokens", "binding", "text_embed", "text_mass", "progress"):
+                d = first_diff(ga.get(part), gb.get(part), args.tol)
+                print(f"  diag {part:<24} " + ("same" if d is None else f"DIFFERENT at {d[0]}: {d[1]} vs {d[2]}"))
+                if d is not None and verdict is None and part in ("processor_state_at_start", "instance_tokens", "binding"):
+                    verdict = f"inputs differ: {part} (see the diag line above)"
         print("  -> " + (verdict or "inputs identical: any difference is numerical (rounding), amplified by the steps"))
 
 
