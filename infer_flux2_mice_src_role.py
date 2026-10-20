@@ -113,6 +113,9 @@ def parse_args():
                         help=">=0: don't steer a token away from neighbor j if it is within this many tokens of "
                              "j (1 = overlapping or touching tokens, which hold both instances). -1 = off")
     parser.add_argument("--ortho_steps", type=str, default="all", help="Denoising steps to act on, or \"all\"")
+    parser.add_argument("--ortho_ref", type=str, default="state", choices=["state", "write"],
+                        help="Contact steering reference g_j: neighbour j's state after the block (state, default) "
+                             "or j's residual update in this block (write)")
 
     parser.add_argument("--ctx_alpha", type=float, default=0.0,
                         help="Context steering: alpha of the same split applied to the context (source-image) "
@@ -321,7 +324,8 @@ def auto_exp_name(args) -> str:
     """Folder name from the steering settings, e.g. a10_b0_p1_t4_sall_exclude_none (alpha/beta in %)."""
     parts = [f"a{args.ortho_alpha * 100:g}", f"b{args.ortho_beta * 100:g}", ("B" if args.ortho_schedule == "budget" else "") + f"p{args.ortho_power:g}",
              f"t{args.ortho_tau:g}" + (f"_lt{args.ortho_local_tau:g}" if args.ortho_local_tau > 0 else "")
-             + (f"_ring{args.ortho_skip_ring}" if args.ortho_skip_ring >= 0 else ""),
+             + (f"_ring{args.ortho_skip_ring}" if args.ortho_skip_ring >= 0 else "")
+             + ("_refW" if args.ortho_ref == "write" else ""),
              "sall" if args.ortho_steps is None else "s" + "-".join(map(str, args.ortho_steps))]
     if not args.exclude_double and not args.exclude_single:
         parts.append("exclude_none")
@@ -639,6 +643,7 @@ def main():
 
     ortho = BlockOrtho(alpha=args.ortho_alpha, beta=args.ortho_beta, power=args.ortho_power, tau=args.ortho_tau,
                        local_tau=args.ortho_local_tau, skip_ring=args.ortho_skip_ring, schedule=args.ortho_schedule, steps=args.ortho_steps,
+                       ref=args.ortho_ref,
                        exclude_double=resolve(args.exclude_double, n_double),
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),

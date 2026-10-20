@@ -12,6 +12,8 @@ tokens and centered over the frame:
     par_t    = sum_j w_kj(t) * (d_t . g_j) g_j                           neighbor-like part of the write
     rest_t   = d_t - par_t
     D_t'     = D_t - a * par_t + b * min(1, sum_j w_kj(t)) * rest_t
+ref "write" takes g_j from the writes instead, g_j = normalize(mean_{tokens of j} d_t): "what j is changing in
+this block" rather than "what j is now". Stats log ref_cos = cos(state direction, write direction) per instance.
 The pair weight w_kj(t) is per token. By default it is the same for every token of k:
 exp(-gap(k, j) / tau), gap = min token distance between the masks - 1. With local_tau > 0 it
 follows the token's own distance to j, so each part of k is only steered from the neighbor it
@@ -103,6 +105,7 @@ class BlockOrtho:
     tau: float = 4.0
     local_tau: float = 0.0  # >0: per-token pair weights from the token's distance to each neighbor
     skip_ring: int = -1  # >=0: no steering from j on tokens within this distance of j
+    ref: str = "state"  # neighbour direction g_j from j's state after the block ("state") or from j's write ("write")
     schedule: str = "sigma"  # "sigma" or "budget" (see module docstring)
     steps: list | None = None  # denoising step indices to act on; None = all
     exclude_double: list = field(default_factory=list)  # double-stream block indices left untouched
@@ -227,6 +230,8 @@ class BlockOrtho:
         c = ho - ho.mean(dim=1, keepdim=True)
         cnt = mask_w.sum(dim=1).clamp_min(1.0)[None, :, None]  # [1, K, 1]
         g = F.normalize(torch.einsum('kn,bnd->bkd', mask_w, c) / cnt, dim=-1)  # [B, K, D]
+        g_w = F.normalize(torch.einsum('kn,bnd->bkd', mask_w, d) / cnt, dim=-1)  # same from the writes
+        g_ref = g_w if self.ref == "write" else g  # neighbour directions for the split (cohesion keeps g)
 
         delta = torch.zeros_like(d)
         cover = torch.zeros(self.HW, device=d.device)
@@ -238,8 +243,8 @@ class BlockOrtho:
                 continue
             idx = masks[k]
             dk = d[:, idx]  # [B, Nk, D]
-            proj = torch.einsum('bnd,bjd->bnj', dk, g)  # [B, Nk, K]
-            par = torch.einsum('bnj,bjd->bnd', proj * w[None], g)
+            proj = torch.einsum('bnd,bjd->bnj', dk, g_ref)  # [B, Nk, K]
+            par = torch.einsum('bnj,bjd->bnd', proj * w[None], g_ref)
             rest = dk - par
             delta[:, idx] += -a * par + b * w.sum(dim=1, keepdim=True).clamp(max=1.0)[None] * rest
             cover[idx] += 1.0
@@ -247,7 +252,8 @@ class BlockOrtho:
         delta = delta / cover.clamp_min(1.0)[None, :, None]
 
         stat = dict(step=self.step_idx, layer=layer, stream=stream, sigma=self.sigma, a=a, b=b,
-                    par_frac=par_frac,
+                    par_frac=par_frac, ref=self.ref,
+                    ref_cos=[float((g[0, k] * g_w[0, k]).sum()) for k in range(K)],  # cos(state dir, write dir)
                     write_rel=float(D[0].norm(dim=-1).mean() / hi[0].norm(dim=-1).mean().clamp_min(1e-12)))
         if src is not None:
             inst = masks.any(dim=0)
