@@ -113,6 +113,9 @@ def parse_args():
                         help=">=0: don't steer a token away from neighbor j if it is within this many tokens of "
                              "j (1 = overlapping or touching tokens, which hold both instances). -1 = off")
     parser.add_argument("--ortho_steps", type=str, default="all", help="Denoising steps to act on, or \"all\"")
+    parser.add_argument("--ortho_norm_preserve", action="store_true",
+                        help="Contact steering: rescale each steered token's write to its original length, so "
+                             "alpha/beta only rotate it (like --src_norm_preserve)")
     parser.add_argument("--ortho_ref", type=str, default="state", choices=["state", "write"],
                         help="Contact steering reference g_j: neighbour j's state after the block (state, default) "
                              "or j's residual update in this block (write)")
@@ -157,6 +160,9 @@ def parse_args():
                         help="Source direction: per token (removes identity AND pose/layout copying) or one per "
                              "instance, the mean of its context write (removes what the old object is, keeps "
                              "where its parts are)")
+    parser.add_argument("--sem_norm_preserve", action="store_true",
+                        help="Semantic term: rescale each instance token's write to its original length, so gamma/"
+                             "lambda rotate it toward u instead of lengthening it (like --src_norm_preserve)")
     parser.add_argument("--sem_lambda", type=float, default=0.0,
                         help="Instruction term, single blocks only (flux2/block_ortho.py): push each instance "
                              "token's write toward u = (block's write to the target word) - (its write to the "
@@ -325,7 +331,7 @@ def auto_exp_name(args) -> str:
     parts = [f"a{args.ortho_alpha * 100:g}", f"b{args.ortho_beta * 100:g}", ("B" if args.ortho_schedule == "budget" else "") + f"p{args.ortho_power:g}",
              f"t{args.ortho_tau:g}" + (f"_lt{args.ortho_local_tau:g}" if args.ortho_local_tau > 0 else "")
              + (f"_ring{args.ortho_skip_ring}" if args.ortho_skip_ring >= 0 else "")
-             + ("_refW" if args.ortho_ref == "write" else ""),
+             + ("_refW" if args.ortho_ref == "write" else "") + ("_onp" if args.ortho_norm_preserve else ""),
              "sall" if args.ortho_steps is None else "s" + "-".join(map(str, args.ortho_steps))]
     if not args.exclude_double and not args.exclude_single:
         parts.append("exclude_none")
@@ -365,7 +371,8 @@ def auto_exp_name(args) -> str:
     if args.sem_lambda > 0 or args.sem_gamma > 0:
         parts.append(f"sem{args.sem_lambda * 100:g}" + (f"_sg{args.sem_gamma * 100:g}" if args.sem_gamma else "")
                      + ("" if args.sem_steps is None else "_ss" + "-".join(map(str, args.sem_steps)))
-                     + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else ""))
+                     + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else "")
+                     + ("_np" if args.sem_norm_preserve else ""))
     if args.cohere > 0:
         parts.append(f"coh{args.cohere * 100:g}" + (f"_ct{args.cohere_tau:g}" if args.cohere_tau > 0 else "")
                      + ("_cx" if args.cohere_ctx else "")
@@ -643,7 +650,8 @@ def main():
 
     ortho = BlockOrtho(alpha=args.ortho_alpha, beta=args.ortho_beta, power=args.ortho_power, tau=args.ortho_tau,
                        local_tau=args.ortho_local_tau, skip_ring=args.ortho_skip_ring, schedule=args.ortho_schedule, steps=args.ortho_steps,
-                       ref=args.ortho_ref,
+                       ref=args.ortho_ref, norm_preserve=args.ortho_norm_preserve,
+                       sem_norm_preserve=args.sem_norm_preserve,
                        exclude_double=resolve(args.exclude_double, n_double),
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),

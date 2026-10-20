@@ -12,6 +12,8 @@ tokens and centered over the frame:
     par_t    = sum_j w_kj(t) * (d_t . g_j) g_j                           neighbor-like part of the write
     rest_t   = d_t - par_t
     D_t'     = D_t - a * par_t + b * min(1, sum_j w_kj(t)) * rest_t
+norm_preserve: each steered token's write is rescaled to its original length after the contact edit, so alpha /
+beta only turn it (no energy added), as src_norm_preserve does for the source term.
 ref "write" takes g_j from the writes instead, g_j = normalize(mean_{tokens of j} d_t): "what j is changing in
 this block" rather than "what j is now". Stats log ref_cos = cos(state direction, write direction) per instance.
 The pair weight w_kj(t) is per token. By default it is the same for every token of k:
@@ -78,6 +80,8 @@ with the same modulation, and are never decoded. Two optional uses:
     latent tokens, with p_t = d_t . u_k:
         D_t' += -sem_gamma * min(p_t, 0) u_k + sem_lambda * |d_t| u_k
     (remove the source-word side, push toward the target word relative to the token's own write).
+    sem_norm_preserve: the result is rescaled to |d_t|, so the term rotates the write toward u_k instead of
+    lengthening it.
     Steps: sem_steps (None = all); blocks: single blocks minus sem_exclude. Stats (logged whenever the
     word positions are known, also with both strengths 0): sem_cos_inst / sem_cos_bg = mean cos(d_t, u_k)
     on k's tokens / on the background, and sem_contrast = |D_tgt - D_src| / |D_tgt|.
@@ -105,6 +109,7 @@ class BlockOrtho:
     tau: float = 4.0
     local_tau: float = 0.0  # >0: per-token pair weights from the token's distance to each neighbor
     skip_ring: int = -1  # >=0: no steering from j on tokens within this distance of j
+    norm_preserve: bool = False  # contact: rescale each steered token's write back to its length (rotate only)
     ref: str = "state"  # neighbour direction g_j from j's state after the block ("state") or from j's write ("write")
     schedule: str = "sigma"  # "sigma" or "budget" (see module docstring)
     steps: list | None = None  # denoising step indices to act on; None = all
@@ -130,6 +135,7 @@ class BlockOrtho:
     sem_gamma: float = 0.0  # instruction term: remove the source-word side
     sem_steps: list | None = None  # steps for the instruction term; None = all
     sem_exclude: set = field(default_factory=set)  # single block names without the instruction term
+    sem_norm_preserve: bool = False  # semantic: rescale each instance token's write back to its length
     sem_tokens: list | None = None  # per instance (src positions, tgt positions) in the text sequence, or None
     stats: list = field(default_factory=list)
 
@@ -250,6 +256,12 @@ class BlockOrtho:
             cover[idx] += 1.0
             par_frac.append(float(par[0].norm(dim=-1).mean() / dk[0].norm(dim=-1).mean().clamp_min(1e-12)))
         delta = delta / cover.clamp_min(1.0)[None, :, None]
+        if self.norm_preserve:  # contact edit only rotates the write: same length as before
+            on = cover > 0
+            old = d[:, on]
+            new = old + delta[:, on]
+            new = new * (old.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+            delta[:, on] = new - old
 
         stat = dict(step=self.step_idx, layer=layer, stream=stream, sigma=self.sigma, a=a, b=b,
                     par_frac=par_frac, ref=self.ref,
@@ -311,7 +323,12 @@ class BlockOrtho:
                 if gs != 0.0 or ls != 0.0:
                     dk = dn[:, idx]
                     p = (dk * uk).sum(-1, keepdim=True)
-                    delta[:, idx] += (-gs * p.clamp(max=0.0) + ls * dk.norm(dim=-1, keepdim=True)) * uk
+                    sem_d = (-gs * p.clamp(max=0.0) + ls * dk.norm(dim=-1, keepdim=True)) * uk
+                    if self.sem_norm_preserve:  # rotate toward u_k instead of adding along it
+                        new = dk + sem_d
+                        new = new * (dk.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+                        sem_d = new - dk
+                    delta[:, idx] += sem_d
             stat.update(sem_cos_inst=cos_in, sem_cos_bg=cos_bg, sem_gamma=gs, sem_lambda=ls,
                         sem_contrast=self._sem_contrast)
         if stream == "lat":
