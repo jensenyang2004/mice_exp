@@ -88,6 +88,11 @@ with the same modulation, and are never decoded. Two optional uses:
     src_ctrl (flux2/block_role.py): when set, it gives gamma and beta per block and per instance (as
     per-token [HW] tensors) in place of src_gamma / src_beta; the step factor still applies.
     Steps: src_steps (default = steps); blocks: hooked blocks minus src_exclude.
+compose (latent stream): "current" = contact and source are each computed from d_t and each rescaled to |d_t|
+(per their norm_preserve flags), their increments summed, then the semantic term is computed on that sum.
+"joint" = all three increments are computed from the same d_t, summed, and the result is rescaled once:
+    D_t' = |d_t| normalize(d_t + Δ_ctc + Δ_src + Δ_sem) + mean_frame(D)
+(the individual norm_preserve flags are ignored; joint always preserves the length of instance tokens).
     Stats log the cosine between the latent and context writes (and context state) on background
     vs instance tokens whenever the hook is active, to check where the two are comparable.
 
@@ -136,6 +141,7 @@ class BlockOrtho:
     sem_steps: list | None = None  # steps for the instruction term; None = all
     sem_exclude: set = field(default_factory=set)  # single block names without the instruction term
     sem_norm_preserve: bool = False  # semantic: rescale each instance token's write back to its length
+    compose: str = "current"  # "current" (sequential, per-term rescale) or "joint" (sum all, rescale once)
     sem_tokens: list | None = None  # per instance (src positions, tgt positions) in the text sequence, or None
     stats: list = field(default_factory=list)
 
@@ -228,6 +234,7 @@ class BlockOrtho:
         src_on = stream == "lat" and self._in(self._src_steps()) and layer not in self.src_exclude
         gamma = self.src_gamma * self.factor if src_on else 0.0
         src_b = self.src_beta * self.factor if src_on else 0.0
+        joint = self.compose == "joint" and stream == "lat"
         masks, mask_w, pair_w = self._tensors(h_out.device)
         K = masks.shape[0]
         hi, ho = h_in.float(), h_out.float()
@@ -256,7 +263,7 @@ class BlockOrtho:
             cover[idx] += 1.0
             par_frac.append(float(par[0].norm(dim=-1).mean() / dk[0].norm(dim=-1).mean().clamp_min(1e-12)))
         delta = delta / cover.clamp_min(1.0)[None, :, None]
-        if self.norm_preserve:  # contact edit only rotates the write: same length as before
+        if self.norm_preserve and not joint:  # contact edit only rotates the write: same length as before
             on = cover > 0
             old = d[:, on]
             new = old + delta[:, on]
@@ -299,7 +306,7 @@ class BlockOrtho:
                     d_src = -g_t * par_s + b_t * (d[:, inst] - par_s)
                 else:
                     d_src = -gamma * par_s + src_b * (d[:, inst] - par_s)
-                if self.src_norm_preserve:
+                if self.src_norm_preserve and not joint:
                     old = d[:, inst]
                     new = old + d_src
                     new = new * (old.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
@@ -308,7 +315,7 @@ class BlockOrtho:
         if stream == "lat" and sem is not None:  # instruction term, sem: [B, K, D] (zero rows = no words)
             on = self._in(self.sem_steps) and layer not in self.sem_exclude
             gs, ls = (self.sem_gamma * self.factor, self.sem_lambda * self.factor) if on else (0.0, 0.0)
-            dn = d + delta
+            dn = d if joint else d + delta  # joint: same d_t as the other terms
             inst = masks.any(dim=0)
             cos_in, cos_bg = [], []
             for k in range(K):
@@ -324,13 +331,19 @@ class BlockOrtho:
                     dk = dn[:, idx]
                     p = (dk * uk).sum(-1, keepdim=True)
                     sem_d = (-gs * p.clamp(max=0.0) + ls * dk.norm(dim=-1, keepdim=True)) * uk
-                    if self.sem_norm_preserve:  # rotate toward u_k instead of adding along it
+                    if self.sem_norm_preserve and not joint:  # rotate toward u_k instead of adding along it
                         new = dk + sem_d
                         new = new * (dk.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
                         sem_d = new - dk
                     delta[:, idx] += sem_d
             stat.update(sem_cos_inst=cos_in, sem_cos_bg=cos_bg, sem_gamma=gs, sem_lambda=ls,
                         sem_contrast=self._sem_contrast)
+        if joint:  # one rescale of the summed edit: every term only rotates the write together
+            inst = masks.any(dim=0)
+            old = d[:, inst]
+            new = old + delta[:, inst]
+            new = new * (old.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+            delta[:, inst] = new - old
         if stream == "lat":
             split, p_cv = [], []
             coh = self.cohere * self.factor if self.cohere > 0 and self._in(self.cohere_steps) else 0.0

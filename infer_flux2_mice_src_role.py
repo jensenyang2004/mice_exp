@@ -160,6 +160,10 @@ def parse_args():
                         help="Source direction: per token (removes identity AND pose/layout copying) or one per "
                              "instance, the mean of its context write (removes what the old object is, keeps "
                              "where its parts are)")
+    parser.add_argument("--compose", type=str, default="current", choices=["current", "joint"],
+                        help="How the three terms combine on a latent instance token: current = contact and source "
+                             "each rescaled, summed, then semantic on the sum; joint = all computed from the same "
+                             "write, summed, rescaled once to its length (ignores the *_norm_preserve flags)")
     parser.add_argument("--sem_norm_preserve", action="store_true",
                         help="Semantic term: rescale each instance token's write to its original length, so gamma/"
                              "lambda rotate it toward u instead of lengthening it (like --src_norm_preserve)")
@@ -392,6 +396,8 @@ def auto_exp_name(args) -> str:
         parts.append(f"cov{args.mask_cover * 100:g}")
     if args.strict_masks:
         parts.append("strict")
+    if args.compose == "joint":
+        parts.append("joint")
     name = "_".join(parts)
     return f"{args.exp_name}_{name}" if args.exp_name else name
 
@@ -651,7 +657,7 @@ def main():
     ortho = BlockOrtho(alpha=args.ortho_alpha, beta=args.ortho_beta, power=args.ortho_power, tau=args.ortho_tau,
                        local_tau=args.ortho_local_tau, skip_ring=args.ortho_skip_ring, schedule=args.ortho_schedule, steps=args.ortho_steps,
                        ref=args.ortho_ref, norm_preserve=args.ortho_norm_preserve,
-                       sem_norm_preserve=args.sem_norm_preserve,
+                       sem_norm_preserve=args.sem_norm_preserve, compose=args.compose,
                        exclude_double=resolve(args.exclude_double, n_double),
                        exclude_single=resolve(args.exclude_single, n_single),
                        alpha_exclude=names("alpha"), beta_exclude=names("beta"),

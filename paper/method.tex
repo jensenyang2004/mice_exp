@@ -1,0 +1,264 @@
+% =============================================================================================
+% Method section, first draft. Lines starting with "% TODO" are open decisions or checks.
+% Placeholder figures: \fbox boxes; the existing schematics live in ../figures/.
+% =============================================================================================
+
+\section{Method}
+\label{sec:method}
+
+Given a source image, $K$ instance masks $\{M_k\}_{k=1}^{K}$ and one local instruction per instance,
+``replace the $s_k$ with $t_k$'', multi-instance editing must satisfy three requirements at once.
+\emph{Binding}: every instruction acts on its own instance and nowhere else.
+\emph{Disentanglement}: within a bound region, two failures remain. In \emph{source dominance
+leakage}~\cite{bindedit}, the original object survives and the edit is weak or partial; in
+\emph{inter-instance leakage}~\cite{bindedit,layeredit}, adjacent edits blend into each other.
+\emph{Harmonization}: the edited objects must agree with the scene and with each other in lighting,
+focus, perspective and contact.
+
+Prior work enforces disentanglement by masking the attention between image tokens~\cite{mice,breakingpoint}.
+This removes leakage, but it also removes the interactions through which the model makes objects
+consistent with their surroundings, and the result looks pasted in. We take the opposite approach: the
+joint attention of the model is left untouched, and disentanglement is obtained by steering what each
+transformer block \emph{writes} into its residual stream. Every intervention is a rotation of that write,
+so it changes its direction but never adds energy to the stream (Fig.~\ref{fig:overview}).
+
+\paragraph{Binding.}
+We adopt the standard regional text binding of~\cite{mice,regionalprompting}. Each local instruction is
+encoded as a separate prompt segment, and the attention mask restricts every segment and the tokens of
+its instance to attend to each other; image-to-image attention is fully open. Binding is not a
+contribution of this work. It is the starting point of all our experiments (``binding only'' in
+Tab.~\ref{tab:ablation}), and everything below is added on top of it.
+
+\begin{figure*}[t]
+  \centering
+  \fbox{\parbox[c][5cm][c]{0.95\linewidth}{\centering
+    PLACEHOLDER: method overview.\\
+    Left: source image, instance masks, local instructions; regional binding (prompt segment
+    $\leftrightarrow$ instance tokens).
+    Middle: MMDiT stack with text, latent and context token streams; at every block a hook reads the
+    block's residual update and rotates it on the instance tokens.
+    Right: the three references used for the rotation: the context update at the same position
+    (source decoupling), the neighbouring instance (contact-local disentanglement), and the
+    target/source word updates (instruction rotation).}}
+  \caption{\textbf{Overview.} Instructions are bound to their instances by regional text binding; the
+  joint attention is otherwise left untouched. Inside every block, the residual update of each instance
+  token is rotated away from what it should not write (the source object, the neighbouring instance)
+  and toward the instruction, with its length preserved.}
+  \label{fig:overview}
+\end{figure*}
+
+% ---------------------------------------------------------------------------------------------
+\subsection{Residual Update Rotation}
+\label{sec:rotation}
+
+\paragraph{Preliminaries.}
+We build on an MMDiT editing model that processes one joint token sequence
+$[\mathcal{T}; \mathcal{X}; \mathcal{C}]$: text tokens $\mathcal{T}$, latent tokens $\mathcal{X}$ of the
+image being generated, and context tokens $\mathcal{C}$ that encode the source image on the same spatial
+grid as $\mathcal{X}$ and are never decoded. For a latent token $t \in \mathcal{X}$ we write $\bar t \in
+\mathcal{C}$ for the context token at the same position, and $\Omega_k \subset \mathcal{X}$ for the latent
+tokens of instance $k$. The network consists of \emph{double-stream} blocks, in which text and image tokens
+have separate weights but attend jointly, followed by \emph{single-stream} blocks, in which all tokens share
+weights. Sampling runs for $N$ steps with noise levels $\sigma_0 > \dots > \sigma_{N-1}$.
+
+\paragraph{Residual updates.}
+Every block $l$ is a residual update of the hidden state of each token:
+\begin{equation}
+  \mathbf{h}^{l+1}_t = \mathbf{h}^{l}_t + \mathbf{D}^{l}_t ,
+  \label{eq:residual}
+\end{equation}
+where $\mathbf{D}^{l}_t$ collects the gated attention and MLP outputs of the block. The state
+$\mathbf{h}^{l}_t$ accumulates everything earlier blocks have written; the update $\mathbf{D}^{l}_t$ is what
+block $l$ contributes now. We never modify the state. We replace the update of instance tokens by a steered
+update $\mathbf{D}'^{\,l}_t$, so the next block receives $\mathbf{h}^{l}_t + \mathbf{D}'^{\,l}_t$ and computes
+its own update from the steered stream; the effect therefore propagates through the remaining blocks and,
+via the predicted velocity, to later sampling steps. Text and context tokens, and latent tokens outside all
+instances, are never modified. Since a block's update contains a component shared by all tokens of the frame,
+we work with the centred update
+\begin{equation}
+  \mathbf{d}_t = \mathbf{D}_t - \bar{\mathbf{D}},
+  \qquad
+  \bar{\mathbf{D}} = \frac{1}{|\mathcal{X}|}\sum_{s \in \mathcal{X}} \mathbf{D}_s ,
+\end{equation}
+and analogously over $\mathcal{C}$ for context tokens; the shared component $\bar{\mathbf{D}}$ is left
+unchanged. We write $\mathrm{n}(\mathbf{v}) = \mathbf{v}/\lVert\mathbf{v}\rVert$ and drop the block index $l$
+from now on.
+
+\paragraph{Rotation against a reference.}
+All steering terms share one operation. Given a unit \emph{reference} direction $\mathbf{r}$ and the
+coefficient $p = \mathbf{d}_t^{\top}\mathbf{r}$, the update splits into a reference part
+$\phi(p)\,\mathbf{r}$ and a remainder,
+\begin{equation}
+  \mathbf{d}_t = \phi(p)\,\mathbf{r} + \big(\mathbf{d}_t - \phi(p)\,\mathbf{r}\big),
+  \label{eq:split}
+\end{equation}
+where $\phi(p) = p$ for a two-sided split, and $\phi(p) = \max(p,0)$ or $\min(p,0)$ when only one side of the
+reference is to be acted on. A steering term proposes an edit $\Delta_t$ that removes part of the reference
+component, amplifies the remainder, or adds a component along $\mathbf{r}$. The edited update is then rescaled
+to its original length:
+\begin{equation}
+  \mathbf{d}'_t = \lVert \mathbf{d}_t \rVert \; \mathrm{n}\big(\mathbf{d}_t + \Delta_t\big) .
+  \label{eq:rotation}
+\end{equation}
+Because $\Delta_t$ lies in $\mathrm{span}(\mathbf{d}_t, \mathbf{r})$, Eq.~\eqref{eq:rotation} is a rotation
+of $\mathbf{d}_t$ within that plane (within the span of $\mathbf{d}_t$ and all references when several are
+used): the block writes as much as it would have, only in a different direction.
+This is what distinguishes our steering from adding a vector: its size follows the block's own activity,
+it vanishes where the block writes nothing, and it injects no energy into the stream. The references are not
+fixed vectors: each is read from the same forward pass, per token and per block
+(Secs.~\ref{sec:source}--\ref{sec:semantic}). All strengths below are multiplied by $\sigma_i$, so the
+steering fades as the sample converges.
+% TODO decide whether the sigma factor is stated here or in Sec. 3.5.
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox[c][4cm][c]{0.95\linewidth}{\centering
+    PLACEHOLDER: one token through the blocks.\\
+    (source: ../figures/residual_token.png; panels a and b only, or redraw for one column)}}
+  \caption{\textbf{Steering the residual update.} The state of a token (grey) is the sum of all block
+  updates (orange). We replace the update of one block by a rotated version of it; later blocks read the
+  steered state and write as usual. The state itself is never overwritten.}
+  \label{fig:residual}
+\end{figure}
+
+% ---------------------------------------------------------------------------------------------
+\subsection{Source Decoupling}  % TODO name
+\label{sec:source}
+
+Source dominance arises because the context tokens supply the original object at exactly the positions to
+be edited. Since context tokens pass through the same blocks with the same weights and modulation as the
+latent tokens, the update of the context token $\bar t$ is precisely what the block writes when it reproduces
+the source at that position. We take it as the reference,
+$\hat{\mathbf{s}}_t = \mathrm{n}(\mathbf{d}_{\bar t})$.
+For every instance token $t \in \bigcup_k \Omega_k$, the copying part of its update is the positive component
+along $\hat{\mathbf{s}}_t$, and the remainder is the edit:
+\begin{align}
+  \mathbf{c}_t &= \max(\mathbf{d}_t^{\top}\hat{\mathbf{s}}_t,\,0)\,\hat{\mathbf{s}}_t , \\
+  \Delta^{\mathrm{src}}_t &= \beta_s\,(\mathbf{d}_t - \mathbf{c}_t) .
+\end{align}
+After the rotation of Eq.~\eqref{eq:rotation}, the update turns away from copying while its length is
+unchanged. The copying part itself is kept, so pose, layout and lighting of the original remain available to
+the edit; only the departure from the source is strengthened.
+
+The choice of the \emph{update} rather than the context \emph{state} as reference is supported by a direct
+measurement. On background tokens, which should reproduce the source, latent updates align with the context
+updates far more than with the context states (mean cosine $0.37$--$0.53$ vs.\ $0.22$--$0.28$ in the
+single-stream blocks; Fig.~\ref{fig:diagnostics}). Copying the source is visible in what the blocks write,
+not in what has accumulated.
+% TODO recompute these numbers on the final setting (they come from an earlier LoMOE run).
+% TODO related: SpotEdit~\cite{spotedit} (arXiv 2512.22323, CVPR 2026) finds that hidden states of non-edited
+% tokens and condition-image tokens converge to the same latent subspace during denoising (they use it to
+% cache/reuse condition features). Consistent with us: if states converge, a state reference mostly carries the
+% shared source content (true for every token that copies, and for every neighbour), so it cannot tell copying
+% from editing; the per-block update still can. Cite here as support for update-vs-state, and in the
+% residual-anchor study (state vs update references, per term).
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox[c][4cm][c]{0.95\linewidth}{\centering
+    PLACEHOLDER: diagnostics from the residual stream, per step and block type.\\
+    (a) cosine of latent update vs.\ context update and vs.\ context state, background and instance tokens;\\
+    (b) share of instance updates along the neighbour direction near contacts, with and without steering.}}
+  \caption{\textbf{Leakage is visible in the residual updates.} (a) Updates of tokens that copy the source
+  align with the context \emph{updates}, much less with the context \emph{states}. (b) Near contact regions,
+  a large share of an instance's update points along its neighbour.}
+  \label{fig:diagnostics}
+\end{figure}
+
+% ---------------------------------------------------------------------------------------------
+\subsection{Contact-Local Disentanglement}  % TODO name
+\label{sec:contact}
+
+Inter-instance leakage occurs where instances are close: tokens of one object attend strongly to an adjacent
+object and adopt its appearance. For each neighbour $j$ of instance $k$, the reference is the mean centred
+update of its tokens,
+$\mathbf{g}_j = \mathrm{n}\big(\frac{1}{|\Omega_j|}\sum_{s\in\Omega_j}\mathbf{d}_s\big)$,
+\ie what the block is currently writing into $j$. Each token $t \in \Omega_k$ is weighted toward each
+neighbour by its own distance $\delta_j(t)$, in tokens, to the nearest token of $\Omega_j$:
+\begin{equation}
+  w_{kj}(t) = \exp\!\Big(-\frac{\max(\delta_j(t) - 1,\,0)}{\tau}\Big) .
+  \label{eq:contact_weights}
+\end{equation}
+The part of the update that follows the neighbours, and the total contact weight of the token, are
+\begin{align}
+  \mathbf{q}_t &= \sum_{j \neq k} w_{kj}(t)\,(\mathbf{d}_t^{\top}\mathbf{g}_j)\,\mathbf{g}_j , \\
+  \rho_t &= \min\!\Big(1,\, \sum_{j \neq k} w_{kj}(t)\Big) .
+\end{align}
+The edit removes the neighbour-aligned part and amplifies the instance's own remainder,
+\begin{equation}
+  \Delta^{\mathrm{ctc}}_t = -\alpha\,\mathbf{q}_t + \beta\,\rho_t\,(\mathbf{d}_t - \mathbf{q}_t) .
+\end{equation}
+The split is two-sided: writing against the neighbour entangles the two instances as much as writing toward
+it. The weights are \emph{local}: they depend on each token's own distance to each neighbour, so only the parts
+of an object that actually touch another one are steered, and from that neighbour only
+(Fig.~\ref{fig:contact}). The interior of an object and parts far from any neighbour are left to the model,
+which is where its interactions with the scene, and thus harmonization, are preserved.
+% TODO schedule: the final setting applies this term at steps 0-1 only. Pending the all-step run;
+% if it holds, delete this note; otherwise justify the step restriction here.
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox[c][4.5cm][c]{0.95\linewidth}{\centering
+    PLACEHOLDER: contact-local steering.\\
+    (sources: ../figures/ortho_decomposition.png for the split, ../figures/local_tau_steering.png for
+    global vs.\ local pair weights; combine into one column-width figure)}}
+  \caption{\textbf{Contact-local disentanglement.} Left: the update of a token of instance $A$ is split along
+  the neighbour direction $\mathbf{g}_B$; the neighbour-aligned part is removed and the remainder amplified.
+  Right: with local pair weights, each token is steered only from the neighbour it is close to.}
+  \label{fig:contact}
+\end{figure}
+
+% ---------------------------------------------------------------------------------------------
+\subsection{Instruction Rotation}  % TODO name
+\label{sec:semantic}
+
+The two terms above tell each instance what \emph{not} to write. The instruction itself also provides a
+direction. In the single-stream blocks, text and image tokens share the weights and the residual stream, so
+the update a block writes into a word token lies in the same space as the updates of image tokens. Let
+$W^{s}_k$ and $W^{t}_k$ be the token positions of the source word $s_k$ and the target word $t_k$ in the local
+instruction of instance $k$, and $\bar{\mathbf{D}}^{s}_k$, $\bar{\mathbf{D}}^{t}_k$ the mean updates of those
+tokens. We define
+\begin{equation}
+  \mathbf{u}_k = \mathrm{n}\big(\bar{\mathbf{D}}^{t}_k - \bar{\mathbf{D}}^{s}_k\big),
+\end{equation}
+how this block treats the target word differently from the source word. Everything the two words share,
+being part of the same instruction and reading the same image tokens, cancels in the difference. The edit
+removes the part of an instance update that leans toward the source word and pushes toward the target word
+relative to the update's own size. For $t \in \Omega_k$,
+\begin{equation}
+  \Delta^{\mathrm{sem}}_t = \big(\lambda\,\lVert\mathbf{d}_t\rVert
+     - \gamma\,\min(\mathbf{d}_t^{\top}\mathbf{u}_k,\,0)\big)\,\mathbf{u}_k ,
+\end{equation}
+applied in the single-stream blocks only. As for the other terms, $\mathbf{u}_k$ is recomputed in every block
+and step, and the result is rescaled by Eq.~\eqref{eq:rotation}: rather than adding a fixed guidance vector,
+the update is turned toward the instruction. In contrast to classifier-free guidance, which extrapolates
+between two forward passes uniformly over all tokens, the direction here is obtained within a single pass,
+per block and per instance.
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox[c][4cm][c]{0.95\linewidth}{\centering
+    PLACEHOLDER: instruction rotation.\\
+    (source: ../figures/semantic_steering.png; left: $\mathbf{u}_k$ from the word updates, right: the
+    rotation of an instance update)}}
+  \caption{\textbf{Instruction rotation.} In a single-stream block, the updates written into the target and
+  source words define $\mathbf{u}_k$; instance updates are rotated toward it.}
+  \label{fig:semantic}
+\end{figure}
+
+% ---------------------------------------------------------------------------------------------
+\subsection{Composition}
+\label{sec:composition}
+
+A token of instance $k$ may receive all three edits in the same block. Each is computed from the same update
+$\mathbf{d}_t$; at sampling step $i$ they are summed and applied as a single rotation,
+\begin{align}
+  \Delta_t &= \sigma_i\big(\Delta^{\mathrm{src}}_t + \Delta^{\mathrm{ctc}}_t + \Delta^{\mathrm{sem}}_t\big), \\
+  \mathbf{D}'_t &= \lVert \mathbf{d}_t \rVert\;\mathrm{n}\big(\mathbf{d}_t + \Delta_t\big) + \bar{\mathbf{D}} ,
+\end{align}
+so the result does not depend on an order of the terms and the length of the update is preserved exactly.
+% TODO the code currently differs: contact and source are each rescaled to |d_t| and their increments summed,
+% then the semantic term is computed from that sum and rescaled to its length. Switch the code to this joint
+% form and rerun the final setting, or rewrite this paragraph to match the code.
+% TODO schedule (on hold): if the all-step contact run holds, add "All terms act in every block and every
+% sampling step." Otherwise add the step restriction of the contact term here.

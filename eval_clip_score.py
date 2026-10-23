@@ -24,7 +24,7 @@ METHODS = {
     "MICE": ("image/mice", "{id}_result.png"),
     "MICE_free_latent": ("image/mice_free_latent", "{id}_result.png"),
     # "Context Steering 1": ("image/10_15_1", "{id}_result.png"),
-    "ICRS_mice_bench": ("image/ICRS_mice_bench", "{id}_result.png"),
+    "ICRS_preview": ("image/ICRS_new_preview", "{id}_result.png"),
     # "Query_blur_infinit": ("image/k2k_prime_strict_sigmainf", "{id}_query_blur_sigmainf.png"),
     # "MICE_free_LL": ("image/mice_free_LL", "{id}_result.png"),
     # "MICE_free_LC": ("image/mice_free_LC", "{id}_result.png"),
