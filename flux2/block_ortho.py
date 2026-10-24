@@ -88,7 +88,10 @@ with the same modulation, and are never decoded. Two optional uses:
     instruction-independent edit direction (edited instances' (L_k - bg) - (C_k - context bg) over other
     images, massive channels zeroed, sem_axes); "random" = a fixed random unit vector per instance;
     "self" = the instance's own mean write (rotating toward it only shrinks how its tokens differ from each
-    other, no new direction); "bg" = the background's mean write. sem_axes (make_sem_axes.py) holds
+    other, no new direction); "bg" = the background's mean write; "none" = no direction: each instance token's
+    write is scaled by 1/sqrt(1 + lambda^2), the share of its own direction a norm-preserving rotation by lambda
+    toward an orthogonal direction keeps (release without filler; not with compose "joint", whose rescale
+    would undo it). sem_axes (make_sem_axes.py) holds
     [steps, blocks, D] directions per sample built without that sample ("all" for any other sample).
     Steps: sem_steps (None = all); blocks: single blocks minus sem_exclude. Stats (logged whenever the
     word positions are known, also with both strengths 0): sem_cos_inst / sem_cos_bg = mean cos(d_t, u_k)
@@ -149,7 +152,7 @@ class BlockOrtho:
     sem_steps: list | None = None  # steps for the instruction term; None = all
     sem_exclude: set = field(default_factory=set)  # single block names without the instruction term
     sem_norm_preserve: bool = False  # semantic: rescale each instance token's write back to its length
-    sem_dir: str = "u"  # direction of the instruction term: u, generic, specific, axis, random, self, bg
+    sem_dir: str = "u"  # direction of the instruction term: u, generic, specific, axis, random, self, bg, none
     sem_axes: dict | None = None  # precomputed shared directions for generic / specific / axis (make_sem_axes.py)
     sem_sample: str | None = None  # current sample id: picks its leave-one-out directions in sem_axes
     sem_seed: int = 0  # sem_dir "random"
@@ -344,7 +347,9 @@ class BlockOrtho:
                     dk = dn[:, idx]
                     p = (dk * uk).sum(-1, keepdim=True)
                     sem_d = (-gs * p.clamp(max=0.0) + ls * dk.norm(dim=-1, keepdim=True)) * uk
-                    if self.sem_norm_preserve and not joint:  # rotate toward u_k instead of adding along it
+                    if self.sem_dir == "none":  # release only: lose what the rotation would, add nothing
+                        sem_d = dk * (1.0 / (1.0 + ls ** 2) ** 0.5 - 1.0)
+                    elif self.sem_norm_preserve and not joint:  # rotate toward u_k instead of adding along it
                         new = dk + sem_d
                         new = new * (dk.norm(dim=-1, keepdim=True) / new.norm(dim=-1, keepdim=True).clamp_min(1e-12))
                         sem_d = new - dk
@@ -453,7 +458,7 @@ class BlockOrtho:
     def _sem_dir(self, uk, k: int, dn, idx, inst, layer: str):
         """The unit direction [B, 1, D] the instruction term pushes instance k toward (see sem_dir)."""
         mode = self.sem_dir
-        if mode == "u":
+        if mode in ("u", "none"):
             return uk
         if mode == "self":
             return F.normalize(dn[:, idx].mean(dim=1, keepdim=True), dim=-1)

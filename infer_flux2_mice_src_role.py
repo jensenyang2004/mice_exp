@@ -177,12 +177,14 @@ def parse_args():
                              "source-word side (negative projection on u)")
     parser.add_argument("--sem_steps", type=str, default="all", help="Steps for the instruction term, or \"all\"")
     parser.add_argument("--sem_dir", type=str, default="u",
-                        choices=["u", "generic", "specific", "axis", "random", "self", "bg"],
+                        choices=["u", "generic", "specific", "axis", "random", "self", "bg", "none"],
                         help="Direction of the instruction term (flux2/block_ortho.py): u = u_k; generic = the "
                              "part of u_k shared by every instruction; specific = u_k without it; axis = the "
                              "latent's instruction-independent edit direction; random = fixed random per "
                              "instance; self = the instance's own mean write (only evens out its tokens); bg = "
-                             "the background's mean write. generic / specific / axis need --sem_axes")
+                             "the background's mean write; none = no direction, only shrink each instance token's write "
+                             "as much as the rotation would (release without filler). generic / specific / axis "
+                             "need --sem_axes")
     parser.add_argument("--sem_axes", type=str, default=None,
                         help="sem_axes.pt from make_sem_axes.py (leave-one-out per sample of the diagnosis)")
     parser.add_argument("--sem_seed", type=int, default=0, help="--sem_dir random: seed of the directions")
@@ -326,6 +328,8 @@ def parse_args():
         parser.error("--cpu_offload cannot be combined with --multi_gpu")
     if args.sem_dir in ("generic", "specific", "axis") and not args.sem_axes:
         parser.error(f"--sem_dir {args.sem_dir} needs --sem_axes (make_sem_axes.py)")
+    if args.sem_dir == "none" and args.compose == "joint":
+        parser.error("--sem_dir none cannot be combined with --compose joint (its rescale undoes the shrink)")
     return args
 
 
