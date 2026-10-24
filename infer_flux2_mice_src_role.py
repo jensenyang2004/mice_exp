@@ -176,6 +176,16 @@ def parse_args():
                         help="Instruction term: remove the part of each instance token's write pointing to the "
                              "source-word side (negative projection on u)")
     parser.add_argument("--sem_steps", type=str, default="all", help="Steps for the instruction term, or \"all\"")
+    parser.add_argument("--sem_dir", type=str, default="u",
+                        choices=["u", "generic", "specific", "axis", "random", "self", "bg"],
+                        help="Direction of the instruction term (flux2/block_ortho.py): u = u_k; generic = the "
+                             "part of u_k shared by every instruction; specific = u_k without it; axis = the "
+                             "latent's instruction-independent edit direction; random = fixed random per "
+                             "instance; self = the instance's own mean write (only evens out its tokens); bg = "
+                             "the background's mean write. generic / specific / axis need --sem_axes")
+    parser.add_argument("--sem_axes", type=str, default=None,
+                        help="sem_axes.pt from make_sem_axes.py (leave-one-out per sample of the diagnosis)")
+    parser.add_argument("--sem_seed", type=int, default=0, help="--sem_dir random: seed of the directions")
     parser.add_argument("--sem_exclude_single", type=str, default="",
                         help="Single blocks without the instruction term (same syntax as --exclude_single)")
     parser.add_argument("--cohere", type=float, default=0.0,
@@ -314,6 +324,8 @@ def parse_args():
         parser.error("--mask_cover needs --use_masks (bboxes are already rounded outward)")
     if args.multi_gpu and args.cpu_offload:
         parser.error("--cpu_offload cannot be combined with --multi_gpu")
+    if args.sem_dir in ("generic", "specific", "axis") and not args.sem_axes:
+        parser.error(f"--sem_dir {args.sem_dir} needs --sem_axes (make_sem_axes.py)")
     return args
 
 
@@ -376,7 +388,9 @@ def auto_exp_name(args) -> str:
         parts.append(f"sem{args.sem_lambda * 100:g}" + (f"_sg{args.sem_gamma * 100:g}" if args.sem_gamma else "")
                      + ("" if args.sem_steps is None else "_ss" + "-".join(map(str, args.sem_steps)))
                      + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else "")
-                     + ("_np" if args.sem_norm_preserve else ""))
+                     + ("_np" if args.sem_norm_preserve else "")
+                     + ("" if args.sem_dir == "u" else f"_d{args.sem_dir}"
+                        + (f"{args.sem_seed}" if args.sem_dir == "random" else "")))
     if args.cohere > 0:
         parts.append(f"coh{args.cohere * 100:g}" + (f"_ct{args.cohere_tau:g}" if args.cohere_tau > 0 else "")
                      + ("_cx" if args.cohere_ctx else "")
@@ -618,7 +632,7 @@ def main():
         # a flag added after the folder was made counts as unchanged while it is off
         diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys()
                 if old.get(k) != settings.get(k)
-                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) == "token"))}
+                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) in ("token", "u")))}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
                              f"Use another --exp_name, or --overwrite to regenerate everything here.")
@@ -667,7 +681,9 @@ def main():
                        cohere=args.cohere, cohere_steps=args.cohere_steps,
                        cohere_tau=args.cohere_tau, cohere_ctx=args.cohere_ctx,
                        sem_lambda=args.sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
-                       sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)})
+                       sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)},
+                       sem_dir=args.sem_dir, sem_seed=args.sem_seed,
+                       sem_axes=torch.load(args.sem_axes, weights_only=True) if args.sem_axes else None)
     if args.src_role:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
             raise SystemExit("--src_role needs --attention_setting apitasmkernelnonlap")
@@ -731,6 +747,7 @@ def main():
             else:
                 kwargs['instance_bboxes_xyxy_normalized'] = sample['bboxes']
 
+            ortho.sem_sample = str(sample_id)  # leave-one-out directions of --sem_axes
             try:
                 mem, fp = {}, {}
                 diag = Diagnose() if args.diagnose else None

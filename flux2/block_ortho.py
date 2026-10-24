@@ -82,6 +82,14 @@ with the same modulation, and are never decoded. Two optional uses:
     (remove the source-word side, push toward the target word relative to the token's own write).
     sem_norm_preserve: the result is rescaled to |d_t|, so the term rotates the write toward u_k instead of
     lengthening it.
+    sem_dir replaces u_k with another direction (same instances, strengths and blocks), to test what the
+    term needs: "u" = u_k (default); "generic" = u_bar, the part of u_k shared by every instruction (mean of
+    normalised u over other images, sem_axes); "specific" = u_k with u_bar projected out; "axis" = the latent's
+    instruction-independent edit direction (edited instances' (L_k - bg) - (C_k - context bg) over other
+    images, massive channels zeroed, sem_axes); "random" = a fixed random unit vector per instance;
+    "self" = the instance's own mean write (rotating toward it only shrinks how its tokens differ from each
+    other, no new direction); "bg" = the background's mean write. sem_axes (make_sem_axes.py) holds
+    [steps, blocks, D] directions per sample built without that sample ("all" for any other sample).
     Steps: sem_steps (None = all); blocks: single blocks minus sem_exclude. Stats (logged whenever the
     word positions are known, also with both strengths 0): sem_cos_inst / sem_cos_bg = mean cos(d_t, u_k)
     on k's tokens / on the background, and sem_contrast = |D_tgt - D_src| / |D_tgt|.
@@ -141,6 +149,10 @@ class BlockOrtho:
     sem_steps: list | None = None  # steps for the instruction term; None = all
     sem_exclude: set = field(default_factory=set)  # single block names without the instruction term
     sem_norm_preserve: bool = False  # semantic: rescale each instance token's write back to its length
+    sem_dir: str = "u"  # direction of the instruction term: u, generic, specific, axis, random, self, bg
+    sem_axes: dict | None = None  # precomputed shared directions for generic / specific / axis (make_sem_axes.py)
+    sem_sample: str | None = None  # current sample id: picks its leave-one-out directions in sem_axes
+    sem_seed: int = 0  # sem_dir "random"
     compose: str = "current"  # "current" (sequential, per-term rescale) or "joint" (sum all, rescale once)
     sem_tokens: list | None = None  # per instance (src positions, tgt positions) in the text sequence, or None
     stats: list = field(default_factory=list)
@@ -324,6 +336,7 @@ class BlockOrtho:
                 if not bool(idx.any()) or float(uk.norm()) == 0.0:
                     cos_in.append(float("nan")); cos_bg.append(float("nan"))
                     continue
+                uk = self._sem_dir(uk, k, dn, idx, inst, layer)
                 cos_all = (F.normalize(dn[0], dim=-1) * uk[0]).sum(-1)  # [HW]
                 cos_in.append(float(cos_all[idx].mean()))
                 cos_bg.append(float(cos_all[~inst].mean()) if bool((~inst).any()) else float("nan"))
@@ -436,6 +449,33 @@ class BlockOrtho:
             self._sem_contrast.append(float(diff[0].norm() / d_tgt[0].norm().clamp_min(1e-12)))
             U[:, k] = F.normalize(diff, dim=-1)
         return U
+
+    def _sem_dir(self, uk, k: int, dn, idx, inst, layer: str):
+        """The unit direction [B, 1, D] the instruction term pushes instance k toward (see sem_dir)."""
+        mode = self.sem_dir
+        if mode == "u":
+            return uk
+        if mode == "self":
+            return F.normalize(dn[:, idx].mean(dim=1, keepdim=True), dim=-1)
+        if mode == "bg":
+            return F.normalize(dn[:, ~inst].mean(dim=1, keepdim=True), dim=-1) if bool((~inst).any()) else uk * 0
+        if mode == "random":
+            gen = torch.Generator().manual_seed(self.sem_seed * 1000 + k)
+            v = F.normalize(torch.randn(uk.shape[-1], generator=gen), dim=0)
+            return v.to(uk.device)[None, None].expand_as(uk)
+        def shared(name):
+            table = self.sem_axes[name]
+            T = table[self.sem_sample] if self.sem_sample in table else table["all"]  # [S, L, D]
+            v = T[min(self.step_idx, T.shape[0] - 1), self.sem_axes["blocks"].index(layer)]
+            return F.normalize(v.float(), dim=-1).to(uk.device)[None, None].expand_as(uk)
+        if mode == "generic":
+            return shared("generic")
+        if mode == "specific":
+            ub = shared("generic")
+            return F.normalize(uk - (uk * ub).sum(-1, keepdim=True) * ub, dim=-1)
+        if mode == "axis":
+            return shared("axis")
+        raise ValueError(f"unknown sem_dir {mode}")
 
     def _edit_stream(self, h_in, h_out, s: int, layer: str):
         """Edits the latent tokens [s, s+HW) and, if there is a context, [s+HW, s+2HW) of a block output."""

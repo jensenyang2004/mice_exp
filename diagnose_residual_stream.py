@@ -12,6 +12,7 @@ capture   Same generation as capture_residual_stream.py (every generation flag o
               unit[step, block, kind, group, C']  mean of the unit-normalised tokens, massive channels dropped
               copy[step, block, kind, K + 1]      per-token cos(latent, context at the same position) averaged
                                                   over each instance and the background (massive dropped)
+              bg_map[step, block, kind, HW]       per latent token: cos(token, background mean), massive dropped
           Groups (full token grid): text (all local-instruction words), latent, context, latent_bg, context_bg
           and per instance k: L{k} latent, C{k} context at the same positions, Lb{k} latent tokens touching
           another instance, T{k} the words of k's instruction, S{k} / G{k} the source / target words.
@@ -23,12 +24,16 @@ label     Edit success with the CLIP rule of 3D-bench/clip_bench/eval_success_ra
           on the source and on the result: overlap(j, k) = |A_j & A_k| / min(|A_j|, |A_k|); a pair is fused
           when its overlap in the result is >= --fuse_overlap and grew by >= --fuse_gain over the source.
           <sid>/labels.json, labels.jpg (result with the SAM2 masks and the labels, to check them by eye)
+          analyze also draws <sid>/bg_map.png: per token, how far its update departs from the background's
 
 analyze   Per instance (>= --min_tokens latent tokens) and per adjacent pair, curves over blocks (mean over
           steps), split by the labels; the d' of image groups is corrected for group size, so instances of
           different sizes compare. <diag_dir>/diagnosis/:
               sdl.png       edited vs failed: latent <-> own context / own instruction / source / target word,
                             target lean, copy cos, latent update . u_k (u_k from word updates and word states)
+              sdl_concat.png / sdl_concat_uk.png / sdl_concat_bg.png  sdl.png with the steps concatenated
+              sdl_steps_state.png / sdl_steps_update.png  the same over the denoising steps: copy cos and
+                            latent <-> own context per step, the within-sample gap, and per block per step
               fusion.png    fused vs adjacent-not-fused pairs: latent <-> latent, context <-> context,
                             contact band, cross-instruction, cross-context, cos of the centred updates
               instances.csv, pairs.csv  window means per record; summary.txt  group means and the
@@ -139,7 +144,8 @@ class StreamStats:
         self.chan_ss = None
 
     def _reduce(self, X):
-        """X [N, C] float32 -> raw means [G, C], unit means [G, C'], copy cos [K + 1]."""
+        """X [N, C] float32 -> raw means [G, C], unit means [G, C'], copy cos [K + 1], and per latent token
+        cos(token, background mean) [HW] (massive dropped): a map of where the frame gets its own write."""
         if self.keep is None:
             self.keep = torch.ones(X.shape[1], dtype=torch.bool, device=X.device)
             self.keep[self.massive] = False
@@ -150,7 +156,9 @@ class StreamStats:
         T, HW = self.T, self.HW
         cc = F.cosine_similarity(X[T:T + HW, self.keep], X[T + HW:T + 2 * HW, self.keep], dim=1)
         copy = (self.Mf @ cc) / self.Mf.sum(1).clamp_min(1)
-        return raw, unit, copy
+        bg = raw[self.gnames.index("latent_bg"), self.keep]
+        bg_map = F.cosine_similarity(X[T:T + HW, self.keep], bg[None], dim=1)
+        return raw, unit, copy, bg_map
 
     def _block(self, h_in, h_out, name):
         if not self.on:
@@ -158,7 +166,7 @@ class StreamStats:
         H = h_out[0].float()
         D = H - h_in[0].float()
         r = [self._reduce(X) for X in (D, H)]
-        self.cur.append([torch.stack([a[i] for a in r]).cpu() for i in range(3)])
+        self.cur.append([torch.stack([a[i] for a in r]).cpu() for i in range(4)])
         img = H[self.T:self.T + 2 * self.HW]
         ss = (img ** 2).sum(0).cpu()
         self.chan_ss = ss if self.chan_ss is None else self.chan_ss + ss
@@ -184,8 +192,8 @@ class StreamStats:
 
         def post_forward(module, args, kwargs, output):
             if self.on:
-                raw, unit, copy = (torch.stack([b[i] for b in self.cur]) for i in range(3))
-                self.data[self.step] = dict(raw=raw.half(), unit=unit.half(), copy=copy)
+                raw, unit, copy, bg_map = (torch.stack([b[i] for b in self.cur]) for i in range(4))
+                self.data[self.step] = dict(raw=raw.half(), unit=unit.half(), copy=copy, bg_map=bg_map.half())
             self.cur, self.on = None, False
 
         def double_hook(idx):
@@ -211,7 +219,8 @@ class StreamStats:
     def save(self, out_dir: Path):
         steps = sorted(self.data)
         stack = lambda key: torch.stack([self.data[s][key] for s in steps])
-        torch.save(dict(raw=stack("raw"), unit=stack("unit"), copy=stack("copy"), counts=self.counts,
+        torch.save(dict(raw=stack("raw"), unit=stack("unit"), copy=stack("copy"), bg_map=stack("bg_map"),
+                        counts=self.counts,
                         chan_rms=(self.chan_ss / (len(steps) * len(self.names) * 2 * self.HW)).sqrt()),
                    out_dir / "stats.pt")
         return steps
@@ -464,7 +473,9 @@ INST_FEATS = (("L-C", "latent ↔ own context (d')"), ("L-T", "latent ↔ own in
               ("L-G", "latent ↔ target word (d')"), ("lean", "target lean d'(L, src) − d'(L, tgt)"),
               ("copy", "token cos latent ↔ context, same position"),
               ("u_centred", "centred latent update · u_k"),
-              ("u_raw_vs_bg", "raw latent update · u_k minus background · u_k"))
+              ("u_raw_vs_bg", "raw latent update · u_k minus background · u_k"),
+              ("bg_cos", "cos(instance mean, background mean), massive dropped"),
+              ("bg_dev", "instance-specific size |mean_k − mean_bg| / |mean_bg|, massive dropped"))
 PAIR_FEATS = (("Lj-Lk", "latent j ↔ latent k (d')"), ("Cj-Ck", "context j ↔ context k (d', control)"),
               ("Lb", "contact band j ↔ contact band k (d')"),
               ("cross-own", "d'(L, other's instruction) − d'(L, own instruction)"),
@@ -484,6 +495,11 @@ def features(stats, meta, labels, min_tokens, rule="delta"):
         d = lambda a, b: dprime(U, n, g[a], g[b])
         f = {"L-C": d(f"L{k}", f"C{k}"), "L-T": d(f"L{k}", f"T{k}"), "C-T": d(f"C{k}", f"T{k}"),
              "copy": cp[..., k]}
+        # how much the instance gets its own write, apart from the background's (raw means, no centring)
+        keep = torch.ones(R.shape[-1], dtype=torch.bool)
+        keep[meta.get("massive", MASSIVE)] = False
+        Lm, bm = R[..., g[f"L{k}"], :][..., keep], R[..., g["latent_bg"], :][..., keep]
+        f["bg_cos"], f["bg_dev"] = ncos(Lm, bm), (Lm - bm).norm(dim=-1) / bm.norm(dim=-1)
         if f"S{k}" in g:
             f["L-S"], f["L-G"] = d(f"L{k}", f"S{k}"), d(f"L{k}", f"G{k}")
             f["lean"] = f["L-S"] - f["L-G"]
@@ -596,6 +612,173 @@ def plot_groups(recs, feats, labels, blocks, out, title):
     plt.close(fig)
 
 
+STEP_COLORS = ["#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]  # ordinal blue ramp, noisy -> clean
+
+
+def plot_steps(recs, blocks, out, title, kind=1, lo=0, hi=17):
+    """Trajectory over the denoising steps (state by default; mean over the single blocks lo..hi): does a failed
+    instance drift toward its source while an edited one does not?"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    idx = [i for i, b in enumerate(blocks) if b.startswith("single") and lo <= int(b.split("_")[1]) <= hi]
+    kname = ("update D", "state h")[kind]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8.5), constrained_layout=True)
+    steps = np.arange(recs[0]["feats"]["copy"].shape[0])
+
+    def per_step(r, key):
+        return r["feats"][key][:, idx, kind].mean(1).numpy()
+
+    for ax, key, name in ((axes[0, 0], "copy", "token cos latent ↔ context, same position"),
+                          (axes[0, 1], "L-C", "latent ↔ own context (d')")):
+        for lab in ("edited", "failed"):
+            cs = np.stack([per_step(r, key) for r in recs if r["label"] == lab])
+            for c in cs:
+                ax.plot(steps, c, color=LABEL_COLORS[lab], lw=0.6, alpha=0.15)
+            m, se = cs.mean(0), cs.std(0, ddof=1) / np.sqrt(len(cs))
+            ax.fill_between(steps, m - se, m + se, color=LABEL_COLORS[lab], alpha=0.2, lw=0)
+            ax.plot(steps, m, color=LABEL_COLORS[lab], lw=2.4, marker="o", label=f"{lab} (n={len(cs)})")
+        ax.set_title(f"{name}, {kname}, mean over s{lo}-s{hi}", fontsize=9, color=INK, loc="left")
+        ax.legend(fontsize=7, frameon=False)
+
+    # the same within each sample (failed - edited), so differences between images drop out
+    ax = axes[1, 0]
+    for key, name, color in (("copy", "copy cos", "#eb6834"), ("L-C", "latent ↔ own context d'", "#2a78d6"),
+                             ("L-T", "latent ↔ own instruction d'", "#1baf7a")):
+        gaps = []
+        for s in sorted({r["sample"] for r in recs}):
+            f = [per_step(r, key) for r in recs if r["sample"] == s and r["label"] == "failed"]
+            e = [per_step(r, key) for r in recs if r["sample"] == s and r["label"] == "edited"]
+            if f and e:
+                gaps.append(np.mean(f, 0) - np.mean(e, 0))
+        if not gaps:
+            continue
+        for g_ in gaps:
+            ax.plot(steps, g_, color=color, lw=0.7, alpha=0.3)
+        ax.plot(steps, np.mean(gaps, 0), color=color, lw=2.4, marker="o", label=f"{name} ({len(gaps)} samples)")
+    ax.axhline(0, color=MUTED, lw=0.8)
+    ax.set_title(f"within-sample gap failed − edited, {kname} (thin = samples)", fontsize=9, color=INK, loc="left")
+    ax.legend(fontsize=7, frameon=False)
+    for ax in (axes[0, 0], axes[0, 1], axes[1, 0]):
+        ax.set_xticks(steps)
+        ax.set_xlabel("denoising step", fontsize=8, color=INK2)
+        ax.grid(axis="y", color=GRID, lw=0.6)
+        ax.tick_params(labelsize=7, colors=INK2)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+
+    # where in the blocks the gap builds up, per step
+    ax = axes[1, 1]
+    x = np.arange(len(blocks))
+    for s in steps:
+        f = np.stack([r["feats"]["copy"][s, :, kind].numpy() for r in recs if r["label"] == "failed"]).mean(0)
+        e = np.stack([r["feats"]["copy"][s, :, kind].numpy() for r in recs if r["label"] == "edited"]).mean(0)
+        ax.plot(x, f - e, color=STEP_COLORS[s % len(STEP_COLORS)], lw=2, label=f"step {s}")
+    ax.axhline(0, color=MUTED, lw=0.8)
+    style(ax, blocks, f"copy cos gap failed − edited per block, {kname}")
+    ax.legend(fontsize=7, frameon=False)
+    fig.suptitle(title, fontsize=11, color=INK, x=0.01, ha="left")
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+
+
+def plot_concat(recs, feats, blocks, out, title, width=20):
+    """Like plot_groups, but every step separately: the 4 steps' blocks concatenated on one x axis."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    S, L = recs[0]["feats"]["copy"].shape[:2]
+    x = np.arange(S * L)
+    n_double = sum(b.startswith("double") for b in blocks)
+    fig, axes = plt.subplots(len(feats), 2, figsize=(width, 2.8 * len(feats)), constrained_layout=True,
+                             squeeze=False)
+    for i, (key, name) in enumerate(feats):
+        for kind, kname in enumerate(("update D", "state h")):
+            ax = axes[i, kind]
+            for lab in ("edited", "failed"):
+                cs = [r["feats"][key][..., kind].reshape(-1).numpy() for r in recs if r["label"] == lab and key in r["feats"]]
+                if not cs:
+                    continue
+                cs = np.stack(cs)
+                m = cs.mean(0)
+                se = cs.std(0, ddof=1) / np.sqrt(len(cs)) if len(cs) > 1 else np.zeros_like(m)
+                for s in range(S):  # break the line between steps
+                    sl = slice(s * L, (s + 1) * L)
+                    ax.fill_between(x[sl], (m - se)[sl], (m + se)[sl], color=LABEL_COLORS[lab], alpha=0.2, lw=0)
+                    ax.plot(x[sl], m[sl], color=LABEL_COLORS[lab], lw=1.8, label=f"{lab} (n={len(cs)})" if s == 0 else None)
+            for s in range(S):
+                ax.axvline(s * L - 0.5, color=INK2, lw=1) if s else None
+                ax.axvline(s * L + n_double - 0.5, color=MUTED, lw=0.8, ls=":")
+                ax.text(s * L + L / 2, 1.0, f"step {s}", transform=ax.get_xaxis_transform(), ha="center",
+                        va="bottom", fontsize=8, color=INK2)
+            if key.startswith(("u_", "lean", "copy")):
+                ax.axhline(0, color=MUTED, lw=0.8)
+            ticks = [s * L + l for s in range(S) for l in range(L) if l in (0, n_double) or (l - n_double) % 5 == 0]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([blocks[t % L].replace("double_", "d").replace("single_", "s") for t in ticks],
+                               fontsize=6, color=INK2)
+            ax.set_xlim(-0.5, S * L - 0.5)
+            ax.tick_params(axis="y", labelsize=7, colors=INK2)
+            ax.grid(axis="y", color=GRID, lw=0.6)
+            for sp in ("top", "right"):
+                ax.spines[sp].set_visible(False)
+            col = (" (u_k from word updates)", " (u_k from word states)")[kind] if key.startswith("u_") else f", {kname}"
+            ax.set_title(name + col, fontsize=9, color=INK, loc="left", pad=14)
+            ax.legend(fontsize=7, frameon=False, loc="upper left")
+    fig.suptitle(title, fontsize=11, color=INK, x=0.01, ha="left")
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+
+
+MAP_BLOCKS = ("double_2", "single_0", "single_2", "single_3", "single_7", "single_11", "single_15", "single_19")
+
+
+def plot_bg_map(stats, meta, labels, masks, out, kind=0, rule="delta"):
+    """Per latent token, 1 - cos(update, background mean update): where the frame gets a write of its own
+    (dark) and where it gets the background's (light). Rows = steps, columns = MAP_BLOCKS; instance outlines
+    in the label colour."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    M = stats["bg_map"][..., kind, :].float()  # [S, L, HW]
+    S = M.shape[0]
+    Ht, Wt = meta["grid"]
+    cols = [b for b in MAP_BLOCKS if b in meta["blocks"]]
+    dev = 1 - M
+    vmax = float(torch.quantile(dev[:, [meta["blocks"].index(b) for b in cols]].flatten()[::7], 0.99))
+    fig, axes = plt.subplots(S, len(cols), figsize=(2.3 * len(cols), 2.3 * S * Ht / Wt + 0.8),
+                             constrained_layout=True, squeeze=False)
+    inst = {int(k): v for k, v in labels["instances"].items()}
+    for s in range(S):
+        for j, b in enumerate(cols):
+            ax = axes[s, j]
+            im = ax.imshow(dev[s, meta["blocks"].index(b)].reshape(Ht, Wt).numpy(), cmap="Blues", vmin=0, vmax=vmax)
+            for k, m in enumerate(masks.float().numpy()):
+                if k not in inst or not m.any():
+                    continue
+                ok = inst[k]["success"] and (rule == "delta" or inst[k]["best_target"] == k)
+                color = LABEL_COLORS["edited" if ok else "failed"]
+                ax.contour(m, levels=[0.5], colors=[color], linewidths=1.0)
+                if s == 0 and j == 0:
+                    ys, xs = np.nonzero(m)
+                    ax.text(xs.mean(), ys.mean(), str(k), color=color, fontsize=7, ha="center", va="center",
+                            fontweight="bold")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_visible(False)
+            if s == 0:
+                ax.set_title(b.replace("double_", "d").replace("single_", "s"), fontsize=9, color=INK)
+            if j == 0:
+                ax.set_ylabel(f"step {s}", fontsize=9, color=INK2)
+    fig.colorbar(im, ax=axes, shrink=0.6, label="1 − cos(token update, background mean update)")
+    fig.suptitle(f"Sample {meta['sample_id']}: how much each token's {('update', 'state')[kind]} departs from the "
+                 f"background's (outline: blue = edited, orange = failed)", fontsize=10, color=INK, x=0.01,
+                 ha="left")
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+
+
 def analyze(args):
     import csv
     root = Path(args.diag_dir)
@@ -610,6 +793,9 @@ def analyze(args):
         insts += i_
         pairs += p_
         blocks = meta["blocks"]
+        if "bg_map" in stats and (d / "masks.pt").exists():
+            plot_bg_map(stats, meta, labels, torch.load(d / "masks.pt", weights_only=True), d / "bg_map.png",
+                        rule=args.label_rule)
         top = stats["chan_rms"].topk(len(args.massive)).indices.sort().values.tolist()
         if set(top) != set(args.massive):
             logger.warning(f"{d.name}: top-RMS channels {top} differ from --massive {args.massive}")
@@ -620,6 +806,16 @@ def analyze(args):
     plot_groups(insts, INST_FEATS, ("edited", "failed"), blocks, out / "sdl.png",
                 f"Edited vs failed instances ({n_samples} samples; thick = mean ± SE over instances, thin = "
                 f"instances; mean over steps)")
+    if {"edited", "failed"} <= {r["label"] for r in insts}:
+        plot_concat(insts, INST_FEATS, blocks, out / "sdl_concat.png",
+                    f"Edited vs failed, every step ({n_samples} samples; mean ± SE over instances)")
+        plot_concat(insts, [f for f in INST_FEATS if f[0].startswith("bg_")], blocks, out / "sdl_concat_bg.png",
+                    f"Instance vs background, edited vs failed, every step ({n_samples} samples; mean ± SE)", width=24)
+        plot_concat(insts, [f for f in INST_FEATS if f[0].startswith("u_")], blocks, out / "sdl_concat_uk.png",
+                    f"Latent update · u_k, edited vs failed, every step ({n_samples} samples; mean ± SE)", width=24)
+        for kind, kn in ((1, "state"), (0, "update")):
+            plot_steps(insts, blocks, out / f"sdl_steps_{kn}.png",
+                       f"Edited vs failed over the denoising steps ({n_samples} samples, {kn})", kind=kind)
     if pairs:
         plot_groups(pairs, PAIR_FEATS, ("apart", "fused"), blocks, out / "fusion.png",
                     f"Fused vs adjacent-not-fused pairs ({n_samples} samples; thick = mean ± SE over pairs)")
