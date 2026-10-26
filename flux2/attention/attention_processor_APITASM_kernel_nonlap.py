@@ -60,7 +60,7 @@ def fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instan
     return atten_mask
 
 
-def fill_image_bind_mask(atten_mask, mask_type, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=None, kernel_size=11, temperature=3.0, smooth_P_L=False, free_context=False, free_latent=False, free_LC=False, free_LL=False):
+def fill_image_bind_mask(atten_mask, mask_type, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=None, kernel_size=11, temperature=3.0, smooth_P_L=False, free_context=False, free_latent=False, free_LC=False, free_LL=False, binary=False):
     """
     Fills the attention mask with:
     - 0.0 for valid connections
@@ -69,6 +69,7 @@ def fill_image_bind_mask(atten_mask, mask_type, instance_text_index_lst, image_w
     
     kernel_size: Controls the Gaussian kernel size for convolution.
     temperature: Controls falloff intensity (higher = softer falloff).
+    binary: drop the Gaussian falloff (-inf everywhere outside the instance), i.e. IDAttn's APITA hard mask.
     """
     device = atten_mask.device
     dtype = atten_mask.dtype
@@ -164,6 +165,8 @@ def fill_image_bind_mask(atten_mask, mask_type, instance_text_index_lst, image_w
             # - temperature > 1.0: softer falloff (more attention outside mask)
             # - temperature < 1.0: sharper falloff (less attention outside mask)
             gaussian_bias = torch.log(convolved_flat + 1e-6) / temperature
+            if binary:
+                gaussian_bias = torch.full_like(gaussian_bias, -float('inf'))
             
             # Remove extra smoothed added parts for areas that overlap other masks
             overlap_mask_2d = (inst_mask_2d == 0) & (other_masks_2d == 1)
@@ -207,6 +210,9 @@ def fill_image_bind_mask(atten_mask, mask_type, instance_text_index_lst, image_w
             # 5. Handle Global Prompt
             # Usually we still block global prompt to keep text guidance specific
             atten_mask[seq_len + instance_flat_indices[:, None], : global_seq_len] = -float('inf')
+            if binary:
+                # IDAttn also blocks context-instance-image -> global prompt
+                atten_mask[seq_len + HW + instance_flat_indices[:, None], : global_seq_len] = -float('inf')
 
             # 4. Enforce Hard Intra-Instance Attention - Context Copy
             atten_mask[seq_len + HW + instance_flat_indices[:, None], seq_len + instance_flat_indices] = 0.0
@@ -292,12 +298,13 @@ class Flux2APITASMAttnProcessorKernelNonLap:
     cfg_inference_steps_multiplier = 1
     debug_info = None
 
-    def __init__(self, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False):
+    def __init__(self, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False, binary: bool = False):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0. Please upgrade your pytorch version.")
         self.kernel_size = kernel_size
         self.temperature = temperature
         self.strict = strict
+        self.binary = binary
 
     @classmethod
     def clear_cached_masks(cls):
@@ -404,13 +411,13 @@ class Flux2APITASMAttnProcessorKernelNonLap:
         if (Flux2APITASMAttnProcessorKernelNonLap.cond_hard_bind_mask is None and is_conditional) or (Flux2APITASMAttnProcessorKernelNonLap.uncond_hard_bind_mask is None and not is_conditional):
             atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
             atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
-            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL, binary=self.binary)
             Flux2APITASMAttnProcessorKernelNonLap.cond_hard_bind_mask = atten_mask if is_conditional else Flux2APITASMAttnProcessorKernelNonLap.uncond_hard_bind_mask
 
         if (Flux2APITASMAttnProcessorKernelNonLap.cond_soft_bind_mask is None and is_conditional) or (Flux2APITASMAttnProcessorKernelNonLap.uncond_soft_bind_mask is None and not is_conditional):
             atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
             atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
-            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL, binary=self.binary)
             Flux2APITASMAttnProcessorKernelNonLap.cond_soft_bind_mask = atten_mask if is_conditional else Flux2APITASMAttnProcessorKernelNonLap.uncond_soft_bind_mask
 
         if Flux2APITASMAttnProcessorKernelNonLap.counter % TRANSFORMER_NUM_LAYERS in hard_image_attribute_binding_list_double:
@@ -473,12 +480,13 @@ class Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap:
     uncond_hard_bind_mask2 = None
     cfg_inference_steps_multiplier = 1
 
-    def __init__(self, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False):
+    def __init__(self, kernel_size: int = 11, temperature: float = 3.0, strict: bool = False, binary: bool = False):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0. Please upgrade your pytorch version.")
         self.kernel_size = kernel_size
         self.temperature = temperature
         self.strict = strict
+        self.binary = binary
     
     @classmethod
     def clear_cached_masks(cls):
@@ -577,13 +585,13 @@ class Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap:
         if (Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.cond_hard_bind_mask is None and is_conditional) or (Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.uncond_hard_bind_mask is None and not is_conditional):
             atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
             atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
-            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.HARD, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL, binary=self.binary)
             Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.cond_hard_bind_mask = atten_mask if is_conditional else Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.uncond_hard_bind_mask
 
         if (Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.cond_soft_bind_mask is None and is_conditional) or (Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.uncond_soft_bind_mask is None and not is_conditional):
             atten_mask = torch.full((query.shape[1], query.shape[1]), -float('inf'), device=query.device, dtype=query.dtype)
             atten_mask = fill_hard_text_bind_mask(atten_mask, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, instance_position_mask_list, image_token_H, image_token_W, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list)
-            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL)
+            atten_mask = fill_image_bind_mask(atten_mask, MaskType.SOFT, instance_text_index_lst, image_w_instance_token_index_list, seq_len, HW, instance_num, global_seq_len, instance_position_mask_list, image_token_H, image_token_W, query, context_image_w_instance_token_index_list=context_image_w_instance_token_index_list, kernel_size=self.kernel_size, temperature=self.temperature, smooth_P_L=smooth_P_L, free_context=free_context, free_latent=free_latent, free_LC=free_LC, free_LL=free_LL, binary=self.binary)
             Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.cond_soft_bind_mask = atten_mask if is_conditional else Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.uncond_soft_bind_mask
 
         if Flux2ParallelSelfAttnProcessorAPITASMKernelNonLap.counter % TRANSFORMER_SINGLE_NUM_LAYERS in hard_image_attribute_binding_list_single:
