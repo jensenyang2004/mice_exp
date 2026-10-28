@@ -491,6 +491,38 @@ def run_with_steer(pipe, steer: ResidualSteer, chunked: ChunkedAttention | None,
             h.remove()
 
 
+def setup_transformer(pipe, args):
+    """Sets the MICE processors and adapts them to the loaded model's block counts.
+    Returns (attention setting, double processor, single processor, n_double, n_single)."""
+    attn_setting_enum = AttentionSetting(args.attention_setting.lower())
+    attn_proc, parallel_attn_proc = get_attention_processors(attn_setting_enum, args.sigma_scale, args.kernel_size,
+                                                             args.temperature)
+    for _, module in pipe.transformer.named_modules():
+        if isinstance(module, Flux2Attention):
+            module.set_processor(attn_proc)
+        elif isinstance(module, Flux2ParallelSelfAttention):
+            module.set_processor(parallel_attn_proc)
+
+    n_double, n_single = len(pipe.transformer.transformer_blocks), len(pipe.transformer.single_transformer_blocks)
+    # The MICE processors count their calls with the klein-4B block counts (5 double, 20 single) as module
+    # globals; set them to the loaded model's (e.g. klein 9B) so the per-block / per-step mask schedule holds.
+    # The default binding lists ("0,5" / "0,20" = every block of 4B) mean every block of the loaded model.
+    mice_attn_module.TRANSFORMER_NUM_LAYERS = n_double
+    mice_attn_module.TRANSFORMER_SINGLE_NUM_LAYERS = n_single
+    if args.hard_image_attribute_binding_list_double == list(range(5)):
+        args.hard_image_attribute_binding_list_double = list(range(n_double))
+    if args.hard_image_attribute_binding_list_single == list(range(20)):
+        args.hard_image_attribute_binding_list_single = list(range(n_single))
+    logger.info(f"Transformer: {n_double} double + {n_single} single blocks")
+    if (n_double, n_single) != (5, 20) and not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
+        # the other processors import the 4B counts by value, so the override above does not reach them
+        raise SystemExit("A non-4B transformer needs --attention_setting apitasmkernelnonlap")
+    if args.guidance_scale > 1.0 and not pipe.config.is_distilled:
+        # the hooks would also steer the unconditional pass, with u_k read at the conditional prompt's positions
+        raise SystemExit("Steering under CFG is not supported yet: use a distilled checkpoint or --guidance_scale 1")
+    return attn_setting_enum, attn_proc, parallel_attn_proc, n_double, n_single
+
+
 def main():
     args = parse_args()
     device = args.device or ("cuda:0" if args.multi_gpu else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -535,32 +567,7 @@ def main():
         pipe.to("cpu")
         pipe.enable_model_cpu_offload(device=device)
 
-    attn_setting_enum = AttentionSetting(args.attention_setting.lower())
-    attn_proc, parallel_attn_proc = get_attention_processors(attn_setting_enum, args.sigma_scale, args.kernel_size,
-                                                             args.temperature)
-    for _, module in pipe.transformer.named_modules():
-        if isinstance(module, Flux2Attention):
-            module.set_processor(attn_proc)
-        elif isinstance(module, Flux2ParallelSelfAttention):
-            module.set_processor(parallel_attn_proc)
-
-    n_double, n_single = len(pipe.transformer.transformer_blocks), len(pipe.transformer.single_transformer_blocks)
-    # The MICE processors count their calls with the klein-4B block counts (5 double, 20 single) as module
-    # globals; set them to the loaded model's (e.g. klein 9B) so the per-block / per-step mask schedule holds.
-    # The default binding lists ("0,5" / "0,20" = every block of 4B) mean every block of the loaded model.
-    mice_attn_module.TRANSFORMER_NUM_LAYERS = n_double
-    mice_attn_module.TRANSFORMER_SINGLE_NUM_LAYERS = n_single
-    if args.hard_image_attribute_binding_list_double == list(range(5)):
-        args.hard_image_attribute_binding_list_double = list(range(n_double))
-    if args.hard_image_attribute_binding_list_single == list(range(20)):
-        args.hard_image_attribute_binding_list_single = list(range(n_single))
-    logger.info(f"Transformer: {n_double} double + {n_single} single blocks")
-    if (n_double, n_single) != (5, 20) and not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
-        # the other processors import the 4B counts by value, so the override above does not reach them
-        raise SystemExit("A non-4B transformer needs --attention_setting apitasmkernelnonlap")
-    if args.guidance_scale > 1.0 and not pipe.config.is_distilled:
-        # the hooks would also steer the unconditional pass, with u_k read at the conditional prompt's positions
-        raise SystemExit("Steering under CFG is not supported yet: use a distilled checkpoint or --guidance_scale 1")
+    attn_setting_enum, attn_proc, parallel_attn_proc, n_double, n_single = setup_transformer(pipe, args)
 
     def resolve(blocks, n):
         return list(range(n)) if blocks == ["all"] else sorted({i % n for i in blocks})
