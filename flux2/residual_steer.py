@@ -20,6 +20,9 @@ per instance k and latent token t of k, three increments are computed from the s
   semantic  single blocks only. In the single blocks text and image tokens share the residual stream,
             so the block's writes into the instance's own prompt words live in the same space:
             u_k = normalize(mean_{target words} D_text - mean_{source words} D_text)
+            Optionally also in the double blocks in sem_double (own strengths sem_double_lambda / _gamma), with
+            D_text the text stream's update there: text has separate weights in those blocks, so u_k comes from
+            another stream's basis (an experiment, not the method).
             Δ_sem = (-sem_gamma min(d_t . u_k, 0) + sem_lambda |d_t|) u_k
 
 and combined with one rescale, so the terms only turn the write together and add no energy:
@@ -77,6 +80,9 @@ class ResidualSteer:
     sem_gamma: float = 0.0  # semantic: remove the source-word side
     sem_steps: list | None = None  # None = all
     sem_exclude: set = field(default_factory=set)  # single block names without the semantic term
+    sem_double: list = field(default_factory=list)  # double block indices that also get the semantic term
+    sem_double_lambda: float = 0.0  # its push in those blocks (u_k from the text stream's own update)
+    sem_double_gamma: float = 0.0  # its source-side removal in those blocks
     sem_tokens: list | None = None  # per instance (src positions, tgt positions) in the text sequence, or None
     stats: list = field(default_factory=list)
 
@@ -143,7 +149,9 @@ class ResidualSteer:
         return (self.masks.shape[0] >= 1 and self.sigma is not None and self.sigma > 0.0
                 and (self._in(self.steps)
                      or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))
-                     or ((self.sem_lambda > 0 or self.sem_gamma > 0) and self._in(self.sem_steps))))
+                     or ((self.sem_lambda > 0 or self.sem_gamma > 0) and self._in(self.sem_steps))
+                     or ((self.sem_double_lambda > 0 or self.sem_double_gamma > 0) and bool(self.sem_double)
+                         and self._in(self.sem_steps))))
 
     def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str, stream: str = "lat",
               src: tuple | None = None, sem: torch.Tensor | None = None) -> torch.Tensor:
@@ -213,7 +221,9 @@ class ResidualSteer:
         # semantic
         if sem is not None:
             on = self._in(self.sem_steps) and layer not in self.sem_exclude
-            gs, ls = (self.sem_gamma * self.factor, self.sem_lambda * self.factor) if on else (0.0, 0.0)
+            lam, gam = ((self.sem_double_lambda, self.sem_double_gamma) if layer.startswith("double")
+                        else (self.sem_lambda, self.sem_gamma))
+            gs, ls = (gam * self.factor, lam * self.factor) if on else (0.0, 0.0)
             cos_in, cos_bg = [], []
             for k in range(K):
                 uk = sem[:, k:k + 1]  # [B, 1, D]
@@ -238,14 +248,16 @@ class ResidualSteer:
         self.stats.append(stat)
         return (ho + delta).to(h_out.dtype)
 
-    def _sem_directions(self, h_in, h_out, s: int):
-        """[B, K, D] unit u_k from the text tokens' writes (zero rows where the words are unknown), or None."""
+    def _sem_directions(self, Dt: torch.Tensor):
+        """[B, K, D] unit u_k from the text tokens' writes Dt [B, S, D] (zero rows where the words are unknown),
+        or None."""
+        s = Dt.shape[1]
         if not self.sem_tokens or s <= 0:
             return None
         K = self.masks.shape[0]
         if len(self.sem_tokens) != K:
             return None
-        Dt = (h_out[:, :s] - h_in[:, :s]).float()
+        Dt = Dt.float()
         U = torch.zeros(Dt.shape[0], K, Dt.shape[-1], device=Dt.device)
         self._sem_contrast = []
         for k, pos in enumerate(self.sem_tokens):
@@ -259,14 +271,18 @@ class ResidualSteer:
             U[:, k] = F.normalize(diff, dim=-1)
         return U
 
-    def _edit_stream(self, h_in, h_out, s: int, layer: str):
-        """Edits the latent tokens [s, s+HW) and, if there is a context, [s+HW, s+2HW) of a block output."""
+    def _edit_stream(self, h_in, h_out, s: int, layer: str, text_upd: torch.Tensor | None = None):
+        """Edits the latent tokens [s, s+HW) and, if there is a context, [s+HW, s+2HW) of a block output.
+        text_upd: the text stream's update of a double block in sem_double (its u_k source)."""
         HW = self.HW
         has_ctx = h_out.shape[1] >= s + 2 * HW
         lat, ctx = slice(s, s + HW), slice(s + HW, s + 2 * HW)
         out = h_out.clone()
         src = (h_out[:, ctx] - h_in[:, ctx], h_out[:, ctx]) if has_ctx else None  # unsteered context
-        sem = self._sem_directions(h_in, h_out, s) if layer.startswith("single") else None
+        if layer.startswith("single"):
+            sem = self._sem_directions(h_out[:, :s] - h_in[:, :s])
+        else:  # double blocks: text has its own weights and stream, so u_k is read from that stream's update
+            sem = self._sem_directions(text_upd) if text_upd is not None else None
         out[:, lat] = self._edit(h_in[:, lat], h_out[:, lat], layer, "lat", src=src, sem=sem)
         if has_ctx and (self.ctx_alpha != 0.0 or self.ctx_beta != 0.0):
             out[:, ctx] = self._edit(h_in[:, ctx], h_out[:, ctx], layer, "ctx")
@@ -281,7 +297,8 @@ class ResidualSteer:
                     return output
                 enc, h_out = output
                 h_in = kwargs['hidden_states']  # image stream: [latent | context]
-                return enc, self._edit_stream(h_in, h_out, 0, f"double_{idx}")
+                text_upd = enc - kwargs['encoder_hidden_states'] if idx in self.sem_double else None
+                return enc, self._edit_stream(h_in, h_out, 0, f"double_{idx}", text_upd=text_upd)
             return hook
 
         def single_hook(idx):

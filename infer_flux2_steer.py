@@ -139,6 +139,13 @@ def parse_args():
     parser.add_argument("--sem_steps", type=str, default="all", help="Steps for the instruction term, or \"all\"")
     parser.add_argument("--sem_exclude_single", type=str, default="",
                         help="Single blocks without the instruction term (same syntax as --exclude_single)")
+    parser.add_argument("--sem_double", type=str, default="",
+                        help="Double blocks that also get the instruction term, e.g. 0,1,2,3,4 or all (same syntax "
+                             "as --exclude_double). u_k is read from the text stream's update in that block")
+    parser.add_argument("--sem_double_beta", type=float, default=0.0,
+                        help="Instruction push toward u_k in the --sem_double blocks (the double-block --sem_lambda)")
+    parser.add_argument("--sem_double_gamma", type=float, default=0.0,
+                        help="Source-side removal in the --sem_double blocks (the double-block --sem_gamma)")
     parser.add_argument("--mask_cover", type=float, default=0.0,
                         help="Build the token-grid instance masks by coverage instead of nearest sampling: a token "
                              "belongs to the instance if >= this fraction of its 16x16 cell is object (e.g. 0.25). "
@@ -225,7 +232,7 @@ def parse_args():
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
                 "beta_exclude_double", "beta_exclude_single",
-                "src_exclude_double", "src_exclude_single", "sem_exclude_single"):
+                "src_exclude_double", "src_exclude_single", "sem_exclude_single", "sem_double"):
         setattr(args, key, parse_blocks(getattr(args, key)))
     args.sample_ids = (None if args.sample_ids is None or args.sample_ids.lower() == "all"
                        else set(args.sample_ids.split(',')))
@@ -286,6 +293,9 @@ def auto_exp_name(args) -> str:
         parts.append(f"sem{args.sem_lambda * 100:g}" + (f"_sg{args.sem_gamma * 100:g}" if args.sem_gamma else "")
                      + steps("ss", args.sem_steps)
                      + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else ""))
+    if args.sem_double and (args.sem_double_beta > 0 or args.sem_double_gamma > 0):
+        parts.append("semd" + fmt_blocks(args.sem_double) + f"_b{args.sem_double_beta * 100:g}"
+                     + (f"_g{args.sem_double_gamma * 100:g}" if args.sem_double_gamma else ""))
     if not args.free_latent:
         parts.append("nofree")
     if args.free_context:
@@ -535,6 +545,23 @@ def main():
             module.set_processor(parallel_attn_proc)
 
     n_double, n_single = len(pipe.transformer.transformer_blocks), len(pipe.transformer.single_transformer_blocks)
+    # The MICE processors count their calls with the klein-4B block counts (5 double, 20 single) as module
+    # globals; set them to the loaded model's (e.g. klein 9B) so the per-block / per-step mask schedule holds.
+    # The default binding lists ("0,5" / "0,20" = every block of 4B) mean every block of the loaded model.
+    mice_attn_module.TRANSFORMER_NUM_LAYERS = n_double
+    mice_attn_module.TRANSFORMER_SINGLE_NUM_LAYERS = n_single
+    if args.hard_image_attribute_binding_list_double == list(range(5)):
+        args.hard_image_attribute_binding_list_double = list(range(n_double))
+    if args.hard_image_attribute_binding_list_single == list(range(20)):
+        args.hard_image_attribute_binding_list_single = list(range(n_single))
+    logger.info(f"Transformer: {n_double} double + {n_single} single blocks")
+    if (n_double, n_single) != (5, 20) and not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
+        # the other processors import the 4B counts by value, so the override above does not reach them
+        raise SystemExit("A non-4B transformer needs --attention_setting apitasmkernelnonlap")
+    if args.guidance_scale > 1.0 and not pipe.config.is_distilled:
+        # the hooks would also steer the unconditional pass, with u_k read at the conditional prompt's positions
+        raise SystemExit("Steering under CFG is not supported yet: use a distilled checkpoint or --guidance_scale 1")
+
     def resolve(blocks, n):
         return list(range(n)) if blocks == ["all"] else sorted({i % n for i in blocks})
 
@@ -551,7 +578,9 @@ def main():
                           src_gamma=args.src_gamma, src_beta=args.src_beta, src_steps=args.src_steps,
                           src_mode=args.src_mode, src_exclude=names("src"),
                           sem_lambda=args.sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
-                          sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)})
+                          sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)},
+                          sem_double=resolve(args.sem_double, n_double), sem_double_lambda=args.sem_double_beta,
+                          sem_double_gamma=args.sem_double_gamma)
     chunked = None
     if args.attn_chunk > 0:
         if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
