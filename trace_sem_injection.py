@@ -33,6 +33,7 @@ from infer_flux2_mice import load_pipeline
 from infer_flux2_steer import SEED, run_with_steer, coverage_masks, setup_transformer
 from flux2.attention import AttentionSetting
 from flux2.residual_steer import ResidualSteer
+from flux2.chunked_attention import ChunkedAttention
 
 
 def parse_args():
@@ -58,6 +59,11 @@ def parse_args():
                         help="Where the reference states are kept (default: the GPU; \"cpu\" if memory is short)")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--cpu_offload", action="store_true")
+    parser.add_argument("--multi_gpu", action="store_true",
+                        help="Split the transformer across the visible GPUs (as in infer_flux2_steer.py)")
+    parser.add_argument("--attn_chunk", type=int, default=0,
+                        help="Masked attention in query chunks of this many tokens (cuts the MICE mask's peak memory, "
+                             "keeps it on the right device with --multi_gpu), e.g. 1024. 0 = off")
     parser.add_argument("--num_inference_steps", type=int, default=4)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
 
@@ -84,6 +90,8 @@ def parse_args():
     parser.add_argument("--strict_masks", action="store_true")
     parser.add_argument("--cpu_noise", action="store_true")
     args = parser.parse_args()
+    if args.multi_gpu and args.cpu_offload:
+        parser.error("--cpu_offload cannot be combined with --multi_gpu")
 
     to_ints = lambda s: [int(x) for x in s.split(",")]
     args.measure_steps = to_ints(args.measure_steps)
@@ -218,7 +226,7 @@ def plot(summary: dict, keys_all: list, n_blocks: int, out_dir: Path, lam: float
 
 def main():
     args = parse_args()
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device or ("cuda:0" if args.multi_gpu else ("cuda" if torch.cuda.is_available() else "cpu"))
     name = args.exp_name or (f"lam{args.sem_lambda * 100:g}" + ("" if args.sem_ref == "diff" else f"_{args.sem_ref}")
                              + "_s" + "-".join(map(str, args.measure_steps))
                              + "_" + args.pretrained_model_name_or_path.rstrip("/").split("/")[-1])
@@ -232,7 +240,12 @@ def main():
     if args.cpu_offload:
         pipe.to("cpu")
         pipe.enable_model_cpu_offload(device=device)
-    _, attn_proc, parallel_attn_proc, n_double, n_single = setup_transformer(pipe, args)
+    attn_setting_enum, attn_proc, parallel_attn_proc, n_double, n_single = setup_transformer(pipe, args)
+    chunked = None
+    if args.attn_chunk > 0:
+        if not attn_setting_enum.value.lower().startswith("apitasmkernelnonlap"):
+            raise SystemExit("--attn_chunk needs --attention_setting apitasmkernelnonlap")
+        chunked = ChunkedAttention(args.attn_chunk)
     blocks = resolve_blocks(args.inject_blocks, n_double, n_single)
     from_step = min(args.measure_steps)
     keys = order(n_double, n_single, args.num_inference_steps, from_step)
@@ -267,7 +280,7 @@ def main():
                     if proc and hasattr(proc, "clear_cached_masks"):
                         proc.clear_cached_masks()
                 return run_with_steer(
-                    pipe, steer, None, sample, args.use_masks, {}, args.strict_masks,
+                    pipe, steer, chunked, sample, args.use_masks, {}, args.strict_masks,
                     image=image, prompt=sample["prompt"], height=h, width=w,
                     num_inference_steps=args.num_inference_steps, guidance_scale=args.guidance_scale,
                     prompt_settings=args.prompt_settings, attention_setting=args.attention_setting,
