@@ -27,6 +27,11 @@ per instance k and latent token t of k, three increments are computed from the s
             another stream's basis (an experiment, not the method).
             Δ_sem = (-sem_gamma min(d_t . u_k, 0) + sem_lambda |d_t|) u_k
 
+  background  (bg_eta > 0) the source term mirrored: background tokens turn TOWARD the context write at
+            their position, Δ_bg = bg_eta w(t) |d_t| s_t, with w(t) = 1 - exp(-max(δ(t) - margin, 0) / bg_tau)
+            from the token's distance δ(t) to the nearest instance token: 0 within the margin (left free to
+            adapt to the edit), rising to 1 away from the instances (bg_tau 0: a hard step at the margin).
+
 and combined with one rescale, so the terms only turn the write together and add no energy:
     D_t' = |d_t| normalize(d_t + Δ_ctc + Δ_src + Δ_sem) + mean_frame(D)
 
@@ -82,6 +87,10 @@ class ResidualSteer:
     sem_gamma: float = 0.0  # semantic: remove the source-word side
     sem_steps: list | None = None  # None = all
     sem_exclude: set = field(default_factory=set)  # single block names without the semantic term
+    bg_eta: float = 0.0  # background: turn background writes toward the context write
+    bg_margin: float = 2.0  # tokens around the instances left free
+    bg_tau: float = 2.0  # width (tokens) of the soft ramp after the margin; 0 = hard step
+    bg_steps: list | None = None  # None = all
     sem_double: list = field(default_factory=list)  # double block indices that also get the semantic term
     sem_double_lambda: float = 0.0  # its push in those blocks (u_k from the text stream's own update)
     sem_double_gamma: float = 0.0  # its source-side removal in those blocks
@@ -98,6 +107,7 @@ class ResidualSteer:
         self.masks = torch.stack([m.reshape(-1) > 0.5 for m in masks_2d]).to(device)  # [K, HW]
         self.mask_w = self.masks.float()
         self.pair_w = self._pair_weights(Ht, Wt)
+        self.bg_w = self._bg_weights(Ht, Wt)
         self._by_device = {}
         self.sigma, self.step_idx, self.img_len, self.factor = None, None, None, 0.0
 
@@ -107,6 +117,20 @@ class ResidualSteer:
             self._by_device[device] = (self.masks.to(device), self.mask_w.to(device),
                                        [w.to(device) for w in self.pair_w])
         return self._by_device[device]
+
+    def _bg_weights(self, Ht: int, Wt: int) -> torch.Tensor:
+        """[HW] background weight w(t): 0 on instance tokens and within bg_margin of them, then a soft ramp."""
+        inst = self.masks.any(dim=0)
+        if not bool(inst.any()):
+            return (~inst).float()
+        ys, xs = torch.meshgrid(torch.arange(Ht, device=inst.device), torch.arange(Wt, device=inst.device),
+                                indexing="ij")
+        coords = torch.stack([ys.reshape(-1), xs.reshape(-1)], dim=-1).float()
+        ci = coords[inst]
+        dist = torch.cat([torch.cdist(chunk, ci).min(dim=1).values for chunk in coords.split(1024)])  # 0 inside
+        over = (dist - self.bg_margin).clamp_min(0.0)
+        w = (over > 0).float() if self.bg_tau <= 0 else 1.0 - torch.exp(-over / self.bg_tau)
+        return w * (~inst).float()
 
     def _pair_weights(self, Ht: int, Wt: int) -> list:
         """Per instance k: [N_k, K] weight of every token of k toward every instance (0 for k itself)."""
@@ -156,7 +180,8 @@ class ResidualSteer:
                      or ((self.src_gamma > 0 or self.src_beta != 0) and self._in(self._src_steps()))
                      or ((self.sem_lambda > 0 or self.sem_gamma > 0) and self._in(self.sem_steps))
                      or ((self.sem_double_lambda > 0 or self.sem_double_gamma > 0) and bool(self.sem_double)
-                         and self._in(self.sem_steps))))
+                         and self._in(self.sem_steps))
+                     or (self.bg_eta > 0 and self._in(self.bg_steps))))
 
     def _edit(self, h_in: torch.Tensor, h_out: torch.Tensor, layer: str, stream: str = "lat",
               src: tuple | None = None, sem: torch.Tensor | None = None) -> torch.Tensor:
@@ -223,6 +248,15 @@ class ResidualSteer:
             if gamma != 0 or src_b != 0:
                 delta[:, inst] += -gamma * copy + src_b * (d[:, inst] - copy)
 
+            # background: turn toward the context write at the same position
+            if stream == "lat" and self.bg_eta > 0 and self._in(self.bg_steps):
+                bw = self.bg_w.to(d.device)
+                bg_on = bw > 0
+                eta = self.bg_eta * self.factor
+                delta[:, bg_on] += eta * bw[bg_on][None, :, None] * d[:, bg_on].norm(dim=-1, keepdim=True) \
+                    * s_dir[:, bg_on]
+                stat.update(bg_eta=eta, bg_cos=mean_on(cos_w, bg_on), bg_tokens=int(bg_on.sum()))
+
         # semantic
         if sem is not None:
             on = self._in(self.sem_steps) and layer not in self.sem_exclude
@@ -248,6 +282,8 @@ class ResidualSteer:
 
         # one rescale of the summed edit: the terms only turn the write together
         on = inst if stream == "lat" else cover > 0
+        if stream == "lat" and src is not None and self.bg_eta > 0 and self._in(self.bg_steps):
+            on = on | (self.bg_w.to(d.device) > 0)
         delta[:, on] = _rescale(d[:, on], d[:, on] + delta[:, on]) - d[:, on]
         stat["edit_rel"] = float(delta[0].norm(dim=-1).mean() / D[0].norm(dim=-1).mean().clamp_min(1e-12))
         self.stats.append(stat)

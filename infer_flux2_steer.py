@@ -129,6 +129,14 @@ def parse_args():
         parser.add_argument(f"--src_exclude_{kind}", type=str, default="",
                             help=f"{kind.capitalize()}-stream blocks without the source term (same syntax as "
                                  f"--exclude_{kind}); applied on top of --exclude_{kind}")
+    parser.add_argument("--bg_eta", type=float, default=0.0,
+                        help="Background preservation: turn the write of every background token toward the context "
+                             "write at its position (the source term mirrored), with the same rescale. 0 = off")
+    parser.add_argument("--bg_margin", type=float, default=2.0,
+                        help="Background tokens within this distance (tokens) of an instance are left free")
+    parser.add_argument("--bg_tau", type=float, default=2.0,
+                        help="Width (tokens) of the soft ramp from 0 to full strength after the margin; 0 = hard step")
+    parser.add_argument("--bg_steps", type=str, default="all", help="Steps for the background term, or \"all\"")
     parser.add_argument("--sem_lambda", type=float, default=0.0,
                         help="Instruction term, single blocks only (flux2/residual_steer.py): turn each instance "
                              "token's write toward u = (block's write to the target word) - (its write to the "
@@ -233,6 +241,7 @@ def parse_args():
     args.ortho_steps = None if args.ortho_steps == "all" else str2list(args.ortho_steps)
     args.log_attn_steps = None if args.log_attn_steps == "all" else str2list(args.log_attn_steps)
     args.sem_steps = None if args.sem_steps == "all" else str2list(args.sem_steps)
+    args.bg_steps = None if args.bg_steps == "all" else str2list(args.bg_steps)
     args.src_steps = (None if args.src_steps is None else
                       list(range(args.num_inference_steps)) if args.src_steps == "all" else str2list(args.src_steps))
     for key in ("exclude_double", "exclude_single", "alpha_exclude_double", "alpha_exclude_single",
@@ -299,6 +308,8 @@ def auto_exp_name(args) -> str:
                      + steps("ss", args.sem_steps)
                      + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else "")
                      + {"diff": "", "target": "_rtgt", "target_centred": "_rtgtc"}[args.sem_ref])
+    if args.bg_eta > 0:
+        parts.append(f"bg{args.bg_eta * 100:g}_m{args.bg_margin:g}_t{args.bg_tau:g}" + steps("bs", args.bg_steps))
     if args.sem_double and (args.sem_double_beta > 0 or args.sem_double_gamma > 0):
         parts.append("semd" + fmt_blocks(args.sem_double) + f"_b{args.sem_double_beta * 100:g}"
                      + (f"_g{args.sem_double_gamma * 100:g}" if args.sem_double_gamma else ""))
@@ -555,7 +566,9 @@ def main():
         # a flag added after the folder was made counts as unchanged while it is off
         diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys()
                 if old.get(k) != settings.get(k)
-                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) in ("token", "diff")))}
+                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) in ("token", "diff")
+                              # the background shape flags mean nothing while the term is off
+                              or (k.startswith("bg_") and not settings.get("bg_eta"))))}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
                              f"Use another --exp_name, or --overwrite to regenerate everything here.")
@@ -593,6 +606,7 @@ def main():
                           src_mode=args.src_mode, src_exclude=names("src"),
                           sem_lambda=args.sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
                           sem_ref=args.sem_ref,
+                          bg_eta=args.bg_eta, bg_margin=args.bg_margin, bg_tau=args.bg_tau, bg_steps=args.bg_steps,
                           sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)},
                           sem_double=resolve(args.sem_double, n_double), sem_double_lambda=args.sem_double_beta,
                           sem_double_gamma=args.sem_double_gamma)
