@@ -31,7 +31,7 @@ from flux2.transformer_flux2_klein import Flux2Attention, Flux2ParallelSelfAtten
 from flux2.attention import get_attention_processors, AttentionSetting
 from flux2.pipeline_utils import create_position_mask_list, resize_mask
 from flux2.residual_steer import ResidualSteer
-from flux2.sem_tokens import word_positions, _template
+from flux2.sem_tokens import word_positions, segment_spans, _template
 from flux2.diagnose import Diagnose
 from flux2.chunked_attention import ChunkedAttention
 from flux2.attention_mass import AttentionMass
@@ -137,6 +137,11 @@ def parse_args():
                         help="Instruction term: remove the part of each instance token's write pointing to the "
                              "source-word side (negative projection on u)")
     parser.add_argument("--sem_steps", type=str, default="all", help="Steps for the instruction term, or \"all\"")
+    parser.add_argument("--sem_ref", type=str, default="diff", choices=["diff", "target", "target_centred"],
+                        help="Direction of the instruction term: diff = target-word write minus source-word write "
+                             "(u_k); target = the target-word write alone; target_centred = the target-word write "
+                             "minus the mean write over its local prompt's tokens. Multi-token words: mean over "
+                             "their tokens")
     parser.add_argument("--sem_exclude_single", type=str, default="",
                         help="Single blocks without the instruction term (same syntax as --exclude_single)")
     parser.add_argument("--sem_double", type=str, default="",
@@ -292,7 +297,8 @@ def auto_exp_name(args) -> str:
     if args.sem_lambda > 0 or args.sem_gamma > 0:
         parts.append(f"sem{args.sem_lambda * 100:g}" + (f"_sg{args.sem_gamma * 100:g}" if args.sem_gamma else "")
                      + steps("ss", args.sem_steps)
-                     + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else ""))
+                     + ("_semexs" + fmt_blocks(args.sem_exclude_single) if args.sem_exclude_single else "")
+                     + {"diff": "", "target": "_rtgt", "target_centred": "_rtgtc"}[args.sem_ref])
     if args.sem_double and (args.sem_double_beta > 0 or args.sem_double_gamma > 0):
         parts.append("semd" + fmt_blocks(args.sem_double) + f"_b{args.sem_double_beta * 100:g}"
                      + (f"_g{args.sem_double_gamma * 100:g}" if args.sem_double_gamma else ""))
@@ -476,10 +482,11 @@ def run_with_steer(pipe, steer: ResidualSteer, chunked: ChunkedAttention | None,
     # source / target word positions of each local prompt, for the instruction term (and its stats)
     try:
         steer.sem_tokens = word_positions(pipe.tokenizer, sample["prompt"], sample["sources"], sample["targets"])
+        steer.sem_segments = segment_spans(pipe.tokenizer, sample["prompt"])
         fp["sem_tokens"] = steer.sem_tokens
     except Exception as e:
         logger.warning(f"Instruction term: word positions not found ({e}); off for this sample")
-        steer.sem_tokens = None
+        steer.sem_tokens = steer.sem_segments = None
     try:
         out = pipe(**pipe_kwargs)
         if torch.cuda.is_available():
@@ -548,7 +555,7 @@ def main():
         # a flag added after the folder was made counts as unchanged while it is off
         diff = {k: (old.get(k), settings.get(k)) for k in old.keys() | settings.keys()
                 if old.get(k) != settings.get(k)
-                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) == "token"))}
+                and not (k not in old and (settings.get(k) in (0, False, None, "", []) or settings.get(k) in ("token", "diff")))}
         if diff:
             raise SystemExit(f"{save_dir} was generated with different settings {diff} (old, new). "
                              f"Use another --exp_name, or --overwrite to regenerate everything here.")
@@ -585,6 +592,7 @@ def main():
                           src_gamma=args.src_gamma, src_beta=args.src_beta, src_steps=args.src_steps,
                           src_mode=args.src_mode, src_exclude=names("src"),
                           sem_lambda=args.sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
+                          sem_ref=args.sem_ref,
                           sem_exclude={f"single_{i}" for i in resolve(args.sem_exclude_single, n_single)},
                           sem_double=resolve(args.sem_double, n_double), sem_double_lambda=args.sem_double_beta,
                           sem_double_gamma=args.sem_double_gamma)

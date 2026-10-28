@@ -19,6 +19,16 @@ def _span_tokens(offsets, start: int, end: int) -> list:
     return [i for i, (a, b) in enumerate(offsets) if b > a and a < end and b > start]
 
 
+def segment_spans(tokenizer, prompt: str, seg_len: int = 200) -> list:
+    """Per local prompt k: (start, end) of its real (non-padding) tokens in the full text sequence."""
+    out = []
+    for k, content in enumerate(prompt.split("$BREAKFLAG$")[1:]):
+        n = len(tokenizer(_template(tokenizer, content), add_special_tokens=False)["input_ids"])
+        offset = seg_len * (k + 1)
+        out.append((offset, offset + min(n, seg_len)))
+    return out
+
+
 def word_positions(tokenizer, prompt: str, sources: list, targets: list, seg_len: int = 200) -> list:
     """Per instance k: (src_positions, tgt_positions) in the full text sequence, or None when either word
     is not found (or would be cut off by the segment length)."""

@@ -44,6 +44,8 @@ def parse_args():
                         help="Blocks to inject at, comma list of names: double_<i>, single_<i> (negative i counts "
                              "from the end), or double_all / single_all. One run per block and step")
     parser.add_argument("--sem_lambda", type=float, default=0.1, help="Strength of the one-block rotation")
+    parser.add_argument("--sem_ref", type=str, default="diff", choices=["diff", "target", "target_centred"],
+                        help="Direction, as in infer_flux2_steer.py")
 
     parser.add_argument("--dataset_root", type=str, default="../mice_bench")
     parser.add_argument("--output_dir", type=str, default="results_micebench")
@@ -153,7 +155,8 @@ class TracedSteer(ResidualSteer):
         return handles
 
 
-def make_steer(mode, from_step, reference, trace_device, n_double, n_single, step=None, block=None, lam=0.0):
+def make_steer(mode, from_step, reference, trace_device, n_double, n_single, step=None, block=None, lam=0.0,
+               sem_ref="diff"):
     """Only `block` is hooked by the steering (all others excluded), with the semantic term only, at `step`
     only, with strength exactly `lam` (power 0: no sigma factor). block None = no steering at all."""
     kind, idx = (block.rsplit("_", 1) if block else (None, None))
@@ -163,7 +166,7 @@ def make_steer(mode, from_step, reference, trace_device, n_double, n_single, ste
                        exclude_single=[i for i in range(n_single) if not (kind == "single" and i == idx)],
                        sem_lambda=lam if kind == "single" else 0.0, sem_steps=[step] if step is not None else [],
                        sem_double=[idx] if kind == "double" else [],
-                       sem_double_lambda=lam if kind == "double" else 0.0,
+                       sem_double_lambda=lam if kind == "double" else 0.0, sem_ref=sem_ref,
                        mode=mode, from_step=from_step, reference=reference, trace_device=trace_device)
 
 
@@ -216,7 +219,8 @@ def plot(summary: dict, keys_all: list, n_blocks: int, out_dir: Path, lam: float
 def main():
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    name = args.exp_name or (f"lam{args.sem_lambda * 100:g}_s" + "-".join(map(str, args.measure_steps))
+    name = args.exp_name or (f"lam{args.sem_lambda * 100:g}" + ("" if args.sem_ref == "diff" else f"_{args.sem_ref}")
+                             + "_s" + "-".join(map(str, args.measure_steps))
                              + "_" + args.pretrained_model_name_or_path.rstrip("/").split("/")[-1])
     save_dir = Path(args.output_dir) / f"trace_sem_{name}"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +298,7 @@ def main():
                     for b in blocks:
                         logger.info(f"[{sid}] inject {b} at step {s}")
                         st = make_steer("compare", from_step, reference, args.trace_device, n_double, n_single,
-                                        step=s, block=b, lam=args.sem_lambda)
+                                        step=s, block=b, lam=args.sem_lambda, sem_ref=args.sem_ref)
                         save_image(run(st), f"s{s}_{b}")
                         acted = [x for x in st.stats if x["layer"] == b and x["step"] == s]
                         record["runs"][str(s)][b] = dict(dist=st.dist, sem_cos_inst=(acted[0].get("sem_cos_inst")

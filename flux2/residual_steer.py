@@ -20,6 +20,8 @@ per instance k and latent token t of k, three increments are computed from the s
   semantic  single blocks only. In the single blocks text and image tokens share the residual stream,
             so the block's writes into the instance's own prompt words live in the same space:
             u_k = normalize(mean_{target words} D_text - mean_{source words} D_text)
+            (sem_ref "target": normalize(mean_{target words} D_text); "target_centred": the same minus the
+            mean D_text over the local prompt's real tokens)
             Optionally also in the double blocks in sem_double (own strengths sem_double_lambda / _gamma), with
             D_text the text stream's update there: text has separate weights in those blocks, so u_k comes from
             another stream's basis (an experiment, not the method).
@@ -84,6 +86,9 @@ class ResidualSteer:
     sem_double_lambda: float = 0.0  # its push in those blocks (u_k from the text stream's own update)
     sem_double_gamma: float = 0.0  # its source-side removal in those blocks
     sem_tokens: list | None = None  # per instance (src positions, tgt positions) in the text sequence, or None
+    sem_ref: str = "diff"  # direction: "diff" target - source words; "target" target words; "target_centred"
+    #                        target words minus the mean of their local prompt's tokens (sem_segments)
+    sem_segments: list | None = None  # per instance (start, end) of its local prompt's real tokens
     stats: list = field(default_factory=list)
 
     def setup(self, masks_2d: list[torch.Tensor], device):
@@ -265,10 +270,19 @@ class ResidualSteer:
                 self._sem_contrast.append(float("nan"))
                 continue
             d_src = Dt[:, pos[0]].mean(dim=1)
-            d_tgt = Dt[:, pos[1]].mean(dim=1)
+            d_tgt = Dt[:, pos[1]].mean(dim=1)  # mean over all tokens of the target word(s)
             diff = d_tgt - d_src
             self._sem_contrast.append(float(diff[0].norm() / d_tgt[0].norm().clamp_min(1e-12)))
-            U[:, k] = F.normalize(diff, dim=-1)
+            if self.sem_ref == "diff":
+                ref = diff
+            elif self.sem_ref == "target":
+                ref = d_tgt
+            else:  # target_centred: minus what the block writes into every token of this prompt
+                seg = self.sem_segments[k] if self.sem_segments else None
+                if seg is None or seg[1] > s:
+                    continue
+                ref = d_tgt - Dt[:, seg[0]:seg[1]].mean(dim=1)
+            U[:, k] = F.normalize(ref, dim=-1)
         return U
 
     def _edit_stream(self, h_in, h_out, s: int, layer: str, text_upd: torch.Tensor | None = None):
