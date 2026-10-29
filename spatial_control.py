@@ -45,20 +45,13 @@ GREEN = (88, 190, 120)
 GREY = (150, 150, 150)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Spatial control gallery: steer a chosen subset of instances.")
+def common_parser(description: str) -> argparse.ArgumentParser:
+    """Sample, steering and MICE arguments shared with scale_control.py."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument("--dataset", type=str, default="mice", choices=["mice", "lomoe"])
     parser.add_argument("--dataset_root", type=str, default="../mice_bench", help="MICE-Bench root (--dataset mice)")
     parser.add_argument("--sample_id", type=str, required=True)
-    parser.add_argument("--subsets", type=str, default=None,
-                        help="Explicit subsets of instance indices, e.g. \"0,1;1,2;0\" (default: random)")
-    parser.add_argument("--subset_sizes", type=str, default="half",
-                        help="\"half\": --num_subsets random halves of the instances, each followed by its "
-                             "complement; or a comma list of subset sizes (clipped to the instance count; "
-                             "duplicates skipped)")
-    parser.add_argument("--num_subsets", type=int, default=6, help="Number of subsets with --subset_sizes half")
-    parser.add_argument("--subset_seed", type=int, default=0)
 
     # steering of the selected instances (same meaning as infer_flux2_steer.py)
     parser.add_argument("--sem_lambda", type=float, default=0.5)
@@ -109,6 +102,11 @@ def parse_args():
     parser.add_argument("--mask_cover", type=float, default=0.0)
     parser.add_argument("--strict_masks", action="store_true")
     parser.add_argument("--cpu_noise", action="store_true")
+    return parser
+
+
+def finish_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    """Parses and resolves the step lists and binding ranges."""
     args = parser.parse_args()
     if args.multi_gpu and args.cpu_offload:
         parser.error("--cpu_offload cannot be combined with --multi_gpu")
@@ -122,6 +120,21 @@ def parse_args():
         key = f"hard_image_attribute_binding_list_{kind}"
         parts = to_ints(getattr(args, key))
         setattr(args, key, list(range(parts[0], parts[1])) if len(parts) >= 2 else [])
+    return args
+
+
+def parse_args():
+    parser = common_parser("Spatial control gallery: steer a chosen subset of instances.")
+    parser.add_argument("--subsets", type=str, default=None,
+                        help="Explicit subsets of instance indices, e.g. \"0,1;1,2;0\" (default: random)")
+    parser.add_argument("--subset_sizes", type=str, default="half",
+                        help="\"half\": --num_subsets random halves of the instances, each followed by its "
+                             "complement; or a comma list of subset sizes (clipped to the instance count; "
+                             "duplicates skipped)")
+    parser.add_argument("--num_subsets", type=int, default=6, help="Number of subsets with --subset_sizes half")
+    parser.add_argument("--subset_seed", type=int, default=0)
+    args = finish_args(parser)
+    to_ints = lambda s: [int(x) for x in s.split(",")]
     if args.subset_sizes != "half":
         args.subset_sizes = to_ints(args.subset_sizes)
     if args.subsets is not None:
@@ -206,12 +219,14 @@ def target_map(image: Image.Image, masks: list, selected: list, alpha: float = 0
 
 
 def gallery(columns: list, path: Path, cell: int = 384):
-    """columns: (title, top image, bottom image). Maps (the source for the baseline) on the top row, edits below."""
+    """columns: (title, top image, bottom image or None). Maps (the source for the baseline) on the top row,
+    edits below; one row if no column has a bottom image."""
     w0, h0 = columns[0][1].size
     cw, ch = cell, round(cell * h0 / w0)
     pad, title_h = 8, 22
+    rows = 2 if any(c[2] is not None for c in columns) else 1
     W = len(columns) * (cw + pad) + pad
-    H = title_h + 2 * (ch + pad) + pad
+    H = title_h + rows * (ch + pad) + pad
     sheet = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(sheet)
     for i, (title, top, bottom) in enumerate(columns):
@@ -223,10 +238,7 @@ def gallery(columns: list, path: Path, cell: int = 384):
     sheet.save(path)
 
 
-def main():
-    args = parse_args()
-    device = args.device or ("cuda:0" if args.multi_gpu else ("cuda" if torch.cuda.is_available() else "cpu"))
-
+def load_sample(args) -> dict:
     if args.dataset == "mice":
         ds = MiceBenchDataset(root_dir=args.dataset_root, target_size=1024)
     else:
@@ -234,29 +246,26 @@ def main():
         ds = LoMOEDataset(target_size=1024)
     if args.sample_id not in ds.sorted_ids:
         raise SystemExit(f"sample {args.sample_id} not in the {args.dataset} dataset")
-    sample = ds[ds.sorted_ids.index(args.sample_id)]
-    K = len(sample["masks"])
-    subsets = args.subsets or pick_subsets(K, args.subset_sizes, args.subset_seed, args.num_subsets)
-    bad = [s for s in subsets if not s or min(s) < 0 or max(s) >= K]
-    if bad:
-        raise SystemExit(f"subsets {bad} out of range for {K} instances")
+    return ds[ds.sorted_ids.index(args.sample_id)]
 
-    tag = args.exp_name or (f"sem{args.sem_lambda * 100:g}_{args.sem_ref}_sb{args.src_beta * 100:g}"
-                            + (f"_sg{args.src_gamma * 100:g}" if args.src_gamma else "")
-                            + f"_keep{args.keep_eta * 100:g}_"
-                            + args.pretrained_model_name_or_path.rstrip("/").split("/")[-1])
+
+def output_dir(args, kind: str, tag: str) -> Path:
     bench = Path(args.dataset_root).name if args.dataset == "mice" else "lomoe"  # e.g. mice_bench / lomoe_bench
-    save_dir = Path(args.output_dir) / f"spatial_{bench}_{args.sample_id}_{tag}"
+    save_dir = Path(args.output_dir) / f"{kind}_{bench}_{args.sample_id}_{args.exp_name or tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
-    local_prompts = sample["prompt"].split("$BREAKFLAG$")[1:]
-    with open(save_dir / "combos.json", "w") as f:
-        json.dump(dict(args=vars(args), instances=[dict(index=k, prompt=p, source=s, target=t) for k, (p, s, t)
-                                                   in enumerate(zip(local_prompts, sample["sources"],
-                                                                    sample["targets"]))],
-                       subsets=subsets), f, indent=2)
-    logger.info(f"{K} instances: " + " | ".join(f"{k}: {p}" for k, p in enumerate(local_prompts)))
-    logger.info(f"subsets: {subsets}; results in {save_dir}")
+    return save_dir
 
+
+def instances(sample) -> list:
+    local_prompts = sample["prompt"].split("$BREAKFLAG$")[1:]
+    return [dict(index=k, prompt=p, source=s, target=t)
+            for k, (p, s, t) in enumerate(zip(local_prompts, sample["sources"], sample["targets"]))]
+
+
+def prepare(args, sample):
+    """Loads the pipeline. Returns run(steer, path) -> the image at the original size (cached in `path`
+    unless --overwrite) and make_steer(selected, sem_lambda, sem_double_lambda) -> SpatialSteer."""
+    device = args.device or ("cuda:0" if args.multi_gpu else ("cuda" if torch.cuda.is_available() else "cpu"))
     pipe = load_pipeline(args, device)
     if args.cpu_offload:
         pipe.to("cpu")
@@ -281,7 +290,7 @@ def main():
         kwargs["instance_bboxes_xyxy_normalized"] = sample["bboxes"]
     size = tuple(sample["original_size"])
 
-    def run(steer):
+    def generate(steer):
         for proc in (attn_proc, parallel_attn_proc):
             if proc and hasattr(proc, "clear_cached_masks"):
                 proc.clear_cached_masks()
@@ -301,27 +310,54 @@ def main():
         torch.cuda.empty_cache()
         return out.resize(size, resample=Image.LANCZOS)
 
-    def cached(path: Path, make):
+    def run(steer, path: Path) -> Image.Image:
         if path.exists() and not args.overwrite:
             return Image.open(path).convert("RGB")
-        img = make()
+        img = generate(steer)
         img.save(path)
         return img
 
-    source = image.resize(size, resample=Image.LANCZOS)
+    def make_steer(selected, sem_lambda, sem_double_lambda) -> SpatialSteer:
+        return SpatialSteer(alpha=0.0, beta=0.0, power=args.power, steps=[], selected=list(selected),
+                            src_beta=args.src_beta, src_gamma=args.src_gamma, src_steps=args.src_steps,
+                            sem_lambda=sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
+                            sem_ref=args.sem_ref, sem_double=sem_double, sem_double_lambda=sem_double_lambda,
+                            keep_eta=args.keep_eta, keep_steps=args.keep_steps)
+
+    return run, make_steer
+
+
+def no_steering() -> ResidualSteer:
+    return ResidualSteer(alpha=0.0, beta=0.0, steps=[])
+
+
+def main():
+    args = parse_args()
+    sample = load_sample(args)
+    K = len(sample["masks"])
+    subsets = args.subsets or pick_subsets(K, args.subset_sizes, args.subset_seed, args.num_subsets)
+    bad = [s for s in subsets if not s or min(s) < 0 or max(s) >= K]
+    if bad:
+        raise SystemExit(f"subsets {bad} out of range for {K} instances")
+
+    tag = (f"sem{args.sem_lambda * 100:g}_{args.sem_ref}_sb{args.src_beta * 100:g}"
+           + (f"_sg{args.src_gamma * 100:g}" if args.src_gamma else "")
+           + f"_keep{args.keep_eta * 100:g}_" + args.pretrained_model_name_or_path.rstrip("/").split("/")[-1])
+    save_dir = output_dir(args, "spatial", tag)
+    with open(save_dir / "combos.json", "w") as f:
+        json.dump(dict(args=vars(args), instances=instances(sample), subsets=subsets), f, indent=2)
+    logger.info(f"{K} instances: " + " | ".join(f"{x['index']}: {x['prompt']}" for x in instances(sample)))
+    logger.info(f"subsets: {subsets}; results in {save_dir}")
+
+    run, make_steer = prepare(args, sample)
+    source = sample["image"].resize(tuple(sample["original_size"]), resample=Image.LANCZOS)
     source.save(save_dir / "source.png")
     logger.info("baseline (no steering)")
-    baseline = cached(save_dir / "baseline.png", lambda: run(ResidualSteer(alpha=0.0, beta=0.0, steps=[])))
-    columns = [("source / no steering", source, baseline)]
+    columns = [("source / no steering", source, run(no_steering(), save_dir / "baseline.png"))]
     for i, sel in enumerate(subsets):
         name = f"combo{i}_" + "-".join(map(str, sel))
         logger.info(f"{name}: steering {[sample['targets'][k] for k in sel]}")
-        steer = SpatialSteer(alpha=0.0, beta=0.0, power=args.power, steps=[], selected=sel,
-                             src_beta=args.src_beta, src_gamma=args.src_gamma, src_steps=args.src_steps,
-                             sem_lambda=args.sem_lambda, sem_gamma=args.sem_gamma, sem_steps=args.sem_steps,
-                             sem_ref=args.sem_ref, sem_double=sem_double, sem_double_lambda=args.sem_double_lambda,
-                             keep_eta=args.keep_eta, keep_steps=args.keep_steps)
-        edit = cached(save_dir / f"{name}.png", lambda: run(steer))
+        edit = run(make_steer(sel, args.sem_lambda, args.sem_double_lambda), save_dir / f"{name}.png")
         tmap = target_map(source, sample["masks"], sel)
         tmap.save(save_dir / f"{name}_map.png")
         columns.append((f"edit instances {', '.join(map(str, sel))}", tmap, edit))  # prompts: combos.json
