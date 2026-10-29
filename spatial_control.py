@@ -10,10 +10,10 @@ the instances is selected:
 The contact and background terms are off.
 
 Runs: one baseline without any steering, then one run per subset. Subsets are --subsets, or random distinct
-ones with the sizes in --subset_sizes (default 2,2,2,1,3: for three instances, all three pairs, one single
-and all three).
+ones: by default (--subset_sizes half) --num_subsets of them, in complementary pairs, each editing half of
+the instances (a random half, then the other half); or with explicit sizes, e.g. --subset_sizes 2,2,2,1,3.
 
-Outputs in <output_dir>/spatial_<dataset>_<id>_<tag>/:
+Outputs in <output_dir>/spatial_<benchmark folder>_<id>_<tag>/:
     source.png, baseline.png
     combo<i>_<ids>.png         the edit with instances <ids> selected
     combo<i>_<ids>_map.png     the target map: selected instances light green, unselected light grey
@@ -53,8 +53,11 @@ def parse_args():
     parser.add_argument("--sample_id", type=str, required=True)
     parser.add_argument("--subsets", type=str, default=None,
                         help="Explicit subsets of instance indices, e.g. \"0,1;1,2;0\" (default: random)")
-    parser.add_argument("--subset_sizes", type=str, default="2,2,2,1,3",
-                        help="Sizes of the random subsets (clipped to the instance count; duplicates skipped)")
+    parser.add_argument("--subset_sizes", type=str, default="half",
+                        help="\"half\": --num_subsets random halves of the instances, each followed by its "
+                             "complement; or a comma list of subset sizes (clipped to the instance count; "
+                             "duplicates skipped)")
+    parser.add_argument("--num_subsets", type=int, default=6, help="Number of subsets with --subset_sizes half")
     parser.add_argument("--subset_seed", type=int, default=0)
 
     # steering of the selected instances (same meaning as infer_flux2_steer.py)
@@ -119,7 +122,8 @@ def parse_args():
         key = f"hard_image_attribute_binding_list_{kind}"
         parts = to_ints(getattr(args, key))
         setattr(args, key, list(range(parts[0], parts[1])) if len(parts) >= 2 else [])
-    args.subset_sizes = to_ints(args.subset_sizes)
+    if args.subset_sizes != "half":
+        args.subset_sizes = to_ints(args.subset_sizes)
     if args.subsets is not None:
         args.subsets = [sorted(set(to_ints(s))) for s in args.subsets.split(";") if s.strip()]
     return args
@@ -164,9 +168,23 @@ class SpatialSteer(ResidualSteer):
         return out
 
 
-def pick_subsets(k: int, sizes: list, seed: int) -> list:
+def pick_subsets(k: int, sizes, seed: int, num: int = 6) -> list:
+    """Random distinct subsets of range(k). sizes "half": num subsets in complementary pairs, a random half
+    (rounded up and down in turn for odd k) followed by the other half."""
     rng = random.Random(seed)
     out = []
+    if sizes == "half":
+        halves = [list(c) for n in sorted({k // 2, (k + 1) // 2}) if n > 0
+                  for c in itertools.combinations(range(k), n)]
+        rng.shuffle(halves)
+        for sel in halves:
+            rest = [i for i in range(k) if i not in sel]
+            if len(out) >= num:
+                break
+            if sel in out or not rest:
+                continue
+            out += [sel, rest][:num - len(out)]
+        return out
     for size in sizes:
         size = min(max(size, 1), k)
         left = [list(c) for c in itertools.combinations(range(k), size) if list(c) not in out]
@@ -218,7 +236,7 @@ def main():
         raise SystemExit(f"sample {args.sample_id} not in the {args.dataset} dataset")
     sample = ds[ds.sorted_ids.index(args.sample_id)]
     K = len(sample["masks"])
-    subsets = args.subsets or pick_subsets(K, args.subset_sizes, args.subset_seed)
+    subsets = args.subsets or pick_subsets(K, args.subset_sizes, args.subset_seed, args.num_subsets)
     bad = [s for s in subsets if not s or min(s) < 0 or max(s) >= K]
     if bad:
         raise SystemExit(f"subsets {bad} out of range for {K} instances")
@@ -227,7 +245,8 @@ def main():
                             + (f"_sg{args.src_gamma * 100:g}" if args.src_gamma else "")
                             + f"_keep{args.keep_eta * 100:g}_"
                             + args.pretrained_model_name_or_path.rstrip("/").split("/")[-1])
-    save_dir = Path(args.output_dir) / f"spatial_{args.dataset}_{args.sample_id}_{tag}"
+    bench = Path(args.dataset_root).name if args.dataset == "mice" else "lomoe"  # e.g. mice_bench / lomoe_bench
+    save_dir = Path(args.output_dir) / f"spatial_{bench}_{args.sample_id}_{tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
     local_prompts = sample["prompt"].split("$BREAKFLAG$")[1:]
     with open(save_dir / "combos.json", "w") as f:
@@ -305,7 +324,7 @@ def main():
         edit = cached(save_dir / f"{name}.png", lambda: run(steer))
         tmap = target_map(source, sample["masks"], sel)
         tmap.save(save_dir / f"{name}_map.png")
-        columns.append((f"edit {', '.join(sample['targets'][k] for k in sel)}", tmap, edit))
+        columns.append((f"edit instances {', '.join(map(str, sel))}", tmap, edit))  # prompts: combos.json
     gallery(columns, save_dir / "gallery.png")
     logger.info(f"Saved gallery.png and {len(subsets)} combos to {save_dir}")
 
