@@ -34,6 +34,8 @@ so the figures can be rebuilt from the caches alone. Figures in --out:
                            step (mean over single blocks). Same norm + different angles = a direction problem
     outcome_trajectory.png every instance in the angle plane (ang_src, ang_ins), one point per step and block
                            type (double / single mean), thick = group mean; right: norm_rel along the same path
+    outcome_timeline.png   all four steps concatenated on one axis for the L-C / L-T / L-W d' and the direction
+                           metrics; left edited vs failed, right failed - edited (+-1 SE): where the gap appears
     outcome_instances.csv  every capture's rows plus changed_ratio
     The log prints edited vs failed and the within-sample difference failed - edited over the samples that have
     both, so a few hard images cannot drive the pooled gap.
@@ -229,6 +231,7 @@ def main():
               f"({n['edited']} edited, {n['failed']} failed; attempt rate {n['edited'] / max(len(group), 1):.2f})")
     plot(rows, blocks, steps, sigmas, insts, outcome, out, args)
     plot_direction(rows, blocks, steps, sigmas, insts_tok, outcome, out, args)
+    plot_timeline(rows, blocks, steps, sigmas, insts, insts_tok, outcome, out)
     summary(rows, insts, insts_tok, outcome, recs)
 
 
@@ -388,6 +391,62 @@ def plot_direction(rows, blocks, steps, sigmas, insts, outcome, out, args):
     fig.suptitle("Where the updates of edited and failed instances point, step by step", fontsize=10, color=INK,
                  x=0.01, ha="left")
     fig.savefig(out / "outcome_trajectory.png", dpi=150)
+    plt.close(fig)
+
+
+# rows of outcome_timeline.png: (kind, pair, label); kind "token" uses the direction instances
+TIMELINE = (("residual", "L-C", "d' latent ↔ own context, update"), ("state", "L-C", "d' latent ↔ own context, state"),
+            ("state", "L-T", "d' latent ↔ own instruction, state"), ("state", "L-W", "d' latent ↔ own target word, state"),
+            ("token", "ang_src", "angle to the source write ŝ (deg)"), ("token", "ang_ins", "angle to the target word u_k (deg)"),
+            ("token", "norm_rel", "update size |d| / frame mean"))
+
+
+def plot_timeline(rows, blocks, steps, sigmas, insts, insts_tok, outcome, out):
+    """All steps concatenated on one axis (step 0 blocks, then step 1 blocks, ...). Left: edited vs failed;
+    right: failed - edited with +-1 SE (both groups' SE combined), so the sign and where it appears read off
+    directly."""
+    nb = len(blocks)
+    x = list(range(len(steps) * nb))
+    n_double = sum(b.startswith("double") for b in blocks)
+    fig, axes = plt.subplots(len(TIMELINE), 2, figsize=(24, 2.5 * len(TIMELINE)), constrained_layout=True,
+                             sharex=True)
+    for r, (kind, pair, label) in enumerate(TIMELINE):
+        group = insts_tok if kind == "token" else insts
+        c = curve(rows, kind, pair, blocks, group, steps).reshape(len(group), -1)  # [I, steps * blocks]
+        idx = {o: [j for j, i in enumerate(group) if outcome[i] == o] for o in OUTCOME_COLORS}
+        for o in OUTCOME_COLORS:
+            band(axes[r, 0], x, c, idx[o], o)
+        if idx["edited"] and idx["failed"]:
+            m = {o: c[idx[o]].mean(0) for o in idx}
+            se = {o: c[idx[o]].std(0) / math.sqrt(len(idx[o])) if len(idx[o]) > 1 else torch.zeros(len(x))
+                  for o in idx}
+            dm, ds = m["failed"] - m["edited"], (se["failed"] ** 2 + se["edited"] ** 2).sqrt()
+            ax = axes[r, 1]
+            ax.fill_between(x, dm - ds, dm + ds, color=INK, alpha=0.12, lw=0)
+            ax.plot(x, dm, color=INK, lw=1.8)
+            ax.axhline(0, color=MUTED, lw=0.9)
+        axes[r, 0].set_title(label, fontsize=9, color=INK, loc="left")
+        axes[r, 1].set_title(f"failed − edited: {label}", fontsize=9, color=INK, loc="left")
+        for ax in axes[r]:
+            for i, s in enumerate(steps):
+                ax.axvline(i * nb - 0.5, color=INK, lw=0.9)
+                ax.axvline(i * nb + n_double - 0.5, color=MUTED, lw=0.7, ls=":")
+            ax.tick_params(labelsize=7)
+            ax.grid(axis="y", color="#e4e3df", lw=0.6)
+            for sp in ("top", "right"):
+                ax.spines[sp].set_visible(False)
+    ticks = [i * nb + j for i in range(len(steps)) for j in (0, n_double, n_double + 5, n_double + 10, n_double + 15)
+             if j < nb]
+    for ax in axes[-1]:
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{blocks[t % nb].replace('double_', 'd').replace('single_', 's')}" +
+                            (f"\nstep {steps[t // nb]} σ={sigmas[steps[t // nb]]:.2f}" if t % nb == 0 else "")
+                            for t in ticks], fontsize=7)
+    axes[0, 0].legend(fontsize=8, frameon=False, loc="upper right")
+    fig.suptitle("All four steps concatenated (solid lines: step boundaries, dotted: double → single). "
+                 "Right column: where the failed instances separate from the edited ones, and with which sign",
+                 fontsize=10, color=INK, x=0.01, ha="left")
+    fig.savefig(out / "outcome_timeline.png", dpi=130)
     plt.close(fig)
 
 
