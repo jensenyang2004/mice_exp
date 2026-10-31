@@ -13,6 +13,8 @@ image + the kept masks + a LoMOE.json with only those instances):
            (--sem_lambda, no rescale) each on its own scale
 
     python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16
+    python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16 --all_instances
+        (grid and ins with every instance edited: grid_all.png, ins_all.png; same folder, no clash)
     python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16 --pairs_only
         (lists the touching pairs and exits)
 
@@ -190,6 +192,8 @@ def main():
     p.add_argument("--out", type=str, required=True)
     p.add_argument("--what", type=str, default="grid,sep,ins", help="Comma list of grid, sep, ins")
     p.add_argument("--instance", type=int, default=None, help="Instance for grid and ins (default: the largest)")
+    p.add_argument("--all_instances", action="store_true",
+                   help="grid and ins on the full sample (every instance edited, contact term active), not cropped")
     p.add_argument("--pair", type=str, default=None, help="i,j for sep (default: the longest contact)")
     p.add_argument("--pairs_only", action="store_true", help="List the touching pairs and exit")
     p.add_argument("--grid_src", type=str, default="0,0.5,1,2,4", help="Factors on rot_src (rows)")
@@ -219,7 +223,12 @@ def main():
     what = set(args.what.split(","))
     if args.plot_only:
         args.dry_run = True
-    one = sub_bench(bench, sid, [inst], out / f"bench_{sid}_{inst}")
+    keep = list(range(len(masks))) if args.all_instances else [inst]
+    tag = "all" if args.all_instances else str(inst)
+    one = sub_bench(bench, sid, keep, out / f"bench_{sid}_{tag}")
+    one_box = None if args.no_crop or args.all_instances else crop_box([masks[inst]])
+    what_inst = "all instances" if args.all_instances else f"instance {inst} ({names[inst]})"
+    sfx = "_all" if args.all_instances else ""
     source = one / d["image_path"]
     all_stats = {}
 
@@ -233,14 +242,14 @@ def main():
         cells = {}
         for r, a in enumerate(fr):
             for c, b in enumerate(fu):
-                exp = f"str_grid_{sid}_{inst}_r{a:g}_u{b:g}"
+                exp = f"str_grid_{sid}_{tag}_r{a:g}_u{b:g}"
                 cells[r, c] = cell(run(args, "infer_flux2_rotate.py",
                                        rot_flags(D["ctc"], D["src"] * a, D["bg"], D["ins"] * b), exp, one))
         montage(cells, [f"reference ×{a:g}\n(κ_r={D['src'] * a:g})" for a in fr],
                 [f"instruction ×{b:g} (κ_u={D['ins'] * b:g})" for b in fu],
-                f"Sample {sid}, instance {inst} ({names[inst]}): reference strength (rows) × instruction strength "
-                f"(columns); contact {D['ctc']}, background {D['bg']}", out / "grid.png",
-                None if args.no_crop else crop_box([masks[inst]]), source, all_stats)
+                f"Sample {sid}, {what_inst}: reference strength (rows) × instruction strength "
+                f"(columns); contact {D['ctc']}, background {D['bg']}", out / f"grid{sfx}.png",
+                one_box, source, all_stats)
     if "sep" in what:
         if pair is None:
             print("sep: no touching pair in this sample, skipped")
@@ -258,18 +267,18 @@ def main():
         cells = {}
         for c, v in enumerate(vr):
             cells[0, c] = cell(run(args, "infer_flux2_rotate.py", rot_flags(0, 0, 0, v),
-                                   f"str_insrot_{sid}_{inst}_{v:g}", one))
+                                   f"str_insrot_{sid}_{tag}_{v:g}", one))
         for c, v in enumerate(va):
             cells[1, c] = cell(run(args, "infer_flux2_additive.py",
                                    ["--ortho_alpha", "0", "--sem_lambda", f"{v:g}", "--sem_double_beta", f"{v:g}"],
-                                   f"str_insadd_{sid}_{inst}_{v:g}", one))
+                                   f"str_insadd_{sid}_{tag}_{v:g}", one))
         n = max(len(vr), len(va))
         montage(cells, ["rotation\n(κ_u: " + ", ".join(f"{v:g}" for v in vr) + ")",
                         "additive\n(λ: " + ", ".join(f"{v:g}" for v in va) + ")"],
                 [f"strength {i + 1}" for i in range(n)],
-                f"Sample {sid}, instance {inst} ({names[inst]}): instruction term only, each method on its own "
-                f"scale", out / "ins.png", None if args.no_crop else crop_box([masks[inst]]), source, all_stats)
-    json.dump(all_stats, open(out / "stats.json", "w"), indent=1)
+                f"Sample {sid}, {what_inst}: instruction term only, each method on its own "
+                f"scale", out / f"ins{sfx}.png", one_box, source, all_stats)
+    json.dump(all_stats, open(out / f"stats{sfx}.json", "w"), indent=1)
 
 
 if __name__ == "__main__":
