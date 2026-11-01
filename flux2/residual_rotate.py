@@ -21,6 +21,9 @@ and applied with the sphere's exponential map:
 g_j, s_t (token mode), u_k, w_kj(t), omega(t), the token sets and the per-term steps / excluded blocks are
 ResidualSteer's (contact uses alpha_exclude). The ResidualSteer strengths (alpha, beta, src_gamma, ...) are unused.
 
+centre=False (ablation): no frame mean is split off. d_t = D_t (and the context write s_t is not centred either), so
+the whole update is turned, D'_t = |D_t| (cos|v| D^ + sin|v| n(v)); the anchors g_j come from the uncentred updates.
+
 Stats per block: turn_inst / turn_bg = mean rotation (deg) on instance / steered background tokens, capped =
 fraction of tokens at max_turn, and per term the mean |theta| (deg) over the tokens it acts on; plus the
 pre-edit cosines of ResidualSteer (src_cos_*, bg_cos, sem_cos_inst) for comparison with its runs.
@@ -56,6 +59,7 @@ class ResidualRotate(ResidualSteer):
     rot_ins_double: float = 0.0  # instruction in the sem_double blocks
     sigma_terms: tuple = ("ctc", "src", "bg")  # terms whose angle is multiplied by the step factor
     max_turn: float = math.pi / 2
+    centre: bool = True  # split off the frame mean and turn only d_t (False: turn the whole update)
 
     def _f(self, term: str) -> float:
         return self.factor if term in self.sigma_terms else 1.0
@@ -78,7 +82,7 @@ class ResidualRotate(ResidualSteer):
         inst = masks.any(dim=0)
         hi, ho = h_in.float(), h_out.float()
         D = ho - hi
-        mean = D.mean(dim=1, keepdim=True)
+        mean = D.mean(dim=1, keepdim=True) if self.centre else torch.zeros_like(D[:, :1])
         d = D - mean
         norm = d.norm(dim=-1, keepdim=True)
         dh = d / norm.clamp_min(1e-12)
@@ -109,7 +113,7 @@ class ResidualRotate(ResidualSteer):
         # source (instance tokens, away) and background (toward): one signed field along the context write
         if src is not None:
             sD = src[0].float()
-            s_dir = F.normalize(sD - sD.mean(dim=1, keepdim=True), dim=-1)
+            s_dir = F.normalize(sD - sD.mean(dim=1, keepdim=True) if self.centre else sD, dim=-1)
             cs = (dh * s_dir).sum(-1, keepdim=True)  # [B, HW, 1]
             mean_on = lambda x, m: float(x[0, m].mean()) if bool(m.any()) else float("nan")
             stat.update(src_cos_inst=mean_on(cs, inst), src_cos_bg=mean_on(cs, ~inst))

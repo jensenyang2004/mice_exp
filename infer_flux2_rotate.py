@@ -41,6 +41,8 @@ def rotate_parser() -> argparse.ArgumentParser:
                    help="Terms whose angle is multiplied by the step factor (--ortho_schedule / --ortho_power): "
                         "comma list of ctc,src,bg,ins, or \"none\"")
     p.add_argument("--rot_max_turn", type=float, default=90.0, help="Cap on the total rotation per token (deg)")
+    p.add_argument("--rot_no_centre", action="store_true",
+                   help="Ablation: turn the whole update, frame mean included (anchors uncentred too)")
     return p
 
 
@@ -62,7 +64,7 @@ def parse_args():
         setattr(args, k, v)
     base.ResidualSteer = partial(ResidualRotate, rot_ctc=rot.rot_ctc, rot_src=rot.rot_src, rot_bg=rot.rot_bg,
                                  rot_ins=rot.rot_ins, rot_ins_double=rot.rot_ins_double, sigma_terms=terms,
-                                 max_turn=rot.rot_max_turn * 3.141592653589793 / 180)
+                                 max_turn=rot.rot_max_turn * 3.141592653589793 / 180, centre=not rot.rot_no_centre)
     return args
 
 
@@ -71,7 +73,8 @@ def auto_exp_name(args) -> str:
     tag = (f"ROT_c{args.rot_ctc * 100:g}_s{args.rot_src * 100:g}_b{args.rot_bg * 100:g}"
            f"_i{args.rot_ins * 100:g}_id{args.rot_ins_double * 100:g}"
            f"_sig{'-'.join(args.rot_sigma_terms) or 'none'}"
-           + (f"_cap{args.rot_max_turn:g}" if args.rot_max_turn != 90.0 else ""))
+           + (f"_cap{args.rot_max_turn:g}" if args.rot_max_turn != 90.0 else "")
+           + ("_nocen" if args.rot_no_centre else ""))
     return f"{tag}__{_auto_exp_name(args)}"
 
 
