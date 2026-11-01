@@ -12,8 +12,15 @@ image + the kept masks + a LoMOE.json with only those instances):
            reference / instruction / background at the benchmark values
     ins    the grid's instance, instruction term only (every other term off): rotation (--rot_ins) and additive
            (--sem_lambda, no rescale) each on its own scale
+    spatial  the full sample, benchmark strengths; per subset in --subsets only those instances are edited and the
+           others are held at the source (infer_flux2_spatial.py: treated as background, weight --hold_w)
+
+--sem_ref target_centred switches the instruction anchor in every run (exp names get "_tgtc", so the target runs
+are not reused).
 
     python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16
+    python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16,38,54 --out strength --what grid,sep
+        (several samples one after another, each in strength/<id>/)
     python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16 --all_instances
         (grid and ins with every instance edited: grid_all.png, ins_all.png; same folder, no clash)
     python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16 --pairs_only
@@ -25,6 +32,7 @@ with the logged mean turn of the instance tokens / mean |edit|/|update|), stats.
 import json
 import shutil
 import argparse
+import copy
 import subprocess
 from pathlib import Path
 
@@ -109,10 +117,12 @@ def crop_box(masks: list, pad: float = 0.2):
 
 def run(args, script: str, flags: list, exp: str, root: Path) -> Path:
     out = Path(args.out) / "runs"
+    exp += {"target": "", "target_centred": "_tgtc", "diff": "_diff"}[args.sem_ref]
+    common = [args.sem_ref if c == "target" and COMMON[i - 1] == "--sem_ref" else c for i, c in enumerate(COMMON)]
     res = out / f"mice_flux2_klein_steer_{exp}" / f"{args.sample}_result.png"
     if res.exists():
         return res
-    cmd = [args.python, script, *COMMON, *flags, "--dataset_root", str(root), "--sample_ids", args.sample,
+    cmd = [args.python, script, *common, *flags, "--dataset_root", str(root), "--sample_ids", args.sample,
            "--output_dir", str(out), "--exp_name", exp, "--pretrained_model_name_or_path", args.model, *args.extra]
     print(" ".join(cmd), flush=True)
     if not args.dry_run:
@@ -189,9 +199,15 @@ def montage(cells: dict, rows: list, cols: list, title: str, out: Path, box, sou
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--bench", type=str, default="../MIE_bench/mice_bench")
-    p.add_argument("--sample", type=str, required=True)
+    p.add_argument("--sample", type=str, required=True,
+                   help="Sample id, or a comma list (run one after another, each in <out>/<id>/)")
     p.add_argument("--out", type=str, required=True)
-    p.add_argument("--what", type=str, default="grid,sep,ins", help="Comma list of grid, sep, ins")
+    p.add_argument("--what", type=str, default="grid,sep,ins", help="Comma list of grid, sep, ins, spatial")
+    p.add_argument("--sem_ref", type=str, default="target", choices=["target", "target_centred", "diff"],
+                   help="Instruction anchor for every run (benchmark: target)")
+    p.add_argument("--subsets", type=str, default=None,
+                   help="spatial: instances to edit per run, e.g. \"0,1;2,3\" (the others are held)")
+    p.add_argument("--hold_w", type=float, default=1.0, help="spatial: background weight on held instances")
     p.add_argument("--instance", type=int, default=None, help="Instance for grid and ins (default: the largest)")
     p.add_argument("--all_instances", action="store_true",
                    help="grid and ins on the full sample (every instance edited, contact term active), not cropped")
@@ -209,6 +225,15 @@ def main():
     p.add_argument("--plot_only", action="store_true", help="Only assemble the figures from finished runs")
     p.add_argument("extra", nargs="*", help="Passed on to every infer run (after --), e.g. -- --cpu_noise")
     args = p.parse_args()
+    sids = [x.strip() for x in args.sample.split(",") if x.strip()]
+    for sid in sids:
+        one = copy.copy(args)
+        one.sample = sid
+        one.out = str(Path(args.out) / sid) if len(sids) > 1 else args.out
+        run_sample(one)
+
+
+def run_sample(args):
     bench, out, sid = Path(args.bench), Path(args.out), args.sample
     out.mkdir(parents=True, exist_ok=True)
     masks = load_masks(bench, sid)
@@ -282,6 +307,21 @@ def main():
                 [f"strength {i + 1}" for i in range(n)],
                 f"Sample {sid}, {what_inst}: instruction term only, each method on its own "
                 f"scale", out / f"ins{sfx}.png", one_box, source, all_stats)
+    if "spatial" in what:
+        if not args.subsets:
+            raise SystemExit("--what spatial needs --subsets, e.g. \"0,1;2,3\"")
+        subsets = [[int(x) for x in t.split(",")] for t in args.subsets.split(";") if t.strip()]
+        sb = sub_bench(bench, sid, list(range(len(masks))), out / f"bench_{sid}_all")
+        cells = {(0, 0): cell(run(args, "infer_flux2_rotate.py", rot_flags(D["ctc"], D["src"], D["bg"], D["ins"]),
+                                  f"str_sep_{sid}_all_c1", sb))}  # every instance edited = the sep x1 run
+        for c, sel in enumerate(subsets, 1):
+            hold = [k for k in range(len(masks)) if k not in sel]
+            exp = f"str_spatial_{sid}_e{'-'.join(map(str, sel))}" + (f"_w{args.hold_w:g}" if args.hold_w != 1 else "")
+            cells[0, c] = cell(run(args, "infer_flux2_spatial.py", rot_flags(D["ctc"], D["src"], D["bg"], D["ins"])
+                                   + ["--hold", ",".join(map(str, hold)), "--hold_w", f"{args.hold_w:g}"], exp, sb))
+        montage(cells, ["edited"], ["all"] + ["{" + ",".join(map(str, sel)) + "}" for sel in subsets],
+                f"Sample {sid}: only the listed instances edited, the others held at the source "
+                f"(weight {args.hold_w:g})", out / "spatial.png", None, sb / d["image_path"], all_stats)
     json.dump(all_stats, open(out / f"stats{sfx}.json", "w"), indent=1)
 
 
