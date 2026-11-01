@@ -44,6 +44,9 @@ def rotate_parser() -> argparse.ArgumentParser:
     p.add_argument("--rot_ins_global", action="store_true",
                    help="Instruction anchor minus the mean write over all real text tokens (global + local prompts); "
                         "use with --sem_ref target")
+    p.add_argument("--rot_ins_centre_blocks", type=str, default=None,
+                   help="With --sem_ref target_centred: use the centred anchor only in these blocks, e.g. "
+                        "single_5,single_19 (raw target write in the others)")
     p.add_argument("--rot_no_centre", action="store_true",
                    help="Ablation: turn the whole update, frame mean included (anchors uncentred too)")
     return p
@@ -82,7 +85,11 @@ def parse_args():
     base.ResidualSteer = partial(ResidualRotate, rot_ctc=rot.rot_ctc, rot_src=rot.rot_src, rot_bg=rot.rot_bg,
                                  rot_ins=rot.rot_ins, rot_ins_double=rot.rot_ins_double, sigma_terms=terms,
                                  max_turn=rot.rot_max_turn * 3.141592653589793 / 180, centre=not rot.rot_no_centre,
-                                 ins_global=rot.rot_ins_global)
+                                 ins_global=rot.rot_ins_global,
+                                 ins_centre_blocks=None if rot.rot_ins_centre_blocks is None
+                                 else {b.strip() for b in rot.rot_ins_centre_blocks.split(",") if b.strip()})
+    if rot.rot_ins_centre_blocks is not None and args.sem_ref != "target_centred":
+        raise SystemExit("--rot_ins_centre_blocks needs --sem_ref target_centred")
     if rot.rot_ins_global:
         if args.sem_ref != "target":
             raise SystemExit("--rot_ins_global needs --sem_ref target")
@@ -96,7 +103,8 @@ def auto_exp_name(args) -> str:
            f"_i{args.rot_ins * 100:g}_id{args.rot_ins_double * 100:g}"
            f"_sig{'-'.join(args.rot_sigma_terms) or 'none'}"
            + (f"_cap{args.rot_max_turn:g}" if args.rot_max_turn != 90.0 else "")
-           + ("_nocen" if args.rot_no_centre else "") + ("_insglob" if args.rot_ins_global else ""))
+           + ("_nocen" if args.rot_no_centre else "") + ("_insglob" if args.rot_ins_global else "")
+           + (f"_cenblk{args.rot_ins_centre_blocks.replace(',', '-')}" if args.rot_ins_centre_blocks else ""))
     return f"{tag}__{_auto_exp_name(args)}"
 
 

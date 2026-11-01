@@ -66,8 +66,23 @@ class ResidualRotate(ResidualSteer):
     ins_global: bool = False  # instruction anchor minus the mean write over every real text token (global + all
     #                           local prompts): the text-side frame mean. Spans: sem_segments (+ its .glob)
 
+    ins_centre_blocks: set | None = None  # with sem_ref "target_centred": the centred anchor only in these blocks
+    #                                       (e.g. {"single_5"}), the raw target write elsewhere; None = every block
+
+    def _edit_stream(self, h_in, h_out, s: int, layer: str, text_upd=None):
+        self._layer = layer  # for the per-block anchor choice in _sem_directions
+        return super()._edit_stream(h_in, h_out, s, layer, text_upd=text_upd)
+
     def _sem_directions(self, Dt: torch.Tensor):
-        """With ins_global, u_k = n(mean_{target words} D_text - mean_{all real text tokens} D_text)."""
+        """With ins_global, u_k = n(mean_{target words} D_text - mean_{all real text tokens} D_text). With
+        ins_centre_blocks, sem_ref "target_centred" applies only in those blocks and "target" in the others."""
+        if (self.ins_centre_blocks is not None and self.sem_ref == "target_centred"
+                and getattr(self, "_layer", None) not in self.ins_centre_blocks):
+            self.sem_ref = "target"
+            try:
+                return super()._sem_directions(Dt)
+            finally:
+                self.sem_ref = "target_centred"
         segs = self.sem_segments
         if not self.ins_global or not segs:
             return super()._sem_directions(Dt)
