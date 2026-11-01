@@ -21,6 +21,9 @@ and applied with the sphere's exponential map:
 g_j, s_t (token mode), u_k, w_kj(t), omega(t), the token sets and the per-term steps / excluded blocks are
 ResidualSteer's (contact uses alpha_exclude). The ResidualSteer strengths (alpha, beta, src_gamma, ...) are unused.
 
+ins_global=True: the instruction anchor is centred on the text side, minus the mean write over every real token
+of the global and all local prompts (the text counterpart of the frame mean); use with sem_ref "target".
+
 centre=False (ablation): no frame mean is split off. d_t = D_t (and the context write s_t is not centred either), so
 the whole update is turned, D'_t = |D_t| (cos|v| D^ + sin|v| n(v)); the anchors g_j come from the uncentred updates.
 
@@ -60,6 +63,21 @@ class ResidualRotate(ResidualSteer):
     sigma_terms: tuple = ("ctc", "src", "bg")  # terms whose angle is multiplied by the step factor
     max_turn: float = math.pi / 2
     centre: bool = True  # split off the frame mean and turn only d_t (False: turn the whole update)
+    ins_global: bool = False  # instruction anchor minus the mean write over every real text token (global + all
+    #                           local prompts): the text-side frame mean. Spans: sem_segments (+ its .glob)
+
+    def _sem_directions(self, Dt: torch.Tensor):
+        """With ins_global, u_k = n(mean_{target words} D_text - mean_{all real text tokens} D_text)."""
+        segs = self.sem_segments
+        if not self.ins_global or not segs:
+            return super()._sem_directions(Dt)
+        s = Dt.shape[1]
+        spans = list(segs) + ([segs.glob] if getattr(segs, "glob", None) else [])
+        idx = [i for a, b in spans for i in range(a, min(b, s))]
+        if not idx:
+            return super()._sem_directions(Dt)
+        # mean over the target words of (D - m) = (their mean) - m, so the parent's "target" anchor does the rest
+        return super()._sem_directions(Dt - Dt[:, idx].float().mean(dim=1, keepdim=True).to(Dt.dtype))
 
     def _f(self, term: str) -> float:
         return self.factor if term in self.sigma_terms else 1.0

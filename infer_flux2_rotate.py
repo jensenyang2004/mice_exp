@@ -41,12 +41,29 @@ def rotate_parser() -> argparse.ArgumentParser:
                    help="Terms whose angle is multiplied by the step factor (--ortho_schedule / --ortho_power): "
                         "comma list of ctc,src,bg,ins, or \"none\"")
     p.add_argument("--rot_max_turn", type=float, default=90.0, help="Cap on the total rotation per token (deg)")
+    p.add_argument("--rot_ins_global", action="store_true",
+                   help="Instruction anchor minus the mean write over all real text tokens (global + local prompts); "
+                        "use with --sem_ref target")
     p.add_argument("--rot_no_centre", action="store_true",
                    help="Ablation: turn the whole update, frame mean included (anchors uncentred too)")
     return p
 
 
 _parse_args, _auto_exp_name = base.parse_args, base.auto_exp_name
+_segment_spans = base.segment_spans
+
+
+class Spans(list):
+    glob = None  # (start, end) of the global prompt's real tokens
+
+
+def segment_spans_with_global(tokenizer, prompt: str, seg_len: int = 200) -> Spans:
+    """flux2/sem_tokens.segment_spans (local prompts) plus the global prompt's span at offset 0, for
+    --rot_ins_global."""
+    out = Spans(_segment_spans(tokenizer, prompt, seg_len))
+    n = len(tokenizer(base._template(tokenizer, prompt.split("$BREAKFLAG$")[0]), add_special_tokens=False)["input_ids"])
+    out.glob = (0, min(n, seg_len))
+    return out
 
 
 def parse_args():
@@ -64,7 +81,12 @@ def parse_args():
         setattr(args, k, v)
     base.ResidualSteer = partial(ResidualRotate, rot_ctc=rot.rot_ctc, rot_src=rot.rot_src, rot_bg=rot.rot_bg,
                                  rot_ins=rot.rot_ins, rot_ins_double=rot.rot_ins_double, sigma_terms=terms,
-                                 max_turn=rot.rot_max_turn * 3.141592653589793 / 180, centre=not rot.rot_no_centre)
+                                 max_turn=rot.rot_max_turn * 3.141592653589793 / 180, centre=not rot.rot_no_centre,
+                                 ins_global=rot.rot_ins_global)
+    if rot.rot_ins_global:
+        if args.sem_ref != "target":
+            raise SystemExit("--rot_ins_global needs --sem_ref target")
+        base.segment_spans = segment_spans_with_global
     return args
 
 
@@ -74,7 +96,7 @@ def auto_exp_name(args) -> str:
            f"_i{args.rot_ins * 100:g}_id{args.rot_ins_double * 100:g}"
            f"_sig{'-'.join(args.rot_sigma_terms) or 'none'}"
            + (f"_cap{args.rot_max_turn:g}" if args.rot_max_turn != 90.0 else "")
-           + ("_nocen" if args.rot_no_centre else ""))
+           + ("_nocen" if args.rot_no_centre else "") + ("_insglob" if args.rot_ins_global else ""))
     return f"{tag}__{_auto_exp_name(args)}"
 
 
