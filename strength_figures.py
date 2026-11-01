@@ -8,7 +8,8 @@ MICE-Bench has >= 5 instances per image, so the runs read a derived one-sample b
 image + the kept masks + a LoMOE.json with only those instances):
     grid   one instance (--instance, default the largest): reference strength (rows) x instruction strength
            (columns), factors on the benchmark config; contact and background at their defaults
-    sep    the two instances with the longest contact (--pair to choose): contact strength stepped
+    sep    the full sample, every instance edited (--pair i,j: only those two): contact strength stepped from 0,
+           reference / instruction / background at the benchmark values
     ins    the grid's instance, instruction term only (every other term off): rotation (--rot_ins) and additive
            (--sem_lambda, no rescale) each on its own scale
 
@@ -18,7 +19,7 @@ image + the kept masks + a LoMOE.json with only those instances):
     python strength_figures.py --bench ../MIE_bench/mice_bench --sample 16 --out strength/16 --pairs_only
         (lists the touching pairs and exits)
 
-Outputs in <out>/: grid.png, sep.png, ins.png (each cell: result, cropped to the instance(s) unless --no_crop,
+Outputs in <out>/: grid.png, sep_all.png (sep_<i>-<j>.png with --pair), ins.png (each cell: result, cropped to the instance(s) unless --no_crop,
 with the logged mean turn of the instance tokens / mean |edit|/|update|), stats.json, runs/ (the infer outputs).
 """
 import json
@@ -194,7 +195,7 @@ def main():
     p.add_argument("--instance", type=int, default=None, help="Instance for grid and ins (default: the largest)")
     p.add_argument("--all_instances", action="store_true",
                    help="grid and ins on the full sample (every instance edited, contact term active), not cropped")
-    p.add_argument("--pair", type=str, default=None, help="i,j for sep (default: the longest contact)")
+    p.add_argument("--pair", type=str, default=None, help="i,j: sep on only these two instances (default: all instances)")
     p.add_argument("--pairs_only", action="store_true", help="List the touching pairs and exit")
     p.add_argument("--grid_src", type=str, default="0,0.5,1,2,4", help="Factors on rot_src (rows)")
     p.add_argument("--grid_ins", type=str, default="0,0.5,1,2,4", help="Factors on rot_ins (columns)")
@@ -219,7 +220,7 @@ def main():
     if args.pairs_only:
         return
     inst = args.instance if args.instance is not None else int(np.argmax([m.mean() for m in masks]))
-    pair = [int(x) for x in args.pair.split(",")] if args.pair else (list(pairs[0][1:]) if pairs else None)
+    pair = [int(x) for x in args.pair.split(",")] if args.pair else None
     what = set(args.what.split(","))
     if args.plot_only:
         args.dry_run = True
@@ -251,17 +252,20 @@ def main():
                 f"(columns); contact {D['ctc']}, background {D['bg']}", out / f"grid{sfx}.png",
                 one_box, source, all_stats)
     if "sep" in what:
-        if pair is None:
-            print("sep: no touching pair in this sample, skipped")
+        # default: the full sample, every instance edited; --pair: only those two instances
+        f = floats(args.sep_factors)
+        if args.pair:
+            sb, stag = sub_bench(bench, sid, pair, out / f"bench_{sid}_{pair[0]}-{pair[1]}"), f"{pair[0]}-{pair[1]}"
+            what_sep = f"instances {pair[0]} ({names[pair[0]]}) and {pair[1]} ({names[pair[1]]})"
+            box = None if args.no_crop else crop_box([masks[i] for i in pair])
         else:
-            two = sub_bench(bench, sid, pair, out / f"bench_{sid}_{pair[0]}-{pair[1]}")
-            f = floats(args.sep_factors)
-            cells = {(0, c): cell(run(args, "infer_flux2_rotate.py", rot_flags(D["ctc"] * a, D["src"], D["bg"], D["ins"]),
-                                      f"str_sep_{sid}_{pair[0]}-{pair[1]}_c{a:g}", two)) for c, a in enumerate(f)}
-            montage(cells, ["separation"], [f"×{a:g} (κ_ctc={D['ctc'] * a:g})" for a in f],
-                    f"Sample {sid}, instances {pair[0]} ({names[pair[0]]}) and {pair[1]} ({names[pair[1]]}): "
-                    f"contact strength stepped, other terms at their defaults", out / "sep.png",
-                    None if args.no_crop else crop_box([masks[i] for i in pair]), source, all_stats)
+            sb, stag = sub_bench(bench, sid, list(range(len(masks))), out / f"bench_{sid}_all"), "all"
+            what_sep, box = "all instances", None
+        cells = {(0, c): cell(run(args, "infer_flux2_rotate.py", rot_flags(D["ctc"] * a, D["src"], D["bg"], D["ins"]),
+                                  f"str_sep_{sid}_{stag}_c{a:g}", sb)) for c, a in enumerate(f)}
+        montage(cells, ["separation"], [f"×{a:g} (κ_ctc={D['ctc'] * a:g})" for a in f],
+                f"Sample {sid}, {what_sep}: contact strength stepped from 0; reference {D['src']}, instruction "
+                f"{D['ins']}, background {D['bg']}", out / f"sep_{stag}.png", box, source, all_stats)
     if "ins" in what:
         vr, va = floats(args.ins_rot), floats(args.ins_add)
         cells = {}
