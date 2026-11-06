@@ -8,10 +8,13 @@ channels of either run dropped, uncentred so the mean direction stays in):
                (bg: background tokens, all: every latent token): the communal subspace
     cap_inst   share of the update energy of the instance tokens that lies in B_r,  ||D P_B||^2 / ||D||^2
     cap_bg     the same for the background tokens
+    rel        cap_inst / cap_bg: how much less the instances use the communal subspace than the background does
     overlap    mean cos^2 of the principal angles between B_r and the run's own top-r subspace of its instance
                tokens (1: the instances move in the communal subspace; 0: orthogonal to it)
 
-Every run, the reference included, is measured against the same B_r. Prediction of the "masking breaks the
+Every run, the reference included, is measured against the same B_r. B_r is fitted on one checkerboard half of
+the kept grid and every metric is measured on the other half, so the reference's background is held out like the
+masked run's (--no_holdout fits and measures on all tokens). Prediction of the "masking breaks the
 communal write" hypothesis: the masked run's cap_inst and overlap drop below the reference's, its cap_bg does not.
 
 Outputs in --out: communal_pca.csv (run, sample, step, block, rank, metric, value), communal_pca.png at
@@ -37,6 +40,7 @@ from analyze_communal import region_labels, RUN_COLORS
 
 METRICS = (("cap_inst", "instance energy in communal subspace"),
            ("cap_bg", "background energy in communal subspace"),
+           ("rel", "instance / background share"),
            ("overlap", "overlap: instance subspace vs communal"))
 
 
@@ -48,6 +52,7 @@ def parse_args():
     p.add_argument("--ranks", type=str, default="1,4,16")
     p.add_argument("--plot_rank", type=int, default=4)
     p.add_argument("--basis", type=str, default="bg", choices=["bg", "all"])
+    p.add_argument("--no_holdout", action="store_true", help="Fit and measure on the same tokens")
     p.add_argument("--min_inst_tokens", type=int, default=4)
     p.add_argument("--massive_ratio", type=float, default=5.0, help="<= 0 keeps every channel")
     return p.parse_args()
@@ -75,7 +80,7 @@ def load(cap: Path):
     return meta, sets, per_inst
 
 
-def analyse(sid: str, roots: dict, ranks: list, basis: str, ratio: float, min_tokens: int) -> list:
+def analyse(sid: str, roots: dict, ranks: list, basis: str, ratio: float, min_tokens: int, holdout: bool) -> list:
     caps = {k: root / sid for k, root in roots.items()}
     loaded = {k: load(c) for k, c in caps.items()}
     ref = next(iter(roots))
@@ -85,6 +90,11 @@ def analyse(sid: str, roots: dict, ranks: list, basis: str, ratio: float, min_to
     lab = region_labels(per_inst, min_tokens)
     inst, bg = lab >= 0, lab == -1
     src = bg if basis == "bg" else lab != -2
+    if holdout:  # fit on one checkerboard half, measure on the other
+        n_cols = len(meta["lat_cols"])
+        i = torch.arange(len(lab))
+        fit = (i // n_cols + i % n_cols) % 2 == 0
+        src, inst, bg = src & fit, inst & ~fit, bg & ~fit
     if not bool(inst.any()) or not bool(bg.any()):
         print(f"  {sid}: no instance or no background tokens, skipped")
         return []
@@ -104,6 +114,7 @@ def analyse(sid: str, roots: dict, ranks: list, basis: str, ratio: float, min_to
                 for k, X in D.items():
                     vals = dict(cap_inst=captured(X[inst], B), cap_bg=captured(X[bg], B),
                                 overlap=overlap(top_dirs(X[inst], r), B))
+                    vals["rel"] = vals["cap_inst"] / vals["cap_bg"]
                     rows += [dict(run=k, sample=sid, step=s, block=name, rank=r, metric=m, value=v)
                              for m, v in vals.items()]
         del R
@@ -185,7 +196,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     rows = []
     for sid in ids:
-        rows += analyse(sid, roots, ranks, args.basis, args.massive_ratio, args.min_inst_tokens)
+        rows += analyse(sid, roots, ranks, args.basis, args.massive_ratio, args.min_inst_tokens, not args.no_holdout)
     with open(out / "communal_pca.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
