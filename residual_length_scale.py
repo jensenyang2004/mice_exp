@@ -1,6 +1,7 @@
 """
 Does every latent token of a block write an update of about the same length, while the length changes a lot from
-block to block? One or more residual-stream captures (capture_residual_stream.py), massive channels dropped.
+block to block? One or more residual-stream captures (capture_residual_stream.py). Every channel is kept, as in
+the method (the rotation never drops the massive channels); --massive_ratio 5 drops them as a check.
 
 Per sample, step and block: L_t = log2 ||D_t|| for every kept latent token t (1 unit = twice as long), centred by
 the sample's median over all its steps and blocks so samples are comparable.
@@ -40,7 +41,8 @@ def parse_args():
     p.add_argument("captures", nargs="+", help="Capture roots (folders of samples) or sample folders")
     p.add_argument("--out", type=str, default="residual_space/length_scale")
     p.add_argument("--step", type=int, default=2, help="Step shown in the right panel")
-    p.add_argument("--massive_ratio", type=float, default=5.0, help="<= 0 keeps every channel")
+    p.add_argument("--massive_ratio", type=float, default=0.0,
+                   help="> 0 drops channels whose state RMS exceeds this x the median channel (e.g. 5); default keeps all")
     p.add_argument("--max_dots", type=int, default=400, help="Tokens per sample and block drawn on the right")
     return p.parse_args()
 
