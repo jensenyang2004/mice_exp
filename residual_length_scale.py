@@ -4,7 +4,9 @@ block to block? One or more residual-stream captures (capture_residual_stream.py
 the method (the rotation never drops the massive channels); --massive_ratio 5 drops them as a check.
 
 Per sample, step and block: L_t = log2 ||D_t|| for every kept latent token t (1 unit = twice as long), centred by
-the sample's median over all its steps and blocks so samples are comparable.
+the sample's median over all its steps and blocks so samples are comparable. With --relative, L_t = log2(||D_t|| /
+||h_t||) instead, h_t the token's state entering the block: does the update grow with depth only because the
+residual stream grows? Not centred then (0 = the update is as long as the state).
 
     within   std over the block's tokens of L_t
     level    median over the block's tokens of L_t
@@ -43,6 +45,7 @@ def parse_args():
     p.add_argument("--step", type=int, default=2, help="Step shown in the right panel")
     p.add_argument("--massive_ratio", type=float, default=0.0,
                    help="> 0 drops channels whose state RMS exceeds this x the median channel (e.g. 5); default keeps all")
+    p.add_argument("--relative", action="store_true", help="Update length relative to the block's input state")
     p.add_argument("--max_dots", type=int, default=400, help="Tokens per sample and block drawn on the right")
     return p.parse_args()
 
@@ -57,20 +60,25 @@ def sample_dirs(paths: list) -> list:
     return out
 
 
-def lengths(cap: Path, ratio: float):
-    """{(step, block): log2 ||D_t|| over the kept latent tokens}, the sample id and the dropped channels."""
+def lengths(cap: Path, ratio: float, relative: bool = False):
+    """{(step, block): log2 ||D_t|| (or log2 ||D_t|| / ||h_t||) over the kept latent tokens}, the sample id and the
+    dropped channels."""
     meta = json.load(open(cap / "meta.json"))
     masks = torch.load(cap / "masks.pt", weights_only=True)
     sets, _, _, _ = token_sets(meta, masks, 0, "all")
     big = massive_channels(cap, meta["steps"], sets, ratio) if ratio > 0 else torch.zeros(0, dtype=torch.long)
     L = {}
     for s in meta["steps"]:
-        R = torch.load(cap / f"step{s}.pt", map_location="cpu", mmap=True, weights_only=True)["residuals"]
+        d = torch.load(cap / f"step{s}.pt", map_location="cpu", mmap=True, weights_only=True)
+        R, S = d["residuals"], d["states"]
         keep = torch.ones(R.shape[-1], dtype=torch.bool)
         keep[big] = False
         for l, b in enumerate(meta["blocks"]):
-            L[(s, b)] = torch.log2(R[l][sets["latent"]][:, keep].float().norm(dim=-1)).numpy()
-        del R
+            n = R[l][sets["latent"]][:, keep].float().norm(dim=-1)
+            if relative:  # states[l] is the input of block l
+                n = n / S[l][sets["latent"]][:, keep].float().norm(dim=-1)
+            L[(s, b)] = torch.log2(n).numpy()
+        del d, R, S
     return L, str(meta["sample_id"]), big.tolist(), meta["blocks"]
 
 
@@ -86,8 +94,8 @@ def main():
     print(f"{len(caps)} samples")
     data, rows, splits, blocks = {}, [], [], None
     for cap in caps:
-        L, sid, big, blocks = lengths(cap, args.massive_ratio)
-        ref = np.median(np.concatenate(list(L.values())))
+        L, sid, big, blocks = lengths(cap, args.massive_ratio, args.relative)
+        ref = 0.0 if args.relative else np.median(np.concatenate(list(L.values())))
         L = {k: v - ref for k, v in L.items()}
         data[sid] = L
         allv = np.concatenate(list(L.values()))
@@ -116,8 +124,10 @@ def main():
     a.set_ylim(min(lv) - 0.4, max(lv) + 0.4)
     a.set_aspect("equal", adjustable="box")
     a.axhline(0, color="#bbb", lw=0.6)
-    a.set_xlabel("within block: spread over tokens\n(std of log2 ‖D_t‖)", color=INK)
-    a.set_ylabel("between blocks: block median vs sample median\n(log2, 1 = twice as long)", color=INK)
+    a.set_xlabel("within block: spread over tokens\n(std of " + ("log2 ‖D_t‖ / ‖h_t‖)" if args.relative else "log2 ‖D_t‖)"),
+                 color=INK)
+    a.set_ylabel(("between blocks: block median of ‖D_t‖ / ‖h_t‖" if args.relative else
+                  "between blocks: block median vs sample median") + "\n(log2, 1 = twice as long)", color=INK)
     a.set_title(f"Same unit, both axes\nvariance between blocks:\n{share.mean():.0%} (min {share.min():.0%}, "
                 f"n = {len(share)})", loc="left", fontsize=9, color=INK)
     a.legend(frameon=False, fontsize=7, loc="upper right", handletextpad=0.1, borderaxespad=0.2)
@@ -138,7 +148,7 @@ def main():
         if levels:
             b2.plot([i - 0.38, i + 0.38], [np.median(levels)] * 2, color=INK, lw=1.2)
     b2.set_xticks(x[::2], [short(bl) for bl in blocks[::2]], rotation=90)
-    b2.set_ylabel("log2(‖D_t‖ / sample median)", color=INK)
+    b2.set_ylabel("log2(‖D_t‖ / ‖h_t‖)" if args.relative else "log2(‖D_t‖ / sample median)", color=INK)
     b2.set_title(f"Every latent token at step {args.step}, {len(data)} sample{'s' * (len(data) > 1)}\n"
                  f"dot = token, grey = each sample's block median, black = median over samples",
                  loc="left", fontsize=9, color=INK)
@@ -148,7 +158,8 @@ def main():
         for sp in ax.spines.values():
             sp.set_color(GRID)
     a.grid(color=GRID, lw=0.6)
-    fig.suptitle("Update length per latent token" + (", massive channels dropped" if args.massive_ratio > 0 else ""),
+    fig.suptitle(("Update length relative to the block's input state" if args.relative else
+                  "Update length per latent token") + (", massive channels dropped" if args.massive_ratio > 0 else ""),
                  x=0.01, ha="left", fontsize=10, color=INK)
     fig.tight_layout()
     fig.savefig(out / "length_scale.png", dpi=170)
