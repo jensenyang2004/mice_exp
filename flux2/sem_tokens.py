@@ -39,13 +39,14 @@ def word_positions(tokenizer, prompt: str, sources: list, targets: list, seg_len
         base = text.find(content)
         offsets = tokenizer(text, return_offsets_mapping=True, add_special_tokens=False)["offset_mapping"]
         prefix, sep = "Replace the ", " with "
-        if content.startswith(prefix) and sep in content:  # the MICE-Bench template: exact spans
-            s0 = base + len(prefix)
-            t0 = base + content.rindex(sep) + len(sep)
+        if content.startswith(prefix + src + sep):  # the MICE-Bench template: the target starts right after
+            s0 = base + len(prefix)                   # "<src> with " (it may contain " with " itself)
+            t0 = s0 + len(src) + len(sep)
         else:  # any other wording: first occurrence of src, last of tgt
             s0, t0 = base + content.find(src), base + content.rfind(tgt)
-        src_tok = _span_tokens(offsets, s0, s0 + len(src)) if src and s0 >= base else []
-        tgt_tok = _span_tokens(offsets, t0, t0 + len(tgt)) if tgt and t0 >= base else []
+        end = base + len(content)  # never into the chat template after the content
+        src_tok = _span_tokens(offsets, s0, min(s0 + len(src), end)) if src and s0 >= base else []
+        tgt_tok = _span_tokens(offsets, t0, min(t0 + len(tgt), end)) if tgt and t0 >= base else []
         if not src_tok or not tgt_tok or max(src_tok + tgt_tok) >= seg_len or set(src_tok) & set(tgt_tok):
             out.append(None)
             continue

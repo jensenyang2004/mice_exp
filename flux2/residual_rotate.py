@@ -66,6 +66,8 @@ class ResidualRotate(ResidualSteer):
     ins_global: bool = False  # instruction anchor minus the mean write over every real text token (global + all
     #                           local prompts): the text-side frame mean. Spans: sem_segments (+ its .glob)
 
+    ins_shared: bool = False  # ablation: the anchor is the prompt-mean write alone, n(mean over the local prompt's
+    #                           real tokens), i.e. the part target_centred removes (raw = shared + word-specific)
     ins_centre_blocks: set | None = None  # with sem_ref "target_centred": the centred anchor only in these blocks
     #                                       (e.g. {"single_5"}), the raw target write elsewhere; None = every block
 
@@ -73,9 +75,21 @@ class ResidualRotate(ResidualSteer):
         self._layer = layer  # for the per-block anchor choice in _sem_directions
         return super()._edit_stream(h_in, h_out, s, layer, text_upd=text_upd)
 
+    def _shared_directions(self, Dt: torch.Tensor):
+        """[B, K, D] unit prompt-mean write of every instance's local prompt (zero rows where unknown)."""
+        if not self.sem_tokens or not self.sem_segments or Dt.shape[1] <= 0:
+            return None
+        U = torch.zeros(Dt.shape[0], self.masks.shape[0], Dt.shape[-1], device=Dt.device)
+        for k, seg in enumerate(self.sem_segments[:self.masks.shape[0]]):
+            if seg is not None and seg[1] <= Dt.shape[1] and self.sem_tokens[k] is not None:
+                U[:, k] = F.normalize(Dt[:, seg[0]:seg[1]].float().mean(dim=1), dim=-1)
+        return U
+
     def _sem_directions(self, Dt: torch.Tensor):
         """With ins_global, u_k = n(mean_{target words} D_text - mean_{all real text tokens} D_text). With
         ins_centre_blocks, sem_ref "target_centred" applies only in those blocks and "target" in the others."""
+        if self.ins_shared:
+            return self._shared_directions(Dt)
         if (self.ins_centre_blocks is not None and self.sem_ref == "target_centred"
                 and getattr(self, "_layer", None) not in self.ins_centre_blocks):
             self.sem_ref = "target"
