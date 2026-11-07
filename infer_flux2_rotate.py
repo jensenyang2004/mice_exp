@@ -16,7 +16,10 @@ import sys
 import argparse
 from functools import partial
 
+import torch
+
 import infer_flux2_steer as base
+from flux2.pipeline_utils import resize_mask
 from flux2.residual_rotate import ResidualRotate
 
 TERMS = ("ctc", "src", "bg", "ins")
@@ -51,11 +54,41 @@ def rotate_parser() -> argparse.ArgumentParser:
                         "single_5,single_19 (raw target write in the others)")
     p.add_argument("--rot_no_centre", action="store_true",
                    help="Ablation: turn the whole update, frame mean included (anchors uncentred too)")
+    p.add_argument("--rot_boundary_cover", type=float, default=0.0,
+                   help="Steering masks by cell coverage, so a token on the boundary of a and b is in both: a token "
+                        "belongs to every instance covering >= this fraction of its 16x16 cell (e.g. 0.25). With "
+                        "--strict_masks the overlap is carved in pixel space first (a pixel claimed by a smaller "
+                        "instance leaves the larger one), so only pixels both masks really claim are exclusive. "
+                        "Steering only: the attention binding keeps the pipeline's masks. 0 = off (nearest resize, "
+                        "then token-level carving)")
     return p
 
 
 _parse_args, _auto_exp_name = base.parse_args, base.auto_exp_name
 _segment_spans = base.segment_spans
+_run_with_steer = base.run_with_steer
+
+
+def boundary_masks(masks: list, Ht: int, Wt: int, cover: float, strict: bool) -> list:
+    """Token-grid steering masks from the pixel masks, carved in pixel space (strict). Every token keeps the
+    pipeline's nearest assignment; a boundary token, whose cell holds >= cover of instance a and >= cover of
+    another instance b, joins both. Instances grow only by these shared tokens."""
+    masks = [torch.as_tensor(m).float() for m in masks]
+    if strict:
+        masks = base.carve_strict(masks)
+    near = torch.stack([resize_mask(m, Ht, Wt) > 0.5 for m in masks])  # [K, Ht, Wt]
+    big = torch.stack(base.coverage_masks(masks, Ht, Wt, cover)) > 0.5
+    shared = big.sum(0) >= 2
+    return [(n | (b & shared)).float() for n, b in zip(near, big)]
+
+
+def run_with_steer_boundary(cover: float, pipe, steer, chunked, sample, use_masks, mem, strict=False, *a, **kw):
+    """base.run_with_steer with --rot_boundary_cover steering masks. They are already at token resolution, so its
+    nearest resize keeps them, and its token-level carving is off (done in pixel space here). The pipeline's
+    instance_masks_yx (attention binding) is passed through unchanged."""
+    f = pipe.vae_scale_factor * 2
+    sample = dict(sample, masks=boundary_masks(sample["masks"], kw["height"] // f, kw["width"] // f, cover, strict))
+    return _run_with_steer(pipe, steer, chunked, sample, use_masks, mem, False, *a, **kw)
 
 
 class Spans(list):
@@ -96,6 +129,10 @@ def parse_args():
         if args.sem_ref != "target":
             raise SystemExit("--rot_ins_global needs --sem_ref target")
         base.segment_spans = segment_spans_with_global
+    if rot.rot_boundary_cover > 0:
+        if not args.use_masks or args.mask_cover > 0:
+            raise SystemExit("--rot_boundary_cover needs --use_masks and no --mask_cover")
+        base.run_with_steer = partial(run_with_steer_boundary, rot.rot_boundary_cover)
     return args
 
 
@@ -106,7 +143,8 @@ def auto_exp_name(args) -> str:
            f"_sig{'-'.join(args.rot_sigma_terms) or 'none'}"
            + (f"_cap{args.rot_max_turn:g}" if args.rot_max_turn != 90.0 else "")
            + ("_nocen" if args.rot_no_centre else "") + ("_insglob" if args.rot_ins_global else "") + ("_insshared" if args.rot_ins_shared else "")
-           + (f"_cenblk{args.rot_ins_centre_blocks.replace(',', '-')}" if args.rot_ins_centre_blocks else ""))
+           + (f"_cenblk{args.rot_ins_centre_blocks.replace(',', '-')}" if args.rot_ins_centre_blocks else "")
+           + (f"_bnd{args.rot_boundary_cover * 100:g}" if args.rot_boundary_cover > 0 else ""))
     return f"{tag}__{_auto_exp_name(args)}"
 
 
