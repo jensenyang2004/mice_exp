@@ -36,7 +36,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from analyze_residual_space import token_sets, massive_channels, INK, MUTED, GRID
+from analyze_residual_space import (token_sets, massive_channels, TEMPLATE_PREFIX, TEMPLATE_SUFFIX, INK,
+                                    MUTED, GRID)
 
 GROUP_COLORS = dict(latent="#2a78d6", text="#eb6834")
 GROUP_DARK = dict(latent="#174a8a", text="#a8431a")
@@ -67,6 +68,14 @@ def sample_dirs(paths: list) -> list:
     return out
 
 
+def content_tokens(meta: dict) -> torch.Tensor:
+    """Real tokens of the local instructions, chat template stripped (padding is never included). Same spans as
+    token_sets(..., "content"), without its check that the word positions fall inside them."""
+    T0, seg = meta["layout"]["text"][0], meta["seg_len"]
+    return torch.cat([torch.arange(T0 + s * seg + TEMPLATE_PREFIX, T0 + s * seg + n - TEMPLATE_SUFFIX)
+                      for s, n in enumerate(meta["n_real"]) if s > 0])
+
+
 def lengths(cap: Path, ratio: float, relative: bool = False, text: str = "content"):
     """{(group, step, block): log2 ||D_t|| (or log2 ||D_t|| / ||h_t||) over the group's tokens}, the sample id,
     the dropped channels and the blocks. Groups: latent (kept grid) and, unless text is none, text."""
@@ -75,7 +84,7 @@ def lengths(cap: Path, ratio: float, relative: bool = False, text: str = "conten
     sets, _, _, _ = token_sets(meta, masks, 0, "all")
     groups = dict(latent=sets["latent"])
     if text != "none":
-        groups["text"] = token_sets(meta, masks, 0, text)[0]["text"]
+        groups["text"] = sets["text"] if text == "all" else content_tokens(meta)
     big = massive_channels(cap, meta["steps"], sets, ratio) if ratio > 0 else torch.zeros(0, dtype=torch.long)
     L = {}
     for s in meta["steps"]:
